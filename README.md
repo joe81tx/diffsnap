@@ -2,7 +2,7 @@
 
 `diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of solely relying on elapsed time, it queries the native ZFS `written` property to create snapshots only after a dataset has changed by a user-defined threshold. 
 
-Designed to complement comprehensive policy tools like Sanoid, diffsnap manages and prunes only its own snapshots. It safely coexists alongside existing retention systems.
+Designed to complement comprehensive policy tools like Sanoid, `diffsnap` manages and prunes only its own snapshots. It safely coexists alongside existing retention systems.
 
 ## The Problem
 
@@ -10,7 +10,7 @@ Traditional time-based snapshotting struggles with high-frequency intervals. Cap
 
 ## The diffsnap approach
 
-By monitoring how much data has been written since the most recent snapshot, diffsnap enforces an intelligent data-change threshold. 
+By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces an intelligent data-change threshold. 
 
 Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` will capture all modifications, including deletions.
 
@@ -73,14 +73,14 @@ diffsnap
 ```text
 dataset interval_minutes retention prefix recursive min_bytes
 ```
-Snapshots will be named dataset@prefix_date_time
+Snapshots will be named `dataset@prefix_date_time`
 
 Fields:
 
 - `dataset`: ZFS dataset name.
 - `interval_minutes`: Intervals $\le$ 60: Must divide evenly into 60. Intervals $>$ 60: Must divide evenly into 1,440.
 - `retention`: number of matching snapshots to keep.
-- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of diffsnap make sure this is unique.
+- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.
 - `recursive`: `yes` or `no`.
 - `min_bytes`: minimum written bytes needed before snapshotting.
 
@@ -95,15 +95,15 @@ zroot/jails 1440 14 daily yes 0
 ```
 
 ## System Scheduler
-diffsnap does not run as a continuous background service. It relies on an external system scheduler (such as a cron job on FreeBSD or a systemd timer on Linux) to wake it up and trigger execution.
+`diffsnap` does not run as a continuous background service. It relies on an external system scheduler (such as a cron job on FreeBSD or a systemd timer on Linux) to wake it up and trigger execution.
 
-For diffsnap to evaluate a dataset, the system scheduler must run the binary the minute that matches the dataset's configured interval_minutes. If not, the snapshot window is missed entirely. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
+For `diffsnap` to evaluate a dataset, the system scheduler must run the binary the minute that matches the dataset's configured interval_minutes. If not, the snapshot window is missed entirely. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
-If your system schedule for diffsnap is 20 and your interval_minutes is 15 you'll only get one snapshot per hour instead of the intended 4.
-If your system schedule for diffsnap is 10 and your interval_minutes is 5 you'll only get a snapshot every 10 minutes.
+If your system schedule for `diffsnap` is 20 and your interval_minutes is 15 you'll only get one snapshot per hour instead of the intended 4.
+If your system schedule for `diffsnap` is 10 and your interval_minutes is 5 you'll only get a snapshot every 10 minutes instead of every 5.
 The easiest way to avoid these issues is to set the system schedule to run every minute.
 
-The examples below schedule diffsnap to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using zfs allow. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
+The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using zfs allow. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
 FreeBSD Crontab Configuration (/etc/cron.d/diffsnap)
 
