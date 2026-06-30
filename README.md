@@ -20,8 +20,8 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshot execution paths.
-* **Atomic Batching:** Pools concurrent dataset targets into single, atomic `zfs snapshot` invocations to minimize disk I/O overhead.
-* **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemons required.
+* **Atomic Batching:** Pools concurrent dataset targets into single, atomic `zfs snapshot` invocations to minimize disk I/O.
+* **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
 ## Supported systems
