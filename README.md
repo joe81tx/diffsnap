@@ -19,7 +19,7 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Delta-Driven Automation:** Snapshots are generated only when the configured change threshold is met.
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
-* **Hierarchy Aware:** Supports both standard and recursive snapshot execution paths.
+* **Hierarchy Aware:** Supports both standard and recursive snapshots.
 * **Atomic Batching:** Groups datasets into a single snapshot command to reduce disk I/O.
 * **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
@@ -95,9 +95,7 @@ zroot/jails 1440 14 daily yes 0
 ```
 
 ## System Scheduler
-`diffsnap` does not run as a continuous background service. It relies on an external system scheduler (such as a cron job on FreeBSD or a systemd timer on Linux) to wake it up and trigger execution.
-
-For `diffsnap` to evaluate a dataset, the system scheduler must run the binary the minute that matches the dataset's configured interval_minutes. If not, the snapshot window is missed entirely. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
+`diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. For `diffsnap` to evaluate a dataset, the system scheduler must run the binary the minute that matches the dataset's configured interval_minutes. If not, the snapshot window is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
 If your system schedule for `diffsnap` is 20 and your interval_minutes is 15 you'll only get one snapshot per hour instead of the intended 4.
 If your system schedule for `diffsnap` is 10 and your interval_minutes is 5 you'll only get a snapshot every 10 minutes instead of every 5.
