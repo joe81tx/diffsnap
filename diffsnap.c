@@ -64,7 +64,7 @@ static void print_help(const char *progname) {
     printf(
         "Usage: %s [--help] [--version]\n"
         "\n"
-        "Create and prune ZFS snapshots from a space-separated config file.\n"
+        "Create ZFS snapshots based on the amount of data written\n"
         "\n"
         "Files:\n"
         "  Config: %s\n"
