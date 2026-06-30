@@ -12,7 +12,7 @@ Traditional time-based snapshotting struggles with high-frequency intervals. Cap
 
 By monitoring how much data has been written since the most recent snapshot, diffsnap enforces an intelligent data-change threshold. 
 
-Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` will capture all modifications, including minor deletions.
+Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` will capture all modifications, including deletions.
 
 ## Features
 
@@ -20,7 +20,7 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshot execution paths.
-* **Atomic Batching:** Pools concurrent dataset targets into single, atomic `zfs snapshot` invocations to minimize disk I/O.
+* **Atomic Batching:** Groups datasets into a single snapshot command to reduce disk I/O.
 * **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
@@ -69,7 +69,7 @@ diffsnap
 ```
 
 ## Configuration
-
+/usr/local/etc/ on FreeBSD or /etc/ on Linux
 ```text
 dataset interval_minutes retention prefix recursive min_bytes
 ```
@@ -86,9 +86,7 @@ Fields:
 
 Blank lines and lines beginning with `#` are ignored.
 
-FreeBSD /usr/local/etc/diffsnap.conf  
-Linux /etc/diffsnap.conf  
-Example config:
+Example diffsnap.conf:  
 
 ```text
 zroot/downloads 30 100 diffsnap no 1000000
