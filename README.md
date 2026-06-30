@@ -68,7 +68,7 @@ diffsnap --version
 diffsnap
 ```
 
-## Configuration
+## diffsnap.conf
 /usr/local/etc/ on FreeBSD or /etc/ on Linux
 ```text
 dataset interval_minutes retention prefix recursive min_bytes
@@ -86,7 +86,7 @@ Fields:
 
 Blank lines and lines beginning with `#` are ignored.
 
-Example diffsnap.conf:  
+Example:  
 
 ```text
 zroot/downloads 30 100 diffsnap no 1000000
