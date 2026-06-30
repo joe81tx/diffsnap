@@ -1,0 +1,4 @@
+diffsnap
+*.o
+*.core
+core
