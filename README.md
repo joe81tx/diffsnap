@@ -2,15 +2,15 @@
 
 `diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of blindly relying on elapsed time, it queries the native ZFS `written` property to create snapshots only after a dataset has changed by a user-defined byte threshold. 
 
-Designed to complement—rather than replace—comprehensive policy tools like Sanoid, `diffsnap` manages and prunes only its own snapshots, allowing it to safely coexist alongside existing retention systems.
+Designed to complement comprehensive policy tools like Sanoid, diffsnap manages and prunes only its own snapshots, allowing it to safely coexist alongside existing retention systems.
 
 ## The Problem
 
-Traditional time-based snapshotting struggles with high-frequency intervals. Capturing rapid-fire changes (e.g., every 15 minutes) over a long retention window (e.g., 30 days) forces ZFS to maintain 2,880 snapshots per dataset. While idle snapshots consume negligible block space, excessive snapshot counts bloat pool metadata and degrade the performance of core ZFS management commands.
+Traditional time-based snapshotting struggles with high-frequency intervals. Capturing short windows (e.g., every 15 minutes) over a long retention window (e.g., 30 days) forces you to maintain 2,880 snapshots per dataset. While idle snapshots consume negligible block space, excessive snapshot counts bloat pool metadata and degrade the performance of ZFS commands.
 
-## The `diffsnap` Approach
+## The diffsnap Approach
 
-By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces an intelligent data-change threshold. 
+By monitoring how much data has been written since the most recent snapshot, diffsnap enforces an intelligent data-change threshold. 
 
 Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` will capture all modifications, including minor deletions.
 
@@ -18,18 +18,16 @@ Because background metadata processes (such as directory lock updates, protocol 
 
 * **Delta-Driven Automation:** Snapshots are generated only when the configured change threshold is met.
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
-* **Safety First:** Only prunes snapshots matching its own prefix context.
+* **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshot execution paths.
 * **Atomic Batching:** Pools concurrent dataset targets into single, atomic `zfs snapshot` invocations to minimize disk I/O overhead.
 * **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemons required.
-* **Concurrency Protection:** Uses `diffsnap.lock` to safely prevent overlapping runs.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
 ## Supported systems
 
+- FreeBSD 14 & 15
 - OpenZFS on Linux
-- FreeBSD 15.1
-- FreeBSD 14.4
 
 The Makefile selects OS-specific defaults at build time:
 
@@ -76,6 +74,17 @@ diffsnap
 dataset interval_minutes retention prefix recursive min_bytes
 ```
 
+Fields:
+
+- `dataset`: ZFS dataset name.
+- `interval_minutes`: Intervals $\le$ 60: Must divide evenly into $60$. Intervals $>$ 60: Must divide evenly into $1,440$.
+- `retention`: number of matching snapshots to keep.
+- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. snapshots will be named dataset@prefix_date_time
+- `recursive`: `yes` or `no`.
+- `min_bytes`: minimum written bytes needed before snapshotting.
+
+Blank lines and lines beginning with `#` are ignored.
+
 Example:
 
 ```text
@@ -83,17 +92,6 @@ zroot/downloads 30 100 diffsnap no 1000000
 tank/media 5 100 diffsnap no 1000000
 zroot/jails 1440 14 daily yes 0
 ```
-
-Fields:
-
-- `dataset`: ZFS dataset name.
-- `interval_minutes`: Intervals $\le$ 60: Must divide evenly into $60$ minutes. Intervals $>$ 60: Must divide evenly into $1,440$ minutes.
-- `retention`: number of matching snapshots to keep.
-- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`.
-- `recursive`: `yes` or `no`.
-- `min_bytes`: minimum written bytes needed before snapshotting.
-
-Blank lines and lines beginning with `#` are ignored.
 
 ## System Scheduler
 diffsnap does not run as a continuous background service. It relies on an external system scheduler (such as a cron job on FreeBSD or a systemd timer on Linux) to wake it up and trigger execution.
