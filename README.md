@@ -85,7 +85,9 @@ Fields:
 
 Blank lines and lines beginning with `#` are ignored.
 
-Example (FreeBSD:/usr/local/etc/diffsnap.conf linux:/etc/diffsnap.conf):
+Example config:
+FreeBSD:/usr/local/etc/diffsnap.conf
+Linux:/etc/diffsnap.conf)
 
 ```text
 zroot/downloads 30 100 diffsnap no 1000000
