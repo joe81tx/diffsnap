@@ -12,10 +12,18 @@
 #include <sys/wait.h>
 #include <sys/file.h>
 
+#ifndef CONF_PATH
 #define CONF_PATH "/usr/local/etc/diffsnap.conf"
+#endif
+#ifndef LOG_PATH
 #define LOG_PATH "/var/log/diffsnap.log"
+#endif
+#ifndef LOCK_PATH
 #define LOCK_PATH "/var/run/diffsnap.lock"
+#endif
+#ifndef ZFS_PATH
 #define ZFS_PATH "/sbin/zfs"
+#endif
 #define DIFFSNAP_VERSION "1.0"
 
 #define ALLOC_CHUNK_BATCH 32

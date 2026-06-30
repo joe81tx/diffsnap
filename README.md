@@ -11,12 +11,23 @@ Version: 1.0
 - FreeBSD 15.1
 - FreeBSD 14.4
 
-The program expects `zfs` at `/sbin/zfs`.
+The Makefile selects OS-specific defaults at build time:
+
+| System | Config | Log | Lock | ZFS |
+| --- | --- | --- | --- | --- |
+| Linux | `/etc/diffsnap.conf` | `/var/log/diffsnap.log` | `/run/diffsnap.lock` | `/usr/sbin/zfs` if present, otherwise `/sbin/zfs` |
+| FreeBSD | `/usr/local/etc/diffsnap.conf` | `/var/log/diffsnap.log` | `/var/run/diffsnap.lock` | `/sbin/zfs` |
 
 ## Build
 
 ```sh
 make
+```
+
+Path defaults can be overridden at build time:
+
+```sh
+make CONF_PATH=/usr/local/etc/diffsnap.conf ZFS_PATH=/sbin/zfs
 ```
 
 ## Install
@@ -28,7 +39,8 @@ sudo make install
 By default this installs:
 
 - Binary: `/usr/local/sbin/diffsnap`
-- Config: `/usr/local/etc/diffsnap.conf`
+- Config: `/etc/diffsnap.conf` on Linux
+- Config: `/usr/local/etc/diffsnap.conf` on FreeBSD
 
 ## Usage
 
