@@ -58,7 +58,12 @@ mdo make install
 sudo make install
 ```
 
-By default this installs `/usr/local/sbin/diffsnap`
+By default this installs `/usr/local/sbin/diffsnap`.
+
+If the config file does not already exist, `make install` also installs a
+comment-only config template at `/usr/local/etc/diffsnap.conf` on FreeBSD or
+`/etc/diffsnap.conf` on Linux. Example dataset entries are kept in
+`examples/diffsnap.conf`.
 
 ## Usage
 

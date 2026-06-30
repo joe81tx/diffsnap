@@ -41,7 +41,7 @@ install: $(PROG)
 	$(INSTALL) -m 0755 $(PROG) $(DESTDIR)$(SBINDIR)/$(PROG)
 	$(INSTALL) -d $(DESTDIR)$(ETCDIR)
 	@if [ ! -f "$(DESTDIR)$(ETCDIR)/diffsnap.conf" ]; then \
-		$(INSTALL) -m 0644 examples/diffsnap.conf $(DESTDIR)$(ETCDIR)/diffsnap.conf; \
+		$(INSTALL) -m 0644 diffsnap.conf $(DESTDIR)$(ETCDIR)/diffsnap.conf; \
 	fi
 
 uninstall:
