@@ -8,7 +8,7 @@ Designed to complement comprehensive policy tools like Sanoid, diffsnap manages 
 
 Traditional time-based snapshotting struggles with high-frequency intervals. Capturing short windows (e.g., every 15 minutes) over a long retention window (e.g., 30 days) forces you to maintain 2,880 snapshots per dataset. While idle snapshots consume negligible block space, excessive snapshot counts bloat pool metadata and degrade the performance of ZFS commands.
 
-## The diffsnap Approach
+## The diffsnap approach
 
 By monitoring how much data has been written since the most recent snapshot, diffsnap enforces an intelligent data-change threshold. 
 
@@ -79,13 +79,13 @@ Fields:
 - `dataset`: ZFS dataset name.
 - `interval_minutes`: Intervals $\le$ 60: Must divide evenly into $60$. Intervals $>$ 60: Must divide evenly into $1,440$.
 - `retention`: number of matching snapshots to keep.
-- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. snapshots will be named dataset@prefix_date_time
+- `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. Snapshots will be named dataset@prefix_date_time
 - `recursive`: `yes` or `no`.
 - `min_bytes`: minimum written bytes needed before snapshotting.
 
 Blank lines and lines beginning with `#` are ignored.
 
-Example:
+Example (FreeBSD:/usr/local/etc/diffsnap.conf linux:/etc/diffsnap.conf):
 
 ```text
 zroot/downloads 30 100 diffsnap no 1000000
