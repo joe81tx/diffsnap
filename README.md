@@ -1,6 +1,6 @@
 # diffsnap
 
-`diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of solely relying on elapsed time, it queries the native ZFS `written` property to create snapshots only after a dataset has changed by a user-defined byte threshold. 
+`diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of solely relying on elapsed time, it queries the native ZFS `written` property to create snapshots only after a dataset has changed by a user-defined threshold. 
 
 Designed to complement comprehensive policy tools like Sanoid, diffsnap manages and prunes only its own snapshots. It safely coexists alongside existing retention systems.
 
