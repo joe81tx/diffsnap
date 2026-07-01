@@ -76,8 +76,13 @@ diffsnap
 ```
 
 ## Configuration
-copy diffsnap.conf.sample to diffsnap.conf  
-/usr/local/etc/ on FreeBSD or /etc/ on Linux
+
+```sh
+cd /usr/local/etc/ #FreeBSD
+cd /etc/ #Linux
+cp diffsnap.conf.sample diffsnap.conf
+```
+
 ```text
 dataset interval_minutes retention prefix recursive min_bytes
 ```
