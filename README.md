@@ -87,7 +87,7 @@ Fields:
 - `retention`: number of matching snapshots to keep.
 - `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.
 - `recursive`: `yes` or `no`.
-- `min_bytes`: minimum written bytes needed before snapshotting.
+- `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots.
 
 Blank lines and lines beginning with `#` are ignored.
 
