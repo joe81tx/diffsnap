@@ -41,6 +41,8 @@ The Makefile selects OS-specific defaults at build time:
 ## Build
 
 ```sh
+git clone https://github.com/joe81tx/diffsnap.git
+cd diffsnap
 make
 ```
 
@@ -53,8 +55,6 @@ make CONF_PATH=/usr/local/etc/diffsnap.conf ZFS_PATH=/sbin/zfs
 ## Install
 
 ```sh
-git clone https://github.com/joe81tx/diffsnap.git
-cd diffsnap
 mdo make install
 # or
 sudo make install
