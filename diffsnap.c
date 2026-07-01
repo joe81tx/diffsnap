@@ -80,7 +80,7 @@ static void print_help(const char *progname) {
         "  retention         Number of matching snapshots to keep\n"
         "  prefix            Snapshot prefix using letters, numbers, '_' or '-'. To avoid pruning snapshots created outside of diffsnap make sure this is unique\n"
         "  recursive         yes or no\n"
-        "  min_bytes         Minimum written bytes needed before snapshotting\n"
+        "  min_bytes         Minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots\n"
         "\n"
         "Example config line:\n"
         "  zroot/home 60 24 hourly no 0\n"
