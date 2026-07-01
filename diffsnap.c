@@ -86,7 +86,7 @@ static void print_help(const char *progname) {
         "  zroot/home 60 24 hourly no 1000000\n"
         "\n"
         "Example cron line:\n"
-        "  */5 * * * * /usr/local/sbin/diffsnap\n",
+        "  */5 * * * * root /usr/local/sbin/diffsnap\n",
         progname, CONF_PATH, LOG_PATH, LOCK_PATH
     );
 }
