@@ -78,9 +78,8 @@ diffsnap
 ## Configuration
 
 ```sh
-cd /usr/local/etc/ #FreeBSD
-cd /etc/ #Linux
-cp diffsnap.conf.sample diffsnap.conf
+/usr/local/etc/diffsnap.conf #FreeBSD
+/etc/diffsnap.conf #Linux
 ```
 
 ```text
