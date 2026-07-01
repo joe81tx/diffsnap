@@ -19,6 +19,8 @@ LOGDIR ?= /var/log
 RUNSTATEDIR ?= $(OS_RUNSTATEDIR)
 ZFS_PATH ?= $(OS_ZFS_PATH)
 INSTALL ?= install
+INSTALL_PROGRAM ?= $(INSTALL) -m 0755
+INSTALL_DATA ?= $(INSTALL) -m 0644
 
 CONF_PATH ?= $(ETCDIR)/diffsnap.conf
 LOG_PATH ?= $(LOGDIR)/diffsnap.log
@@ -38,11 +40,10 @@ $(PROG): $(SRCS)
 
 install: $(PROG)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
-	$(INSTALL) -m 0755 $(PROG) $(DESTDIR)$(SBINDIR)/$(PROG)
+	$(INSTALL_PROGRAM) $(PROG) $(DESTDIR)$(SBINDIR)/$(PROG)
 	$(INSTALL) -d $(DESTDIR)$(ETCDIR)
-	@if [ ! -f "$(DESTDIR)$(ETCDIR)/diffsnap.conf" ]; then \
-		$(INSTALL) -m 0644 diffsnap.conf $(DESTDIR)$(ETCDIR)/diffsnap.conf; \
-	fi
+	$(INSTALL_DATA) diffsnap.conf \
+		$(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
