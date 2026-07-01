@@ -50,6 +50,6 @@ install: $(PROG)
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
-
+	rm -f $(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
 clean:
 	rm -f $(PROG) *.o
