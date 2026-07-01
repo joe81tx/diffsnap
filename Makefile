@@ -44,6 +44,9 @@ install: $(PROG)
 	$(INSTALL) -d $(DESTDIR)$(ETCDIR)
 	$(INSTALL_DATA) diffsnap.conf \
 		$(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
+	test -f "$(DESTDIR)$(ETCDIR)/diffsnap.conf" || \
+		cp "$(DESTDIR)$(ETCDIR)/diffsnap.conf.sample" \
+		   "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
