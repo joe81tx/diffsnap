@@ -67,6 +67,7 @@ By default this installs `/usr/local/sbin/diffsnap`.
 ```sh
 diffsnap --help
 diffsnap --version
+# When run as root it will process all configured datasets
 diffsnap
 ```
 
