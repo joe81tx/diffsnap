@@ -83,10 +83,10 @@ static void print_help(const char *progname) {
         "  min_bytes         Minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots\n"
         "\n"
         "Example config line:\n"
-        "  zroot/home 60 24 hourly no 0\n"
+        "  zroot/home 60 24 hourly no 1000000\n"
         "\n"
         "Example cron line:\n"
-        "  */15 * * * * /usr/local/sbin/diffsnap\n",
+        "  */5 * * * * /usr/local/sbin/diffsnap\n",
         progname, CONF_PATH, LOG_PATH, LOCK_PATH
     );
 }
