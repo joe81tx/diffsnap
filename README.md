@@ -1,6 +1,6 @@
 # diffsnap
 
-`diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of solely relying on elapsed time, it queries the native ZFS `written` property to create snapshots only after a dataset has changed by a user-defined threshold. 
+`diffsnap` is a lightweight, on-demand snapshot scheduler for OpenZFS. Instead of relying on elapsed time alone, it queries the native ZFS `written` property (bytes modified since the previous snapshot) to create snapshots only after a dataset has changed by a user-defined threshold. 
 
 Designed to complement comprehensive policy tools like Sanoid, `diffsnap` manages and prunes only its own snapshots. It safely coexists alongside existing retention systems.
 
@@ -21,7 +21,7 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshots.
 * **Atomic Batching:** Groups datasets into a single snapshot command to reduce disk I/O.
-* **Zero Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
+* **Low Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
 ## Supported systems
@@ -102,7 +102,7 @@ zroot/jails 1440 14 daily yes 0
 ```
 
 ## System Scheduler
-`diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. For `diffsnap` to evaluate a dataset, the system scheduler must run the binary the minute that matches the dataset's configured interval_minutes. If not, the snapshot window is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
+`diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. `diffsnap` only evaluates datasets when it is invoked. If the scheduler doesn't invoke `diffsnap` at the expected interval boundary, that evaluation is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
 If your system schedule for `diffsnap` is 20 and your interval_minutes is 15 you'll only get one snapshot per hour instead of the intended 4.
 If your system schedule for `diffsnap` is 10 and your interval_minutes is 5 you'll only get a snapshot every 10 minutes instead of every 5.
