@@ -109,16 +109,17 @@ For example, if `diffsnap` is scheduled every 20 minutes, datasets configured fo
 
 The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using `zfs allow`. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
-FreeBSD Crontab Configuration (/etc/cron.d/diffsnap)
+FreeBSD Crontab Configuration
 
 ```cron
+# /etc/cron.d/diffsnap
 * * * * * root /usr/local/sbin/diffsnap
 ```
 
-Linux systemd Unit Files (/etc/systemd/system/)
+Linux systemd Unit Files:
 
 ```ini
-# diffsnap.service
+# /etc/systemd/system/diffsnap.service
 [Unit]
 Description=Create ZFS snapshots using diffsnap
 
@@ -128,7 +129,7 @@ ExecStart=/usr/local/sbin/diffsnap
 ```
 
 ```ini
-# diffsnap.timer
+# /etc/systemd/system/diffsnap.timer
 [Unit]
 Description=Run diffsnap every minute
 
@@ -138,6 +139,11 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable diffsnap.timer --now
 ```
 
 ## License
