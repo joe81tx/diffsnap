@@ -12,7 +12,7 @@ Traditional time-based snapshotting struggles with high-frequency intervals. Cap
 
 By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces an intelligent data-change threshold. 
 
-Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` will capture all modifications, including deletions.
+Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` causes every detected change, including deletions and metadata updates, to qualify for snapshot creation.
 
 ## Features
 
@@ -20,7 +20,7 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshots.
-* **Atomic Batching:** Groups compatible datasets into a single zfs snapshot invocation for consistent snapshot timestamps and reduced command overhead.
+* **Atomic Batching:** Groups compatible datasets into a single `zfs snapshot` invocation for consistent snapshot timestamps and reduced command overhead.
 * **Low Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
@@ -67,7 +67,7 @@ By default this installs `/usr/local/sbin/diffsnap`.
 ```sh
 diffsnap --help
 diffsnap --version
-# When run as root it will process all configured datasets
+# Process all configured datasets (run as root)
 diffsnap
 ```
 
@@ -107,7 +107,7 @@ zroot/jails 1440 14 daily yes 0
 
 For example, if `diffsnap` is scheduled every 20 minutes, datasets configured for 15-minute intervals can only be evaluated at minutes 0, 20, and 40, so three of four intended evaluations are skipped. For this reason, running `diffsnap` every minute is recommended.
 
-The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using zfs allow. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
+The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using `zfs allow`. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
 FreeBSD Crontab Configuration (/etc/cron.d/diffsnap)
 
