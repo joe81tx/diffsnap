@@ -38,18 +38,18 @@ The Makefile selects OS-specific defaults at build time:
 | **Lock** | `/var/run/diffsnap.lock` | `/run/diffsnap.lock` |
 | **ZFS** | `/sbin/zfs` | `/usr/sbin/zfs` if present, otherwise `/sbin/zfs` |
 
+Path defaults can be overridden at build time:
+
+```sh
+make CONF_PATH=/usr/local/etc/diffsnap.conf ZFS_PATH=/sbin/zfs
+```
+
 ## Build
 
 ```sh
 git clone https://github.com/joe81tx/diffsnap.git
 cd diffsnap
 make
-```
-
-Path defaults can be overridden at build time:
-
-```sh
-make CONF_PATH=/usr/local/etc/diffsnap.conf ZFS_PATH=/sbin/zfs
 ```
 
 ## Install
