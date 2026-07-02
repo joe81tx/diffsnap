@@ -79,7 +79,7 @@ static void print_help(const char *progname) {
         "\n"
         "Field notes:\n"
         "  dataset           ZFS dataset name\n"
-        "  interval_minutes  Minutes between snapshot checks - reset at midnight, not hourly so intervals carry over hour boundaries. E.g., 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10)\n"
+        "  interval_minutes  Minutes between snapshots - reset at midnight. Intervals carry over hour boundaries so 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10). Values greater than 1439 only match at midnight.\n"
         "  retention         Number of matching snapshots to keep\n"
         "  prefix            Snapshot prefix using letters, numbers, '_' or '-'. To avoid pruning snapshots created outside of diffsnap make sure this is unique\n"
         "  recursive         yes or no\n"
