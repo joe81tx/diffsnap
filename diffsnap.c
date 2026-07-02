@@ -76,7 +76,7 @@ static void print_help(const char *progname) {
         "\n"
         "Field notes:\n"
         "  dataset           ZFS dataset name\n"
-        "  interval_minutes  Intervals less than 60 must divide evenly into 60. Intervals greater than 60 must divide evenly into 1440\n"
+        "  interval_minutes  Minutes between snapshot checks - reset at midnight, not hourly so intervals carry over hour boundaries. E.g., 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10)\n"
         "  retention         Number of matching snapshots to keep\n"
         "  prefix            Snapshot prefix using letters, numbers, '_' or '-'. To avoid pruning snapshots created outside of diffsnap make sure this is unique\n"
         "  recursive         yes or no\n"
@@ -86,7 +86,7 @@ static void print_help(const char *progname) {
         "  zroot/home 60 24 hourly no 1000000\n"
         "\n"
         "Example cron line:\n"
-        "  */5 * * * * root /usr/local/sbin/diffsnap\n",
+        "  * * * * * root /usr/local/sbin/diffsnap\n",
         progname, CONF_PATH, LOG_PATH, LOCK_PATH
     );
 }
