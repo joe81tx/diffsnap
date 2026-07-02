@@ -86,7 +86,7 @@ Snapshots will be named `dataset@prefix_date_time`
 Fields:
 
 - `dataset`: ZFS dataset name.
-- `interval_minutes`: Minutes between snapshot checks - reset at midnight, not hourly so intervals carry over hour boundaries. E.g., 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10).
+- `interval_minutes`: Minutes between snapshots - reset at midnight. Intervals carry over hour boundaries so 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10). Values greater than 1439 only match at midnight.
 - `retention`: number of matching snapshots to keep.
 - `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.
 - `recursive`: `yes` or `no`.
