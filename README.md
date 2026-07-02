@@ -10,7 +10,7 @@ Traditional time-based snapshotting struggles with high-frequency intervals. Cap
 
 ## The diffsnap approach
 
-By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces an intelligent data-change threshold. 
+By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces a configurable data-change threshold.
 
 Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` causes every detected change, including deletions and metadata updates, to qualify for snapshot creation.
 
