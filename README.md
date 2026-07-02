@@ -74,8 +74,8 @@ diffsnap
 ## Configuration
 
 ```sh
-/usr/local/etc/diffsnap.conf   #  FreeBSD  
-/etc/diffsnap.conf             #  Linux  
+/usr/local/etc/diffsnap.conf   # FreeBSD  
+/etc/diffsnap.conf             # Linux  
 ```
 
 ```text
