@@ -6,7 +6,7 @@ Designed to complement comprehensive policy tools like Sanoid, `diffsnap` manage
 
 ## The Problem
 
-Traditional time-based snapshotting struggles with high-frequency intervals. Capturing short windows (e.g., every 15 minutes) over a long retention window (e.g., 30 days) forces you to maintain 2,880 snapshots per dataset. While idle snapshots consume negligible block space, excessive snapshot counts bloat pool metadata and degrade the performance of ZFS commands.
+Traditional time-based snapshotting struggles with high-frequency intervals. Capturing short windows (e.g., every 15 minutes) over a long retention window (e.g., 30 days) forces you to maintain 2,880 snapshots per dataset. While idle snapshots consume negligible block space, excessive snapshot counts bloat pool metadata and can degrade the performance of ZFS commands.
 
 ## The diffsnap approach
 
@@ -20,7 +20,7 @@ Because background metadata processes (such as directory lock updates, protocol 
 * **Granular Control:** Per-dataset scheduling intervals, retention counts, and byte thresholds.
 * **Safety First:** Only prunes snapshots matching its own prefix context and locks to prevent overlapping runs.
 * **Hierarchy Aware:** Supports both standard and recursive snapshots.
-* **Atomic Batching:** Groups datasets into a single snapshot command to reduce disk I/O.
+* **Atomic Batching:** Groups compatible datasets into a single zfs snapshot invocation for consistent snapshot timestamps and reduced command overhead.
 * **Low Overhead:** Completely stateless; operates strictly via standard `zfs` CLI utilities with no background daemon.
 * **System Native:** Easily integrated with `cron` or systemd timers.
 
@@ -75,7 +75,7 @@ diffsnap
 
 ```sh
 /usr/local/etc/diffsnap.conf #FreeBSD
-/etc/diffsnap.conf #Linux
+/etc/diffsnap.conf           #Linux
 ```
 
 ```text
@@ -94,7 +94,7 @@ Fields:
 
 Blank lines and lines beginning with `#` are ignored.
 
-Example:  
+Example config:  
 
 ```text
 zroot/downloads 30 100 diffsnap no 1000000
@@ -102,12 +102,10 @@ tank/media 5 100 diffsnap no 1000000
 zroot/jails 1440 14 daily yes 0
 ```
 
-## System Scheduler
+## Scheduling
 `diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. `diffsnap` only evaluates datasets when it is invoked. If the scheduler doesn't invoke `diffsnap` at the expected interval boundary, that evaluation is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
-If your system schedule for `diffsnap` is 20 and your interval_minutes is 15 you'll only get one snapshot per hour instead of the intended 4.
-If your system schedule for `diffsnap` is 10 and your interval_minutes is 5 you'll only get a snapshot every 10 minutes instead of every 5.
-The easiest way to avoid these issues is to set the system schedule to run every minute.
+For example, if `diffsnap` is scheduled every 20 minutes, datasets configured for 15-minute intervals can only be evaluated at minutes 0, 20, and 40, so three of four intended evaluations are skipped. For this reason, running `diffsnap` every minute is recommended.
 
 The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using zfs allow. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
