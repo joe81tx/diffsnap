@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <sys/select.h>
 
 #ifndef CONF_PATH
 #define CONF_PATH "/usr/local/etc/diffsnap.conf"
@@ -49,12 +50,14 @@
 
 static FILE *log_fp = NULL;
 
+typedef int (*line_handler_t)(const char *line, void *data);
 typedef struct { char *dataset; char *prefix; size_t retention; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
 typedef struct { char **snaps; size_t count; size_t capacity; const char *match_str; size_t match_len; } prune_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
 typedef struct { char name[STR_BUF_LARGE]; long long written; } metric_item_t;
 typedef struct { metric_item_t *items; size_t count; size_t capacity; } metric_ctx_t;
+typedef struct { int fd; line_handler_t handler; void *data; int is_stderr; char buf[STR_BUF_XLARGE]; size_t used; int failed; } stream_reader_t;
 
 static void print_version(void) {
     printf("diffsnap %s\n", DIFFSNAP_VERSION);
@@ -170,46 +173,100 @@ static void name_list_free(name_list_t *list) {
     list->names = NULL; list->count = 0; list->capacity = 0;
 }
 
-typedef int (*line_handler_t)(const char *line, void *data);
-
-static int process_stream(int fd, line_handler_t handler, void *data) {
-    FILE *stream = fdopen(fd, "r");
-    if (!stream) { close(fd); return -1; }
-    char line_buf[STR_BUF_XLARGE];
-    int handler_failed = 0;
-    for (;;) {
-        if (fgets(line_buf, sizeof(line_buf), stream) != NULL) {
-            trim_trailing_whitespace(line_buf);
-            if (!handler_failed && handler(line_buf, data) != 0) handler_failed = 1;
-            continue;
-        }
-        if (ferror(stream) && errno == EINTR) { clearerr(stream); continue; }
-        break;
+static void stream_reader_line(stream_reader_t *reader) {
+    reader->buf[reader->used] = '\0';
+    trim_trailing_whitespace(reader->buf);
+    if (reader->is_stderr) {
+        if (reader->buf[0] != '\0') log_msg("Error: zfs: %s", reader->buf);
+    } else if (!reader->failed && reader->handler(reader->buf, reader->data) != 0) {
+        reader->failed = 1;
     }
-    int err = ferror(stream);
-    fclose(stream);
-    return (handler_failed || err) ? -1 : 0;
+    reader->used = 0;
+}
+
+static void stream_reader_consume(stream_reader_t *reader, const char *buf, ssize_t len) {
+    for (ssize_t i = 0; i < len; i++) {
+        if (buf[i] == '\n') {
+            stream_reader_line(reader);
+        } else if (reader->used < sizeof(reader->buf) - 1) {
+            reader->buf[reader->used++] = buf[i];
+        } else {
+            stream_reader_line(reader);
+            if (!reader->is_stderr) reader->failed = 1;
+        }
+    }
+}
+
+static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *err_reader) {
+    int out_open = out_reader && out_reader->fd >= 0;
+    int err_open = err_reader && err_reader->fd >= 0;
+    while (out_open || err_open) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        int max_fd = -1;
+        if (out_open) { FD_SET(out_reader->fd, &readfds); if (out_reader->fd > max_fd) max_fd = out_reader->fd; }
+        if (err_open) { FD_SET(err_reader->fd, &readfds); if (err_reader->fd > max_fd) max_fd = err_reader->fd; }
+        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) == -1) {
+            if (errno == EINTR) continue;
+            if (out_open) out_reader->failed = 1;
+            if (err_open) err_reader->failed = 1;
+            break;
+        }
+        stream_reader_t *readers[] = { out_reader, err_reader };
+        for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++) {
+            stream_reader_t *reader = readers[i];
+            if (!reader || reader->fd < 0 || !FD_ISSET(reader->fd, &readfds)) continue;
+            char buf[STR_BUF_XLARGE];
+            ssize_t nread = read(reader->fd, buf, sizeof(buf));
+            if (nread > 0) {
+                stream_reader_consume(reader, buf, nread);
+            } else {
+                if (nread < 0 && errno == EINTR) continue;
+                if (nread < 0) reader->failed = 1;
+                if (reader->used > 0) stream_reader_line(reader);
+                close(reader->fd);
+                reader->fd = -1;
+                if (reader == out_reader) out_open = 0;
+                else err_open = 0;
+            }
+        }
+    }
+    return ((out_reader && out_reader->failed) || (err_reader && err_reader->failed)) ? -1 : 0;
 }
 
 static int exec_cmd_stream(const char *const argv[], line_handler_t handler, void *data) {
-    int pfd[2];
-    if (handler && pipe2(pfd, O_CLOEXEC) == -1) return -1;
+    int out_pfd[2] = {-1, -1}, err_pfd[2] = {-1, -1};
+    if (handler && pipe2(out_pfd, O_CLOEXEC) == -1) return -1;
+    if (pipe2(err_pfd, O_CLOEXEC) == -1) {
+        if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
+        return -1;
+    }
     pid_t pid = fork();
-    if (pid == -1) { if (handler) { close(pfd[0]); close(pfd[1]); } return -1; }
+    if (pid == -1) {
+        if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
+        close(err_pfd[0]); close(err_pfd[1]);
+        return -1;
+    }
     if (pid == 0) {
         if (handler) {
-            if (dup2(pfd[1], STDOUT_FILENO) == -1 || dup2(pfd[1], STDERR_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
-            close(pfd[0]); close(pfd[1]);
+            if (dup2(out_pfd[1], STDOUT_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
+            close(out_pfd[0]); close(out_pfd[1]);
         } else {
             int devnull = open("/dev/null", O_WRONLY);
-            if (devnull == -1 || dup2(devnull, STDOUT_FILENO) == -1 || dup2(devnull, STDERR_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
+            if (devnull == -1 || dup2(devnull, STDOUT_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
             close(devnull);
         }
+        if (dup2(err_pfd[1], STDERR_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
+        close(err_pfd[0]); close(err_pfd[1]);
         execv(argv[0], (char *const *)argv);
         _exit(EXIT_EXEC_FAILED);
     }
     int processing_rc = 0;
-    if (handler) { close(pfd[1]); processing_rc = process_stream(pfd[0], handler, data); }
+    if (handler) close(out_pfd[1]);
+    close(err_pfd[1]);
+    stream_reader_t out_reader = { .fd = handler ? out_pfd[0] : -1, .handler = handler, .data = data, .is_stderr = 0, .used = 0, .failed = 0 };
+    stream_reader_t err_reader = { .fd = err_pfd[0], .handler = NULL, .data = NULL, .is_stderr = 1, .used = 0, .failed = 0 };
+    processing_rc = drain_command_streams(handler ? &out_reader : NULL, &err_reader);
     int status; pid_t wpid;
     do { wpid = waitpid(pid, &status, 0); } while (wpid == -1 && errno == EINTR);
     return (wpid != -1 && processing_rc == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
@@ -300,7 +357,7 @@ static void batch_free(batch_ctx_t *ctx) {
 
 static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *timestamp) {
     if (ctx->count == 0) return 0;
-    size_t total_args = (recursive ? 4 : 3) + ctx->count + 1;
+    size_t total_args = (recursive ? 3 : 2) + ctx->count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
     if (!argv) return -1;
     size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
@@ -464,8 +521,8 @@ int main(int argc, char *argv[]) {
         if (!token) continue;
         if (copy_token(dataset, sizeof(dataset), token) != 0) { log_msg("Error: Config error: dataset name too long"); global_status = 1; continue; }
         REQUIRE_TOKEN("missing interval field"); errno = 0; interval_mins = strtoll(token, &endptr, 10);
-        if (errno == ERANGE || *endptr != '\0' || interval_mins <= 0 || interval_mins > 1440 || (1440 % interval_mins != 0 && interval_mins > 60)) {
-            log_msg("Error: Config error for %s: invalid or non-uniform day interval '%s'", dataset, token); global_status = 1; continue;
+        if (errno == ERANGE || *endptr != '\0' || interval_mins <= 0) {
+            log_msg("Error: Config error for %s: invalid interval '%s'", dataset, token); global_status = 1; continue;
         }
         REQUIRE_TOKEN("missing retention field"); errno = 0; retention_val = strtoll(token, &endptr, 10);
         if (errno == ERANGE || *endptr != '\0' || retention_val < 1) {
