@@ -193,6 +193,7 @@ static void stream_reader_consume(stream_reader_t *reader, const char *buf, ssiz
         } else {
             stream_reader_line(reader);
             if (!reader->is_stderr) reader->failed = 1;
+            reader->buf[reader->used++] = buf[i];
         }
     }
 }
