@@ -331,7 +331,14 @@ static int handle_metric_line(const char *line, void *data) {
 }
 
 static int compare_metrics(const void *a, const void *b) { return strcmp(((metric_item_t *)a)->name, ((metric_item_t *)b)->name); }
-static int zfs_destroy(const char *snap_name) { const char *const argv[] = {ZFS_PATH, "destroy", snap_name, NULL}; return exec_cmd_stream(argv, NULL, NULL); }
+static int zfs_destroy(const char *snap_name, int recursive) {
+    if (recursive) {
+        const char *const argv[] = {ZFS_PATH, "destroy", "-r", snap_name, NULL};
+        return exec_cmd_stream(argv, NULL, NULL);
+    }
+    const char *const argv[] = {ZFS_PATH, "destroy", snap_name, NULL};
+    return exec_cmd_stream(argv, NULL, NULL);
+}
 
 static int handle_prune_line(const char *line, void *data) {
     prune_ctx_t *ctx = (prune_ctx_t *)data;
@@ -351,7 +358,7 @@ static int handle_prune_line(const char *line, void *data) {
     return 0;
 }
 
-static int prune_old_snapshots(const char *dataset, const char *prefix, size_t max_snaps) {
+static int prune_old_snapshots(const char *dataset, const char *prefix, size_t max_snaps, int recursive) {
     char match_str[STR_BUF_LARGE];
     int match_rc = snprintf(match_str, sizeof(match_str), "%s_", prefix);
     if (match_rc < 0 || (size_t)match_rc >= sizeof(match_str)) return -1;
@@ -364,7 +371,7 @@ static int prune_old_snapshots(const char *dataset, const char *prefix, size_t m
     int prune_errors = 0;
     while (ctx.count > max_snaps) {
         char *oldest = ctx.snaps[--ctx.count];
-        if (zfs_destroy(oldest) == 0) log_msg("Pruned snapshot: %s", oldest);
+        if (zfs_destroy(oldest, recursive) == 0) log_msg("Pruned snapshot%s: %s", recursive ? " recursively" : "", oldest);
         else { log_msg("Error: Failed to prune snapshot %s", oldest); prune_errors++; }
         free(oldest); ctx.snaps[ctx.count] = NULL;
     }
@@ -546,7 +553,7 @@ static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *
         char h_bytes[STR_BUF_SMALL] = "0";
         if (found && found->written != -1) format_bytes(found->written, h_bytes, sizeof(h_bytes));
         log_msg("Snapshot created%s: %s (%s written)", recursive ? " (recursive)" : "", snap_name, h_bytes);
-        if (prune_old_snapshots(batch->items[i].dataset, batch->items[i].prefix, batch->items[i].retention) != 0) status = 1;
+        if (prune_old_snapshots(batch->items[i].dataset, batch->items[i].prefix, batch->items[i].retention, recursive) != 0) status = 1;
     }
     name_list_free(&snapshots);
     return status;
