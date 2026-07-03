@@ -356,18 +356,33 @@ static void batch_free(batch_ctx_t *ctx) {
     free(ctx->items);
 }
 
-static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *timestamp) {
-    if (ctx->count == 0) return 0;
-    size_t total_args = (recursive ? 3 : 2) + ctx->count + 1;
+static size_t zfs_root_len(const char *dataset) {
+    const char *slash = strchr(dataset, '/');
+    return slash ? (size_t)(slash - dataset) : strlen(dataset);
+}
+
+static int same_zfs_root(const char *a, const char *b) {
+    size_t a_len = zfs_root_len(a), b_len = zfs_root_len(b);
+    return a_len == b_len && strncmp(a, b, a_len) == 0;
+}
+
+static int zfs_snapshot_batch_root(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset) {
+    size_t snap_count = 0, total_bytes = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
+        snap_count++;
+        total_bytes += strlen(ctx->items[i].dataset) + strlen(ctx->items[i].prefix) + strlen(timestamp) + 3;
+    }
+    if (snap_count == 0) return 0;
+    size_t total_args = (recursive ? 3 : 2) + snap_count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
     if (!argv) return -1;
     size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
-    size_t total_bytes = 0;
-    for (size_t i = 0; i < ctx->count; i++) total_bytes += strlen(ctx->items[i].dataset) + strlen(ctx->items[i].prefix) + strlen(timestamp) + 3;
     char *arena = malloc(total_bytes), *offset = arena;
     if (!arena) { free(argv); return -1; }
     for (size_t i = 0; i < ctx->count; i++) {
+        if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
         size_t remaining = total_bytes - (size_t)(offset - arena);
         int written = snprintf(offset, remaining, "%s@%s_%s", ctx->items[i].dataset, ctx->items[i].prefix, timestamp);
         if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); return -1; }
@@ -376,6 +391,23 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
     argv[idx] = NULL;
     int rc = exec_cmd_stream(argv, NULL, NULL);
     free(arena); free(argv); return rc;
+}
+
+static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *timestamp) {
+    if (ctx->count == 0) return 0;
+    int status = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        int seen_root = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (same_zfs_root(ctx->items[i].dataset, ctx->items[j].dataset)) {
+                seen_root = 1;
+                break;
+            }
+        }
+        if (seen_root) continue;
+        if (zfs_snapshot_batch_root(ctx, recursive, timestamp, ctx->items[i].dataset) != 0) status = -1;
+    }
+    return status;
 }
 
 static int compare_names(const void *a, const void *b) {
