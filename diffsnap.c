@@ -51,12 +51,13 @@
 static FILE *log_fp = NULL;
 
 typedef int (*line_handler_t)(const char *line, void *data);
-typedef struct { char *dataset; char *prefix; size_t retention; } batch_item_t;
+typedef struct { char *dataset; char *prefix; size_t retention; int snap_failed; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
 typedef struct { char **snaps; size_t count; size_t capacity; const char *match_str; size_t match_len; } prune_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
 typedef struct { char name[STR_BUF_LARGE]; long long written; } metric_item_t;
 typedef struct { metric_item_t *items; size_t count; size_t capacity; } metric_ctx_t;
+typedef struct { char **keys; size_t count; size_t capacity; } seen_set_t;
 typedef struct { int fd; line_handler_t handler; void *data; int is_stderr; char buf[STR_BUF_XLARGE]; size_t used; int failed; } stream_reader_t;
 
 static void print_version(void) {
@@ -140,6 +141,14 @@ static void log_msg(const char *fmt, ...) {
     va_end(args);
 }
 
+static void early_fail(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
 static void format_bytes(long long bytes, char *buf, size_t buf_size) {
     if (bytes <= 0) {
         snprintf(buf, buf_size, "0");
@@ -171,6 +180,31 @@ static void name_list_free(name_list_t *list) {
     for (size_t i = 0; i < list->count; i++) free(list->names[i]);
     free(list->names);
     list->names = NULL; list->count = 0; list->capacity = 0;
+}
+
+static int seen_set_add(seen_set_t *set, const char *dataset, const char *prefix) {
+    char key[STR_BUF_LARGE + STR_BUF_MED + 2];
+    int n = snprintf(key, sizeof(key), "%s\x1f%s", dataset, prefix);
+    if (n < 0 || (size_t)n >= sizeof(key)) return -1;
+    for (size_t i = 0; i < set->count; i++) {
+        if (strcmp(set->keys[i], key) == 0) return 1;
+    }
+    if (set->count >= set->capacity) {
+        size_t new_cap = set->capacity == 0 ? ALLOC_CHUNK_BATCH : set->capacity * 2;
+        char **tmp = realloc(set->keys, new_cap * sizeof(*set->keys));
+        if (!tmp) return -1;
+        set->keys = tmp; set->capacity = new_cap;
+    }
+    char *k = strdup(key);
+    if (!k) return -1;
+    set->keys[set->count++] = k;
+    return 0;
+}
+
+static void seen_set_free(seen_set_t *set) {
+    for (size_t i = 0; i < set->count; i++) free(set->keys[i]);
+    free(set->keys);
+    set->keys = NULL; set->count = 0; set->capacity = 0;
 }
 
 static void stream_reader_line(stream_reader_t *reader) {
@@ -347,7 +381,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = strdup(dataset), *p = strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .snap_failed = 0 };
     return 0;
 }
 
@@ -366,6 +400,12 @@ static int same_zfs_root(const char *a, const char *b) {
     return a_len == b_len && strncmp(a, b, a_len) == 0;
 }
 
+static void batch_mark_root_failed(batch_ctx_t *ctx, const char *root_dataset) {
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (same_zfs_root(ctx->items[i].dataset, root_dataset)) ctx->items[i].snap_failed = 1;
+    }
+}
+
 static int zfs_snapshot_batch_root(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset) {
     size_t snap_count = 0, total_bytes = 0;
     for (size_t i = 0; i < ctx->count; i++) {
@@ -376,20 +416,21 @@ static int zfs_snapshot_batch_root(batch_ctx_t *ctx, int recursive, const char *
     if (snap_count == 0) return 0;
     size_t total_args = (recursive ? 3 : 2) + snap_count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
-    if (!argv) return -1;
+    if (!argv) { batch_mark_root_failed(ctx, root_dataset); return -1; }
     size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
     char *arena = malloc(total_bytes), *offset = arena;
-    if (!arena) { free(argv); return -1; }
+    if (!arena) { free(argv); batch_mark_root_failed(ctx, root_dataset); return -1; }
     for (size_t i = 0; i < ctx->count; i++) {
         if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
         size_t remaining = total_bytes - (size_t)(offset - arena);
         int written = snprintf(offset, remaining, "%s@%s_%s", ctx->items[i].dataset, ctx->items[i].prefix, timestamp);
-        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); return -1; }
+        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_root_failed(ctx, root_dataset); return -1; }
         argv[idx++] = offset; offset += written + 1;
     }
     argv[idx] = NULL;
     int rc = exec_cmd_stream(argv, NULL, NULL);
+    if (rc != 0) batch_mark_root_failed(ctx, root_dataset);
     free(arena); free(argv); return rc;
 }
 
@@ -482,8 +523,12 @@ static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *
     int status = rc != 0 ? 1 : 0;
     name_list_t snapshots = { NULL, 0, 0 };
     int can_verify = 1;
+    int need_inventory = 0;
+    for (size_t i = 0; i < batch->count; i++) {
+        if (batch->items[i].snap_failed) { need_inventory = 1; break; }
+    }
     if (rc != 0) log_msg("Error: %s zfs snapshot batch execution failed", recursive ? "recursive" : "standard");
-    if (rc != 0 && load_snapshot_inventory(&snapshots) != 0) {
+    if (need_inventory && load_snapshot_inventory(&snapshots) != 0) {
         log_msg("Error: Unable to list snapshots for %sbatch verification", recursive ? "recursive " : "");
         can_verify = 0;
     }
@@ -491,7 +536,7 @@ static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *
         char snap_name[STR_BUF_XLARGE];
         int len = snprintf(snap_name, sizeof(snap_name), "%s@%s_%s", batch->items[i].dataset, batch->items[i].prefix, snap_time);
         if (len < 0 || (size_t)len >= sizeof(snap_name)) { log_msg("Error: %sSnapshot name too long for %s", recursive ? "Recursive " : "", batch->items[i].dataset); status = 1; continue; }
-        if (rc != 0) {
+        if (batch->items[i].snap_failed) {
             if (!can_verify) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
             if (!name_index_contains(snapshots.names, snapshots.count, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
         }
@@ -528,19 +573,42 @@ int main(int argc, char *argv[]) {
     }
 
     int lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT, 0600);
-    if (lock_fd < 0) return 1;
-    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) { close(lock_fd); return 1; }
+    if (lock_fd < 0) {
+        int saved_errno = errno;
+        early_fail("%s: failed to open lock file %s: %s", progname, LOCK_PATH, strerror(saved_errno));
+        return 1;
+    }
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        int saved_errno = errno;
+        if (saved_errno == EWOULDBLOCK) {
+            early_fail("%s: another instance is already running (lock held on %s)", progname, LOCK_PATH);
+        } else {
+            early_fail("%s: failed to acquire lock %s: %s", progname, LOCK_PATH, strerror(saved_errno));
+        }
+        close(lock_fd);
+        return 1;
+    }
     int global_status = 0, ret_code = 0;
     metric_ctx_t metrics = { NULL, 0, 0 };
     batch_ctx_t std_b = { NULL, 0, 0 }, rec_b = { NULL, 0, 0 };
+    seen_set_t seen = { NULL, 0, 0 };
     char *line = NULL; FILE *conf = NULL;
-    if ((log_fp = fopen(LOG_PATH, "a")) == NULL) { ret_code = 1; goto cleanup; }
+    if ((log_fp = fopen(LOG_PATH, "a")) == NULL) {
+        int saved_errno = errno;
+        early_fail("%s: failed to open log file %s: %s", progname, LOG_PATH, strerror(saved_errno));
+        ret_code = 1; goto cleanup;
+    }
     setvbuf(log_fp, NULL, _IOLBF, 0);
     const char *const m_argv[] = {ZFS_PATH, "get", "-H", "-p", "-o", "name,value", "written", NULL};
     if (exec_cmd_stream(m_argv, handle_metric_line, &metrics) != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
     qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
     conf = fopen(CONF_PATH, "r");
-    if (!conf) { ret_code = 1; goto cleanup; }
+    if (!conf) {
+        int saved_errno = errno;
+        early_fail("%s: failed to open config file %s: %s", progname, CONF_PATH, strerror(saved_errno));
+        log_msg("Error: failed to open config file %s: %s", CONF_PATH, strerror(saved_errno));
+        ret_code = 1; goto cleanup;
+    }
     time_t t = time(NULL); struct tm tm_info; 
     if (localtime_r(&t, &tm_info) == NULL) { ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
@@ -574,6 +642,9 @@ int main(int argc, char *argv[]) {
         if (strcmp(recursive_str, "yes") == 0) is_recursive = 1;
         else if (strcmp(recursive_str, "no") == 0) is_recursive = 0;
         else { log_msg("Error: Config error for %s: invalid recursive flag option '%s'", dataset, recursive_str); global_status = 1; continue; }
+        int seen_rc = seen_set_add(&seen, dataset, prefix);
+        if (seen_rc == -1) { log_msg("Error: Failed to track config entry for %s", dataset); global_status = 1; continue; }
+        if (seen_rc == 1) { log_msg("Error: Config error for %s: duplicate dataset/prefix '%s' in config, skipping", dataset, prefix); global_status = 1; continue; }
         if (current_day_mins % interval_mins != 0) continue;
         metric_item_t key = {0}; memcpy(key.name, dataset, strlen(dataset) + 1);
         metric_item_t *found = bsearch(&key, metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
@@ -591,5 +662,5 @@ int main(int argc, char *argv[]) {
     if (process_batch(&rec_b, &metrics, snap_time, 1) != 0) global_status = 1;
     ret_code = global_status;
 cleanup:
-    free(line); if (conf) fclose(conf); free(metrics.items); batch_free(&std_b); batch_free(&rec_b); if (log_fp) fclose(log_fp); close(lock_fd); return ret_code;
+    free(line); if (conf) fclose(conf); free(metrics.items); batch_free(&std_b); batch_free(&rec_b); seen_set_free(&seen); if (log_fp) fclose(log_fp); close(lock_fd); return ret_code;
 }
