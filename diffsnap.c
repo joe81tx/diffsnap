@@ -44,7 +44,7 @@
         if (!token) { \
             log_msg("Error: Config error for %s: %s", dataset, err_msg); \
             global_status = 1; \
-            continue; \
+            goto next_line; \
         } \
     } while (0)
 
@@ -417,37 +417,62 @@ static int same_zfs_root(const char *a, const char *b) {
     return a_len == b_len && strncmp(a, b, a_len) == 0;
 }
 
-static void batch_mark_root_failed(batch_ctx_t *ctx, const char *root_dataset) {
-    for (size_t i = 0; i < ctx->count; i++) {
-        if (same_zfs_root(ctx->items[i].dataset, root_dataset)) ctx->items[i].snap_failed = 1;
-    }
+static int same_zfs_dataset(const char *a, const char *b) {
+    return strcmp(a, b) == 0;
 }
 
-static int zfs_snapshot_batch_root(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset) {
-    size_t snap_count = 0, total_bytes = 0;
+static size_t batch_dataset_pass(const batch_ctx_t *ctx, size_t item_idx) {
+    size_t pass = 0;
+    for (size_t i = 0; i < item_idx; i++) {
+        if (same_zfs_dataset(ctx->items[i].dataset, ctx->items[item_idx].dataset)) pass++;
+    }
+    return pass;
+}
+
+static int batch_item_in_root_pass(const batch_ctx_t *ctx, size_t item_idx, const char *root_dataset, size_t pass) {
+    return same_zfs_root(ctx->items[item_idx].dataset, root_dataset) && batch_dataset_pass(ctx, item_idx) == pass;
+}
+
+static size_t batch_root_pass_count(const batch_ctx_t *ctx, const char *root_dataset) {
+    size_t pass_count = 0;
     for (size_t i = 0; i < ctx->count; i++) {
         if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
+        size_t item_pass = batch_dataset_pass(ctx, i) + 1;
+        if (item_pass > pass_count) pass_count = item_pass;
+    }
+    return pass_count;
+}
+
+static void batch_mark_root_pass_failed(batch_ctx_t *ctx, const char *root_dataset, size_t pass) {
+    for (size_t i = 0; i < ctx->count; i++)
+        if (batch_item_in_root_pass(ctx, i, root_dataset, pass)) ctx->items[i].snap_failed = 1;
+}
+
+static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset, size_t pass) {
+    size_t snap_count = 0, total_bytes = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
         snap_count++;
         total_bytes += strlen(ctx->items[i].dataset) + strlen(ctx->items[i].prefix) + strlen(timestamp) + 3;
     }
     if (snap_count == 0) return 0;
     size_t total_args = (recursive ? 3 : 2) + snap_count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
-    if (!argv) { batch_mark_root_failed(ctx, root_dataset); return -1; }
+    if (!argv) { batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
     size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
     char *arena = malloc(total_bytes), *offset = arena;
-    if (!arena) { free(argv); batch_mark_root_failed(ctx, root_dataset); return -1; }
+    if (!arena) { free(argv); batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
     for (size_t i = 0; i < ctx->count; i++) {
-        if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
+        if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
         size_t remaining = total_bytes - (size_t)(offset - arena);
         int written = snprintf(offset, remaining, "%s@%s_%s", ctx->items[i].dataset, ctx->items[i].prefix, timestamp);
-        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_root_failed(ctx, root_dataset); return -1; }
+        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
         argv[idx++] = offset; offset += written + 1;
     }
     argv[idx] = NULL;
     int rc = exec_cmd_stream(argv, NULL, NULL);
-    if (rc != 0) batch_mark_root_failed(ctx, root_dataset);
+    if (rc != 0) batch_mark_root_pass_failed(ctx, root_dataset, pass);
     free(arena); free(argv); return rc;
 }
 
@@ -463,7 +488,9 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
             }
         }
         if (seen_root) continue;
-        if (zfs_snapshot_batch_root(ctx, recursive, timestamp, ctx->items[i].dataset) != 0) status = -1;
+        size_t pass_count = batch_root_pass_count(ctx, ctx->items[i].dataset);
+        for (size_t pass = 0; pass < pass_count; pass++)
+            if (zfs_snapshot_batch_root_pass(ctx, recursive, timestamp, ctx->items[i].dataset, pass) != 0) status = -1;
     }
     return status;
 }
@@ -670,6 +697,7 @@ int main(int argc, char *argv[]) {
         if (found->written < min_bytes) continue;
         if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
         else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+    next_line: ;
     }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
     char snap_time[STR_BUF_SMALL];
