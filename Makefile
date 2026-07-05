@@ -8,11 +8,7 @@ OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/s
 OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
 OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo newsyslog.conf.d/diffsnap.conf ;; *) echo logrotate.d/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
-BUILD_SHA = unknown
 BUILD_SHA != git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown
-.if empty(BUILD_SHA) || ${BUILD_SHA} == ""
-BUILD_SHA = unknown
-.endif
 
 CC ?= cc
 CPPFLAGS ?=
