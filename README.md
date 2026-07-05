@@ -34,9 +34,11 @@ The Makefile selects OS-specific defaults at build time:
 | File / Property | FreeBSD | Linux |
 | --- | --- | --- |
 | **Config** | `/usr/local/etc/diffsnap.conf` | `/etc/diffsnap.conf` |
-| **Log** | `/var/log/diffsnap.log` | `/var/log/diffsnap.log` |
+| **Log*** | `/var/log/diffsnap.log` | `/var/log/diffsnap.log` |
 | **Lock** | `/var/run/diffsnap.lock` | `/run/diffsnap.lock` |
 | **ZFS** | `/sbin/zfs` | `/usr/sbin/zfs` if present, otherwise `/sbin/zfs` |
+
+*Overriding the log file requires manual updates to the log rotation config post install
 
 Path defaults can be overridden at build time:
 
