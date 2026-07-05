@@ -12,7 +12,7 @@ Traditional time-based snapshotting struggles with high-frequency intervals. Cap
 
 By monitoring how much data has been written since the most recent snapshot, `diffsnap` enforces a configurable data-change threshold.
 
-Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `0` causes every detected change, including deletions and metadata updates, to qualify for snapshot creation.
+Because background metadata processes (such as directory lock updates, protocol leases, or structural TXG syncs) can cause the `written` metric to creep up slightly on an idle dataset, a threshold buffer of `1000000` bytes (1MB) is recommended. This buffer also prevents small file deletions from unnecessarily triggering the snapshot engine. Setting the threshold to `1` causes every detected change, including deletions and metadata updates, to qualify for snapshot creation.
 
 ## Features
 
@@ -97,9 +97,9 @@ Blank lines and lines beginning with `#` are ignored.
 Example config:  
 
 ```text
-zroot/downloads 30 100 diffsnap no 1000000
+zroot/jails 30 100 diffsnap no 1000000
 tank/media 5 100 diffsnap no 1000000
-zroot/jails 1440 14 daily yes 0
+rpool/downloads 1440 14 daily yes 1
 ```
 
 ## Scheduling
