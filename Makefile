@@ -5,6 +5,7 @@ OS_NAME != uname -s
 OS_ETCDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc ;; *) echo /etc ;; esac
 OS_RUNSTATEDIR != case "$(OS_NAME)" in FreeBSD) echo /var/run ;; *) echo /run ;; esac
 OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/sbin/zfs ]; then echo /usr/sbin/zfs; else echo /sbin/zfs; fi ;; esac
+BUILD_SHA != git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown
 OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
 OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo newsyslog.conf.d/diffsnap.conf ;; *) echo logrotate.d/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
@@ -36,6 +37,7 @@ CPPFLAGS += -DCONF_PATH='"$(CONF_PATH)"'
 CPPFLAGS += -DLOG_PATH='"$(LOG_PATH)"'
 CPPFLAGS += -DLOCK_PATH='"$(LOCK_PATH)"'
 CPPFLAGS += -DZFS_PATH='"$(ZFS_PATH)"'
+CPPFLAGS += -DBUILD_SHA='"$(BUILD_SHA)"'
 
 .PHONY: all clean install uninstall
 
