@@ -432,7 +432,7 @@ CONF
 fi
 archive_log "21 - inventory scoping"
 
-echo "== 22. Overlap dedup only applies to matching prefix =="
+echo "== 22. Overlap dedup only applies to matching prefix (recursive parent + non-recursive child) =="
 # dataset   interval  retention  prefix   recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS         1         2          recA     yes        0
@@ -451,9 +451,56 @@ CONF
 "$BIN"
 if grep -q "Created=$DS/a@recSame" "$LOG"; then bad "same-prefix child NOT deduped (overlap logic broken)"
 else ok "same-prefix child correctly deduped against recursive parent"; fi
+grep -q "Skipping $DS/a: covered by a recursive ancestor with prefix 'recSame'" "$LOG" \
+  && ok "std/rec overlap dedup logged the skip" \
+  || bad "std/rec overlap dedup did not log the skip (silent drop)"
 archive_log "22 - prefix-aware overlap dedup"
 
-echo "== 23. Cleanup =="
+echo "== 23. Nested recursive overlap, same prefix: descendant dropped before any zfs call =="
+# dataset   interval  retention  prefix        recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          recSameNest   yes        0
+$DS/a       1         2          recSameNest   yes        0
+CONF
+"$BIN"
+grep -q "Created=$DS@recSameNest.*Recursive" "$LOG" \
+  && ok "recursive ancestor snapshot created" \
+  || bad "recursive ancestor snapshot missing"
+if grep -q "Created=$DS/a@recSameNest" "$LOG"; then
+  bad "nested recursive descendant NOT deduped (would collide with -r ancestor snapshot)"
+else
+  ok "nested recursive descendant correctly deduped (same prefix, both recursive)"
+fi
+grep -q "Skipping $DS/a: already covered by a recursive ancestor with prefix 'recSameNest'" "$LOG" \
+  && ok "nested recursive overlap dedup logged the skip" \
+  || bad "nested recursive overlap dedup did not log the skip (silent drop)"
+grep -q "cannot create snapshots\|multiple snapshots of same fs" "$LOG" \
+  && bad "zfs rejected batch due to nested recursive collision (dedup did not prevent it)" \
+  || ok "no zfs collision error from nested recursive overlap"
+archive_log "23 - nested recursive overlap (same prefix)"
+
+echo "== 24. Nested recursive overlap, different prefix: both kept, split into separate passes =="
+# dataset   interval  retention  prefix   recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          recX     yes        0
+$DS/a       1         2          recY     yes        0
+CONF
+truss -f -a -o /tmp/trace_nested.log -- "$BIN"
+grep -q "cannot create snapshots\|multiple snapshots of same fs" "$LOG" \
+  && bad "zfs rejected batch: ancestor+descendant recursive snapshots were not split into separate passes" \
+  || ok "no zfs collision error (ancestor+descendant correctly split into separate passes)"
+grep -q "Created=$DS@recX.*Recursive" "$LOG" \
+  && ok "recursive ancestor snapshot created (different prefix, kept)" \
+  || bad "recursive ancestor snapshot missing"
+grep -q "Created=$DS/a@recY.*Recursive" "$LOG" \
+  && ok "recursive descendant snapshot created (different prefix, kept)" \
+  || bad "recursive descendant snapshot missing"
+recursive_snap_pattern='"zfs", "snapshot", "-r"'
+nestedcalls=$(grep -c "$recursive_snap_pattern" /tmp/trace_nested.log)
+[ "$nestedcalls" -eq 2 ] && ok "ancestor and descendant issued as 2 separate 'zfs snapshot -r' calls" || bad "expected 2 separate recursive snapshot invocations, got $nestedcalls"
+archive_log "24 - nested recursive overlap (different prefix, separate passes)"
+
+echo "== 25. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
