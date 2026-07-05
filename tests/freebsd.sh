@@ -152,7 +152,9 @@ $DS/a       1         2          p2      no         0
 $DS/a       1         2          p3      no         0
 $DS/b       1         2          p1      no         0
 CONF
-truss -f -a -o /tmp/trace_batch.log -- "$BIN"
+rm -f /tmp/trace_batch.log
+truss -f -a -o /tmp/trace_batch.log -- "$BIN" || bad "truss failed to run for section 5 (exit $?)"
+[ -s /tmp/trace_batch.log ] || bad "truss trace file empty/missing for section 5 -- results below are unreliable"
 grep -q "cannot create snapshots" "$LOG" && bad "same-dataset collision still occurs" || ok "no same-dataset collision"
 strace_snap_pattern='zfs", "snapshot"'
 snapcalls=$(grep -c "$strace_snap_pattern" /tmp/trace_batch.log)
@@ -356,7 +358,9 @@ $DS/a       1         2          gettest   no         0
 CONF
 zfs snapshot "$DS/a@marker" 2>/dev/null
 zfs bookmark "$DS/a@marker" "$DS/a#marker" 2>/dev/null
-truss -f -a -o /tmp/trace_get.log -- "$BIN"
+rm -f /tmp/trace_get.log
+truss -f -a -o /tmp/trace_get.log -- "$BIN" || bad "truss failed to run for section 19 (exit $?)"
+[ -s /tmp/trace_get.log ] || bad "truss trace file empty/missing for section 19 -- results below are unreliable"
 get_pattern='"get", "-H", "-p", "-t", "filesystem,volume"'
 grep -q "$get_pattern" /tmp/trace_get.log \
   && ok "zfs get invoked with -t filesystem,volume filter" \
@@ -419,7 +423,9 @@ WRAP
 $DS/a       1         2          scopetest   no         0
 CONF
   POOL="${DS%%/*}"
-  truss -f -a -o /tmp/trace_scope.log -- "$BIN"
+ rm -f /tmp/trace_scope.log
+truss -f -a -o /tmp/trace_scope.log -- "$BIN" || bad "truss failed to run for section 21 (exit $?)"
+[ -s /tmp/trace_scope.log ] || bad "truss trace file empty/missing for section 21 -- results below are unreliable"
   list_pattern='"list", "-H", "-r", "-t", "snapshot", "-o", "name", "'"$POOL"'"'
   grep -q "$list_pattern" /tmp/trace_scope.log \
     && ok "single-root batch verification used scoped -r zfs list ($POOL)" \
@@ -485,7 +491,9 @@ cat > "$CONF" <<CONF
 $DS         1         2          recX     yes        0
 $DS/a       1         2          recY     yes        0
 CONF
-truss -f -a -o /tmp/trace_nested.log -- "$BIN"
+rm -f /tmp/trace_nested.log
+truss -f -a -o /tmp/trace_nested.log -- "$BIN" || bad "truss failed to run for section 24 (exit $?)"
+[ -s /tmp/trace_nested.log ] || bad "truss trace file empty/missing for section 24 -- results below are unreliable"
 grep -q "cannot create snapshots\|multiple snapshots of same fs" "$LOG" \
   && bad "zfs rejected batch: ancestor+descendant recursive snapshots were not split into separate passes" \
   || ok "no zfs collision error (ancestor+descendant correctly split into separate passes)"
