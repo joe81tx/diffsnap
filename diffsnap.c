@@ -647,7 +647,7 @@ int main(int argc, char *argv[]) {
         ret_code = 1; goto cleanup;
     }
     setvbuf(log_fp, NULL, _IOLBF, 0);
-    const char *const m_argv[] = {ZFS_PATH, "get", "-H", "-p", "-o", "name,value", "written", NULL};
+    const char *const m_argv[] = {ZFS_PATH, "get", "-H", "-p", "-t", "filesystem,volume", "-o", "name,value", "written", NULL};
     if (exec_cmd_stream(m_argv, handle_metric_line, &metrics) != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
     qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
     conf = fopen(CONF_PATH, "r");
