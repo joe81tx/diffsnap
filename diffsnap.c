@@ -530,9 +530,40 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
     return 0;
 }
 
-static int load_snapshot_inventory(name_list_t *list) {
-    const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", NULL};
-    if (exec_cmd_stream(argv, handle_snapshot_inventory_line, list) != 0) {
+static size_t batch_distinct_roots(const batch_ctx_t *ctx, char *root_buf, size_t root_buf_size) {
+    size_t distinct = 0;
+    const char *first_root_dataset = NULL;
+    for (size_t i = 0; i < ctx->count; i++) {
+        int seen = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (same_zfs_root(ctx->items[i].dataset, ctx->items[j].dataset)) { seen = 1; break; }
+        }
+        if (!seen) {
+            distinct++;
+            if (distinct == 1) first_root_dataset = ctx->items[i].dataset;
+        }
+    }
+    if (distinct == 1) {
+        size_t len = zfs_root_len(first_root_dataset);
+        if (len >= root_buf_size) return 0; /* shouldn't happen; fall back to full listing */
+        memcpy(root_buf, first_root_dataset, len);
+        root_buf[len] = '\0';
+    }
+    return distinct;
+}
+
+static int load_snapshot_inventory(name_list_t *list, const batch_ctx_t *batch) {
+    char root[STR_BUF_LARGE];
+    size_t distinct = batch_distinct_roots(batch, root, sizeof(root));
+    int rc;
+    if (distinct == 1) {
+        const char *const argv[] = {ZFS_PATH, "list", "-H", "-r", "-t", "snapshot", "-o", "name", root, NULL};
+        rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
+    } else {
+        const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", NULL};
+        rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
+    }
+    if (rc != 0) {
         name_list_free(list);
         return -1;
     }
