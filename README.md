@@ -99,7 +99,7 @@ Example config:
 ```text
 zroot/jails 30 100 diffsnap no 1000000
 tank/media 5 100 diffsnap no 1000000
-rpool/downloads 1440 14 daily yes 1
+rpool/USERDATA 1440 14 daily yes 1
 ```
 
 ## Scheduling
