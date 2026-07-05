@@ -423,7 +423,7 @@ WRAP
 $DS/a       1         2          scopetest   no         0
 CONF
   POOL="${DS%%/*}"
- rm -f /tmp/trace_scope.log
+rm -f /tmp/trace_scope.log
 truss -f -a -o /tmp/trace_scope.log -- "$BIN" || bad "truss failed to run for section 21 (exit $?)"
 [ -s /tmp/trace_scope.log ] || bad "truss trace file empty/missing for section 21 -- results below are unreliable"
   list_pattern='"list", "-H", "-r", "-t", "snapshot", "-o", "name", "'"$POOL"'"'
