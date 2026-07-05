@@ -599,7 +599,7 @@ static size_t batch_distinct_roots(const batch_ctx_t *ctx, char *root_buf, size_
     }
     if (distinct == 1) {
         size_t len = zfs_root_len(first_root_dataset);
-        if (len >= root_buf_size) return 0; /* shouldn't happen; fall back to full listing */
+        if (len >= root_buf_size) return 0;
         memcpy(root_buf, first_root_dataset, len);
         root_buf[len] = '\0';
     }
