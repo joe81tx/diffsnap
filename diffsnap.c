@@ -613,7 +613,7 @@ static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *
         if (batch->items[i].snap_failed) { need_inventory = 1; break; }
     }
     if (rc != 0) log_msg("Error: %s zfs snapshot batch execution failed", recursive ? "recursive" : "standard");
-    if (need_inventory && load_snapshot_inventory(&snapshots) != 0) {
+    if (need_inventory && load_snapshot_inventory(&snapshots, batch) != 0) {
         log_msg("Error: Unable to list snapshots for %sbatch verification", recursive ? "recursive " : "");
         can_verify = 0;
     }
