@@ -1,8 +1,10 @@
 /var/log/diffsnap.log {
+    su root root
     size 10M
     rotate 7
     missingok
     notifempty
     compress
     delaycompress
+    create 0644 root root
 }
