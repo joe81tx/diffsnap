@@ -58,6 +58,7 @@ zfs create "$DS/a"
 zfs create "$DS/b"
 
 echo "== 1. Crash regression: malformed lines must not segfault or die from any signal =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 badline
 $DS/a notanumber 2 t1 no 0
@@ -92,6 +93,7 @@ grep -q "Configured dataset not found: nosuch/dataset" "$LOG" && ok "missing dat
 archive_log "2 - feature matrix"
 
 echo "== 3. Retention drains to exactly 1 =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS/a 1 1 rtest no 0
 CONF
@@ -118,6 +120,7 @@ zfs destroy "${DS}_clone"
 archive_log "4 - clone-blocked destroy"
 
 echo "== 5. Batching: same-dataset collision fixed, cross-dataset batching preserved =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS/a 1 2 p1 no 0
 $DS/a 1 2 p2 no 0
@@ -134,6 +137,7 @@ crossbatch=$(grep -E "$snap_pattern" /tmp/trace_batch.log | grep -c "clonetest/a
 archive_log "5 - batching"
 
 echo "== 6. Interval boundary matrix (per --help spec) =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS/a 50 3 i50 no 0
 $DS/a 1440 3 iday no 0
@@ -181,6 +185,7 @@ echo "$out2" | grep -q "another instance is already running" \
 archive_log "7 - lock enforcement"
 
 echo "== 8. Maximum-length prefix accepted =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 maxprefix=$(printf 'a%.0s' $(seq 1 63))
 cat > "$CONF" <<CONF
 $DS/a 1 2 $maxprefix no 0
@@ -190,6 +195,7 @@ grep -q "Created=$DS/a@${maxprefix}_" "$LOG" && ok "max-length (63-char) prefix 
 archive_log "8 - max prefix accepted"
 
 echo "== 9. Prefix exceeding limit rejected =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 overprefix=$(printf 'a%.0s' $(seq 1 64))
 cat > "$CONF" <<CONF
 $DS/a 1 2 $overprefix no 0
@@ -199,6 +205,7 @@ grep -q "prefix too long" "$LOG" && ok "over-length (64-char) prefix rejected" |
 archive_log "9 - prefix exceeding limit rejected"
 
 echo "== 10. Dataset name at diffsnap's internal buffer limit (256 chars) =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 maxds_child_len=$((256 - ${#DS} - 1))
 maxds_child=$(printf 'x%.0s' $(seq 1 $maxds_child_len))
 maxds="$DS/$maxds_child"
@@ -212,6 +219,7 @@ else bad "unexpected result for buffer-limit dataset name test"; fi
 archive_log "10 - dataset name at buffer limit"
 
 echo "== 11. Dataset name exceeding buffer limit rejected =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 overds="${maxds}xxxxxxxxxx"
 cat > "$CONF" <<CONF
 $overds 1 2 buftest2 no 0
@@ -288,6 +296,7 @@ else echo "SKIP: 'nobody' user not available on this system"; fi
 archive_log "17 - missing log permissions"
 
 echo "== 18. Recursive retention pruning behaves correctly =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS 1 1 rectest2 yes 0
 CONF
@@ -299,6 +308,7 @@ childcount=$(zfs list -t snap -H -o name | grep -c "^$DS/a@rectest2")
 archive_log "18 - recursive retention pruning"
 
 echo "== 19. zfs get invoked with -t filesystem,volume filter =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS/a 1 2 gettest no 0
 CONF
@@ -377,6 +387,7 @@ fi
 archive_log "21 - inventory scoping"
 
 echo "== 22. Overlap dedup only applies to matching prefix =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS 1 2 recA yes 0
 $DS/a 1 2 recB no 0
@@ -386,6 +397,7 @@ grep -q "Created=$DS/a@recB" "$LOG" \
   && ok "different-prefix child NOT deduped against recursive parent" \
   || bad "different-prefix child incorrectly deduped"
 
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS 1 2 recSame yes 0
 $DS/a 1 2 recSame no 0
