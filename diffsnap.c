@@ -659,6 +659,8 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     size_t write_idx = 0;
     for (size_t i = 0; i < std_b->count; i++) {
         if (is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built)) {
+            log_msg("Skipping %s: covered by a recursive ancestor with prefix '%s'",
+                     std_b->items[i].dataset, std_b->items[i].prefix);
             free(std_b->items[i].dataset);
             free(std_b->items[i].prefix);
         } else {
