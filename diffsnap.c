@@ -703,6 +703,10 @@ int main(int argc, char *argv[]) {
         else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
     next_line: ;
     }
+    if (ferror(conf)) {
+        log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(errno));
+        ret_code = 1; goto cleanup;
+    }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
     char snap_time[STR_BUF_SMALL];
     if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
