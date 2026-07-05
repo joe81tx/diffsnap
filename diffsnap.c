@@ -448,18 +448,22 @@ static int is_strict_descendant(const char *child, const char *parent) {
 }
 
 static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
-    size_t write_idx = 0;
+    if (rec_b->count == 0) return 0;
+    int *covered = calloc(rec_b->count, sizeof(int));
+    if (!covered) return -1;
     for (size_t j = 0; j < rec_b->count; j++) {
-        int covered = 0;
         for (size_t i = 0; i < rec_b->count; i++) {
             if (i == j) continue;
             if (strcmp(rec_b->items[i].prefix, rec_b->items[j].prefix) == 0 &&
                 is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset)) {
-                covered = 1;
+                covered[j] = 1;
                 break;
             }
         }
-        if (covered) {
+    }
+    size_t write_idx = 0;
+    for (size_t j = 0; j < rec_b->count; j++) {
+        if (covered[j]) {
             log_msg("Skipping %s: already covered by a recursive ancestor with prefix '%s'",
                      rec_b->items[j].dataset, rec_b->items[j].prefix);
             free(rec_b->items[j].dataset);
@@ -470,6 +474,7 @@ static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
         }
     }
     rec_b->count = write_idx;
+    free(covered);
 
     int changed;
     do {
