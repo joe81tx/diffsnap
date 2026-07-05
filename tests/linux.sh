@@ -47,6 +47,21 @@ done
 ORIG_CONF_BACKUP=$(mktemp)
 [ -f "$CONF" ] && cp "$CONF" "$ORIG_CONF_BACKUP" || : > "$ORIG_CONF_BACKUP"
 
+echo "== Preflight: build matches working tree =="
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_OWNER=$(stat -f '%Su' "$REPO_DIR" 2>/dev/null || stat -c '%U' "$REPO_DIR" 2>/dev/null)
+EXPECTED_SHA=$(su "$REPO_OWNER" -c "git -C \"$REPO_DIR\" describe --always --dirty --abbrev=12" 2>/dev/null || echo unknown)
+ACTUAL_SHA=$("$BIN" --version 2>/dev/null | sed -n 's/.*(\(.*\))/\1/p')
+if [ "$EXPECTED_SHA" = "unknown" ] || [ "$ACTUAL_SHA" = "unknown" ]; then
+  echo "NOTE: could not determine build SHA for one side (expected=$EXPECTED_SHA, actual=$ACTUAL_SHA); skipping build-match check"
+elif [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+  echo "ABORT: installed diffsnap build ($ACTUAL_SHA) does not match working tree ($EXPECTED_SHA)."
+  echo "Run 'git pull && make clean && make && make install' before testing."
+  exit 1
+else
+  echo "Build matches working tree ($ACTUAL_SHA)"
+fi
+
 echo "== 0. Clean slate =="
 rm -f "$LOCK"
 zfs destroy -R "$DS" 2>/dev/null
