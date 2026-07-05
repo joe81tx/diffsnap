@@ -54,7 +54,7 @@
 static FILE *log_fp = NULL;
 
 typedef int (*line_handler_t)(const char *line, void *data);
-typedef struct { char *dataset; char *prefix; size_t retention; int snap_failed; } batch_item_t;
+typedef struct { char *dataset; char *prefix; size_t retention; size_t extra_pass; int snap_failed; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
 typedef struct { char **snaps; size_t count; size_t capacity; const char *match_str; size_t match_len; } prune_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
@@ -411,7 +411,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = strdup(dataset), *p = strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .snap_failed = 0 };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .extra_pass = 0, .snap_failed = 0 };
     return 0;
 }
 
@@ -435,11 +435,57 @@ static int same_zfs_dataset(const char *a, const char *b) {
 }
 
 static size_t batch_dataset_pass(const batch_ctx_t *ctx, size_t item_idx) {
-    size_t pass = 0;
+    size_t pass = ctx->items[item_idx].extra_pass;
     for (size_t i = 0; i < item_idx; i++) {
         if (same_zfs_dataset(ctx->items[i].dataset, ctx->items[item_idx].dataset)) pass++;
     }
     return pass;
+}
+
+static int is_strict_descendant(const char *child, const char *parent) {
+    size_t plen = strlen(parent);
+    return strncmp(child, parent, plen) == 0 && child[plen] == '/';
+}
+
+static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
+    size_t write_idx = 0;
+    for (size_t j = 0; j < rec_b->count; j++) {
+        int covered = 0;
+        for (size_t i = 0; i < rec_b->count; i++) {
+            if (i == j) continue;
+            if (strcmp(rec_b->items[i].prefix, rec_b->items[j].prefix) == 0 &&
+                is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset)) {
+                covered = 1;
+                break;
+            }
+        }
+        if (covered) {
+            log_msg("Skipping %s: already covered by a recursive ancestor with prefix '%s'",
+                     rec_b->items[j].dataset, rec_b->items[j].prefix);
+            free(rec_b->items[j].dataset);
+            free(rec_b->items[j].prefix);
+        } else {
+            if (write_idx != j) rec_b->items[write_idx] = rec_b->items[j];
+            write_idx++;
+        }
+    }
+    rec_b->count = write_idx;
+
+    int changed;
+    do {
+        changed = 0;
+        for (size_t j = 0; j < rec_b->count; j++) {
+            for (size_t i = 0; i < rec_b->count; i++) {
+                if (i == j) continue;
+                if (is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset) &&
+                    batch_dataset_pass(rec_b, i) == batch_dataset_pass(rec_b, j)) {
+                    rec_b->items[j].extra_pass++;
+                    changed = 1;
+                }
+            }
+        }
+    } while (changed);
+    return 0;
 }
 
 static int batch_item_in_root_pass(const batch_ctx_t *ctx, size_t item_idx, const char *root_dataset, size_t pass) {
@@ -762,6 +808,7 @@ int main(int argc, char *argv[]) {
         log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(errno));
         ret_code = 1; goto cleanup;
     }
+    if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = 1; goto cleanup; }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
     char snap_time[STR_BUF_SMALL];
     if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
