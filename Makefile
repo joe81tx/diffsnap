@@ -5,6 +5,9 @@ OS_NAME != uname -s
 OS_ETCDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc ;; *) echo /etc ;; esac
 OS_RUNSTATEDIR != case "$(OS_NAME)" in FreeBSD) echo /var/run ;; *) echo /run ;; esac
 OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/sbin/zfs ]; then echo /usr/sbin/zfs; else echo /sbin/zfs; fi ;; esac
+OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
+OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo newsyslog.conf.d/diffsnap.conf ;; *) echo logrotate.d/diffsnap ;; esac
+OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
 
 CC ?= cc
 CPPFLAGS ?=
@@ -18,6 +21,9 @@ ETCDIR ?= $(OS_ETCDIR)
 LOGDIR ?= /var/log
 RUNSTATEDIR ?= $(OS_RUNSTATEDIR)
 ZFS_PATH ?= $(OS_ZFS_PATH)
+LOGCONFDIR ?= $(OS_LOGCONFDIR)
+LOGCONF_SRC ?= $(OS_LOGCONF_SRC)
+LOGCONF_NAME ?= $(OS_LOGCONF_NAME)
 INSTALL ?= install
 INSTALL_PROGRAM ?= $(INSTALL) -m 0755
 INSTALL_DATA ?= $(INSTALL) -m 0644
@@ -47,9 +53,12 @@ install: $(PROG)
 	test -f "$(DESTDIR)$(ETCDIR)/diffsnap.conf" || \
 		cp "$(DESTDIR)$(ETCDIR)/diffsnap.conf.sample" \
 		   "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
+	$(INSTALL) -d $(DESTDIR)$(LOGCONFDIR)
+	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
 	rm -f $(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
+	rm -f $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
 clean:
 	rm -f $(PROG) *.o
