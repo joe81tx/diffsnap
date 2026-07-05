@@ -69,14 +69,15 @@ zfs create "$DS/a"
 zfs create "$DS/b"
 
 echo "== 1. Crash regression: malformed lines must not segfault or die from any signal =="
+# dataset   interval  retention  prefix        recursive  min_bytes
 cat > "$CONF" <<CONF
 badline
-$DS/a notanumber 2 t1 no 0
-$DS/a 1 0 t1 no 0
-$DS/a 1 2 bad!prefix no 0
-$DS/a 1 2 t1 maybe 0
-$DS/a 1 2 t1 no notanumber
-$DS/a 1 2 t1 no 0 trailing
+$DS/a       notanumber 2         t1            no         0
+$DS/a       1          0         t1            no         0
+$DS/a       1          2         bad!prefix    no         0
+$DS/a       1          2         t1            maybe      0
+$DS/a       1          2         t1            no         notanumber
+$DS/a       1          2         t1            no         0 trailing
 CONF
 "$BIN"; rc=$?
 if [ $rc -ge 128 ]; then bad "process died from signal on malformed lines (exit $rc, signal $((rc-128)))"
@@ -85,15 +86,16 @@ grep -c "Config error" "$LOG" | grep -q "^7$" && ok "all 7 malformed lines logge
 archive_log "1 - crash regression"
 
 echo "== 2. Feature matrix: valid config =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 rectest yes 0
-$DS/a 1 2 rectest no 0
-$DS/b 1 999999999999 skipme no 0
-$DS/a 1 2 rectest no 0
-nosuch/dataset 1 2 t1 no 0
+$DS                1         2          rectest   yes        0
+$DS/a              1         2          rectest   no         0
+$DS/b              1         2          skipme    no         999999999999
+$DS/a              1         2          rectest   no         0
+nosuch/dataset     1         2          t1        no         0
 CONF
 "$BIN"
-grep -q "Snapshot created (recursive): $DS@rectest" "$LOG" && ok "recursive snapshot created" || bad "recursive snapshot missing"
+grep -q "Created=$DS@rectest.*Recursive" "$LOG" && ok "recursive snapshot created" || bad "recursive snapshot missing"
 if grep -q "$DS/a@rectest" "$LOG"; then bad "overlap dedup failed: $DS/a snapshotted despite recursive parent"
 else ok "overlap dedup: $DS/a correctly excluded (covered by recursive parent)"; fi
 grep -q "skipme" "$LOG" && bad "min_bytes threshold not respected" || ok "min_bytes skip correct (no skipme entry)"
@@ -102,8 +104,9 @@ grep -q "Configured dataset not found: nosuch/dataset" "$LOG" && ok "missing dat
 archive_log "2 - feature matrix"
 
 echo "== 3. Retention drains to exactly 1 =="
+# dataset   interval  retention  prefix  recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 1 rtest no 0
+$DS/a       1         1          rtest   no         0
 CONF
 "$BIN"; sleep 1; "$BIN"
 count=$(zfs list -t snap -H -o name | grep -c "$DS/a@rtest")
@@ -128,11 +131,12 @@ zfs destroy "${DS}_clone"
 archive_log "4 - clone-blocked destroy"
 
 echo "== 5. Batching: same-dataset collision fixed, cross-dataset batching preserved =="
+# dataset   interval  retention  prefix  recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 p1 no 0
-$DS/a 1 2 p2 no 0
-$DS/a 1 2 p3 no 0
-$DS/b 1 2 p1 no 0
+$DS/a       1         2          p1      no         0
+$DS/a       1         2          p2      no         0
+$DS/a       1         2          p3      no         0
+$DS/b       1         2          p1      no         0
 CONF
 truss -f -a -o /tmp/trace_batch.log -- "$BIN"
 grep -q "cannot create snapshots" "$LOG" && bad "same-dataset collision still occurs" || ok "no same-dataset collision"
@@ -144,9 +148,10 @@ crossbatch=$(grep "$strace_snap_pattern" /tmp/trace_batch.log | grep -c "clonete
 archive_log "5 - batching"
 
 echo "== 6. Interval boundary matrix (per --help spec) =="
+# dataset   interval  retention  prefix  recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS/a 50 3 i50 no 0
-$DS/a 1440 3 iday no 0
+$DS/a       50        3          i50     no         0
+$DS/a       1440      3          iday    no         0
 CONF
 SAVED_DATETIME=$(date "+%Y%m%d%H%M.%S")
 service ntpd stop >/dev/null 2>&1
@@ -156,7 +161,7 @@ check_interval() {
   local prefix="$1" today="$2" t="$3" expect="$4"
   local expected_name="${DS}/a@${prefix}_${today}_${t}"
   if [ "$expect" -eq 1 ]; then
-    grep -qF "Snapshot created: $expected_name" "$LOG" \
+    grep -qF "Created=$expected_name" "$LOG" \
       && ok "$prefix at $t: exact expected snapshot found ($expected_name)" \
       || bad "$prefix at $t: expected snapshot missing ($expected_name)"
   else
@@ -196,17 +201,19 @@ archive_log "7 - lock enforcement"
 
 echo "== 8. Maximum-length prefix accepted =="
 maxprefix=$(printf 'a%.0s' $(seq 1 63))
+# dataset   interval  retention  prefix       recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 $maxprefix no 0
+$DS/a       1         2          $maxprefix   no         0
 CONF
 "$BIN"
-grep -q "Snapshot created: $DS/a@${maxprefix}_" "$LOG" && ok "max-length (63-char) prefix accepted" || bad "max-length prefix rejected unexpectedly"
+grep -q "Created=$DS/a@${maxprefix}_" "$LOG" && ok "max-length (63-char) prefix accepted" || bad "max-length prefix rejected unexpectedly"
 archive_log "8 - max prefix accepted"
 
 echo "== 9. Prefix exceeding limit rejected =="
 overprefix=$(printf 'a%.0s' $(seq 1 64))
+# dataset   interval  retention  prefix       recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 $overprefix no 0
+$DS/a       1         2          $overprefix  no         0
 CONF
 "$BIN"
 grep -q "prefix too long" "$LOG" && ok "over-length (64-char) prefix rejected" || bad "over-length prefix not rejected as expected"
@@ -216,8 +223,9 @@ echo "== 10. Dataset name at diffsnap's internal buffer limit (256 chars) =="
 maxds_child_len=$((256 - ${#DS} - 1))
 maxds_child=$(printf 'x%.0s' $(seq 1 $maxds_child_len))
 maxds="$DS/$maxds_child"
+# dataset   interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
-$maxds 1 2 buftest no 0
+$maxds      1         2          buftest   no         0
 CONF
 "$BIN"
 if grep -q "dataset name too long" "$LOG"; then bad "256-char dataset name incorrectly rejected by diffsnap's buffer check"
@@ -227,8 +235,9 @@ archive_log "10 - dataset name at buffer limit"
 
 echo "== 11. Dataset name exceeding buffer limit rejected =="
 overds="${maxds}xxxxxxxxxx"
+# dataset   interval  retention  prefix     recursive  min_bytes
 cat > "$CONF" <<CONF
-$overds 1 2 buftest2 no 0
+$overds     1         2          buftest2   no         0
 CONF
 "$BIN"
 grep -q "dataset name too long" "$LOG" && ok "over-length dataset name (${#overds} chars) rejected" || bad "over-length dataset name not rejected as expected"
@@ -253,8 +262,9 @@ fi
 exec "$REAL" "$@"
 WRAP
   chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 longerr no 0
+$DS/a       1         2          longerr   no         0
 CONF
   "$BIN"; rc=$?
   [ $rc -lt 128 ] && ok "no crash on >512-byte zfs stderr line" || bad "crashed on >512-byte zfs stderr line (exit $rc)"
@@ -314,8 +324,9 @@ fi
 archive_log "17 - missing log permissions"
 
 echo "== 18. Recursive retention pruning behaves correctly =="
+# dataset   interval  retention  prefix     recursive  min_bytes
 cat > "$CONF" <<CONF
-$DS 1 1 rectest2 yes 0
+$DS         1         1          rectest2   yes        0
 CONF
 "$BIN"; sleep 1; "$BIN"
 parentcount=$(zfs list -t snap -H -o name | grep -c "^$DS@rectest2")
@@ -324,7 +335,111 @@ childcount=$(zfs list -t snap -H -o name | grep -c "^$DS/a@rectest2")
 [ "$childcount" -eq 1 ] && ok "recursive retention held on child via -r destroy (count=$childcount)" || bad "recursive retention violated on child (count=$childcount)"
 archive_log "18 - recursive retention pruning"
 
-echo "== 19. Cleanup =="
+echo "== 19. zfs get invoked with -t filesystem,volume filter =="
+# dataset   interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/a       1         2          gettest   no         0
+CONF
+zfs snapshot "$DS/a@marker" 2>/dev/null
+zfs bookmark "$DS/a@marker" "$DS/a#marker" 2>/dev/null
+truss -f -a -o /tmp/trace_get.log -- "$BIN"
+get_pattern='"get", "-H", "-p", "-t", "filesystem,volume"'
+grep -q "$get_pattern" /tmp/trace_get.log \
+  && ok "zfs get invoked with -t filesystem,volume filter" \
+  || bad "zfs get missing -t filesystem,volume filter"
+zfs destroy "$DS/a#marker" 2>/dev/null
+zfs destroy "$DS/a@marker" 2>/dev/null
+archive_log "19 - zfs get filesystem,volume filter"
+
+echo "== 20. Oversized zfs get written line skipped, not fatal to batch =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run oversized-metric-line test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > "$ZFS_REAL" <<'WRAP'
+#!/usr/local/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "get" ]; then
+  printf '%s\t123\n' "$(printf 'x%.0s' $(seq 1 300))"
+fi
+exec "$REAL" "$@"
+WRAP
+  chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
+  cat > "$CONF" <<CONF
+$DS/a       1         2          skiptest   no         0
+CONF
+  "$BIN"
+  grep -q "Skipping metric line with oversized dataset name" "$LOG" && ok "oversized metric line logged and skipped" || bad "oversized metric line not logged"
+  grep -q "Created=$DS/a@skiptest" "$LOG" && ok "valid dataset still snapshotted despite earlier bad line" || bad "good line lost after bad line (batch aborted?)"
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "20 - oversized metric line"
+
+echo "== 21. Snapshot inventory scoped to single root when verification needed =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run inventory-scoping test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > "$ZFS_REAL" <<'WRAP'
+#!/usr/local/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "snapshot" ]; then
+  echo "error: simulated snapshot failure" >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+WRAP
+  chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix       recursive  min_bytes
+  cat > "$CONF" <<CONF
+$DS/a       1         2          scopetest   no         0
+CONF
+  POOL="${DS%%/*}"
+  truss -f -a -o /tmp/trace_scope.log -- "$BIN"
+  list_pattern='"list", "-H", "-r", "-t", "snapshot", "-o", "name", "'"$POOL"'"'
+  grep -q "$list_pattern" /tmp/trace_scope.log \
+    && ok "single-root batch verification used scoped -r zfs list ($POOL)" \
+    || bad "expected scoped zfs list -r $POOL not found in trace"
+  grep -q "Snapshot not created: $DS/a@scopetest" "$LOG" \
+    && ok "simulated snapshot failure correctly detected via inventory check" \
+    || bad "expected 'Snapshot not created' message missing"
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "21 - inventory scoping"
+
+echo "== 22. Overlap dedup only applies to matching prefix =="
+# dataset   interval  retention  prefix   recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          recA     yes        0
+$DS/a       1         2          recB     no         0
+CONF
+"$BIN"
+grep -q "Created=$DS/a@recB" "$LOG" \
+  && ok "different-prefix child NOT deduped against recursive parent" \
+  || bad "different-prefix child incorrectly deduped"
+
+# dataset   interval  retention  prefix     recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          recSame   yes        0
+$DS/a       1         2          recSame   no         0
+CONF
+"$BIN"
+if grep -q "Created=$DS/a@recSame" "$LOG"; then bad "same-prefix child NOT deduped (overlap logic broken)"
+else ok "same-prefix child correctly deduped against recursive parent"; fi
+archive_log "22 - prefix-aware overlap dedup"
+
+echo "== 23. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
