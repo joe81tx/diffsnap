@@ -74,6 +74,7 @@ grep -c "Config error" "$LOG" | grep -q "^7$" && ok "all 7 malformed lines logge
 archive_log "1 - crash regression"
 
 echo "== 2. Feature matrix: valid config =="
+# dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS 1 2 rectest yes 0
 $DS/a 1 2 rectest no 0
