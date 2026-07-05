@@ -247,6 +247,7 @@ fi
 exec "$REAL" "$@"
 WRAP
   chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 longerr no 0
 CONF
@@ -340,6 +341,7 @@ fi
 exec "$REAL" "$@"
 WRAP
   chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 skiptest no 0
 CONF
@@ -370,6 +372,7 @@ fi
 exec "$REAL" "$@"
 WRAP
   chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 scopetest no 0
 CONF
