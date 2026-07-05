@@ -324,19 +324,25 @@ static int exec_cmd_stream(const char *const argv[], line_handler_t handler, voi
 static int handle_metric_line(const char *line, void *data) {
     metric_ctx_t *ctx = (metric_ctx_t *)data;
     char line_copy[STR_BUF_XLARGE];
-    if (strlen(line) >= sizeof(line_copy)) return -1;
+    if (strlen(line) >= sizeof(line_copy)) {
+        log_msg("Error: Skipping oversized zfs get line");
+        return 0;
+    }
     strcpy(line_copy, line);
     char *saveptr = NULL;
     char *name = strtok_r(line_copy, " \t", &saveptr);
     char *value = strtok_r(NULL, " \t", &saveptr);
-    if (!name || !value) return 0; 
+    if (!name || !value) return 0;
+    if (strlen(name) >= sizeof(ctx->items[0].name)) {
+        log_msg("Error: Skipping metric line with oversized dataset name: %s", name);
+        return 0;
+    }
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_METRIC : ctx->capacity * 2;
         metric_item_t *tmp = realloc(ctx->items, new_cap * sizeof(metric_item_t));
         if (!tmp) return -1;
         ctx->items = tmp; ctx->capacity = new_cap;
     }
-    if (strlen(name) >= sizeof(ctx->items[ctx->count].name)) return -1;
     strcpy(ctx->items[ctx->count].name, name);
     char *endptr; errno = 0;
     long long val = strtoll(value, &endptr, 10);
