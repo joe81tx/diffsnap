@@ -1,0 +1,8 @@
+/var/log/diffsnap.log {
+    size 10M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+}
