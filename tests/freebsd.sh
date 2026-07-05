@@ -60,8 +60,7 @@ ORIG_CONF_BACKUP=$(mktemp)
 
 echo "== Preflight: build matches working tree =="
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-REPO_OWNER=$(stat -f '%Su' "$REPO_DIR" 2>/dev/null || stat -c '%U' "$REPO_DIR" 2>/dev/null)
-EXPECTED_SHA=$(su "$REPO_OWNER" -c "git -C \"$REPO_DIR\" describe --always --dirty --abbrev=12" 2>/dev/null || echo unknown)
+EXPECTED_SHA=$(git -c safe.directory="*" -C "$REPO_DIR" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
 ACTUAL_SHA=$("$BIN" --version 2>/dev/null | sed -n 's/.*(\(.*\))/\1/p')
 if [ "$EXPECTED_SHA" = "unknown" ] || [ "$ACTUAL_SHA" = "unknown" ]; then
   echo "NOTE: could not determine build SHA for one side (expected=$EXPECTED_SHA, actual=$ACTUAL_SHA); skipping build-match check"
