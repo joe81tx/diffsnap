@@ -139,7 +139,7 @@ static void log_msg(const char *fmt, ...) {
     if (localtime_r(&t, &tm_info) == NULL || strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
-    fprintf(log_fp, "[%s] ", timestamp);
+    fprintf(log_fp, "%s ", timestamp);
     vfprintf(log_fp, fmt, args);
     fprintf(log_fp, "\n");
     va_end(args);
@@ -385,7 +385,7 @@ static int prune_old_snapshots(const char *dataset, const char *prefix, size_t m
     int prune_errors = 0;
     while (ctx.count > max_snaps) {
         char *oldest = ctx.snaps[--ctx.count];
-        if (zfs_destroy(oldest, recursive) == 0) log_msg("Pruned snapshot%s: %s", recursive ? " recursively" : "", oldest);
+        if (zfs_destroy(oldest, recursive) == 0) log_msg("Pruned=%s%s", oldest, recursive ? " Recursive" : "");
         else { log_msg("Error: Failed to prune snapshot %s", oldest); prune_errors++; }
         free(oldest); ctx.snaps[ctx.count] = NULL;
     }
@@ -593,7 +593,7 @@ static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *
         metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
         char h_bytes[STR_BUF_SMALL] = "0";
         if (found && found->written != -1) format_bytes(found->written, h_bytes, sizeof(h_bytes));
-        log_msg("Snapshot created%s: %s (%s written)", recursive ? " (recursive)" : "", snap_name, h_bytes);
+        log_msg("Created=%s Written=%s%s", snap_name, h_bytes, recursive ? " Recursive" : "");
         if (prune_old_snapshots(batch->items[i].dataset, batch->items[i].prefix, batch->items[i].retention, recursive) != 0) status = 1;
     }
     name_list_free(&snapshots);
