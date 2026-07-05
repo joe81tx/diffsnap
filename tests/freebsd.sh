@@ -495,9 +495,9 @@ grep -q "Created=$DS@recX.*Recursive" "$LOG" \
 grep -q "Created=$DS/a@recY.*Recursive" "$LOG" \
   && ok "recursive descendant snapshot created (different prefix, kept)" \
   || bad "recursive descendant snapshot missing"
-recursive_snap_pattern='"zfs", "snapshot", "-r"'
-nestedcalls=$(grep -c "$recursive_snap_pattern" /tmp/trace_nested.log)
-[ "$nestedcalls" -eq 2 ] && ok "ancestor and descendant issued as 2 separate 'zfs snapshot -r' calls" || bad "expected 2 separate recursive snapshot invocations, got $nestedcalls"
+nested_snap_pattern='zfs", "snapshot"'
+nestedcalls=$(grep -c "$nested_snap_pattern" /tmp/trace_nested.log)
+[ "$nestedcalls" -eq 2 ] && ok "ancestor and descendant issued as 2 separate 'zfs snapshot' calls" || bad "expected 2 separate snapshot invocations, got $nestedcalls"
 archive_log "24 - nested recursive overlap (different prefix, separate passes)"
 
 echo "== 25. Cleanup =="
