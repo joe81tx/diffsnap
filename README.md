@@ -94,7 +94,7 @@ Fields:
 - `recursive`: `yes` or `no`.
 - `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots.
 
-Overlapping recursive datasets with the same snapshot prefix: the ancestor configuration takes precedence and descendant entries are ignored.
+If recursive datasets overlap with the same snapshot prefix the ancestor configuration takes precedence and descendant entries are ignored.
 
 Blank lines and lines beginning with `#` are ignored.
 
