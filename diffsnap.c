@@ -571,11 +571,14 @@ static int load_snapshot_inventory(name_list_t *list, const batch_ctx_t *batch) 
     return 0;
 }
 
-static int is_recursively_covered(const char *dataset, char **rec_names, size_t rec_count) {
+static int is_recursively_covered(const char *dataset, const char *prefix, char **rec_keys, size_t rec_count) {
     char candidate[STR_BUF_LARGE];
     if (copy_token(candidate, sizeof(candidate), dataset) != 0) return 0;
     for (;;) {
-        if (name_index_contains(rec_names, rec_count, candidate)) return 1;
+        char key[STR_BUF_LARGE + STR_BUF_MED + 2];
+        int n = snprintf(key, sizeof(key), "%s\x1f%s", candidate, prefix);
+        if (n < 0 || (size_t)n >= sizeof(key)) return 0;
+        if (name_index_contains(rec_keys, rec_count, key)) return 1;
         char *slash = strrchr(candidate, '/');
         if (!slash) return 0;
         *slash = '\0';
@@ -584,13 +587,24 @@ static int is_recursively_covered(const char *dataset, char **rec_names, size_t 
 
 static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_b) {
     if (std_b->count == 0 || rec_b->count == 0) return 0;
-    char **rec_names = malloc(rec_b->count * sizeof(*rec_names));
-    if (!rec_names) return -1;
-    for (size_t i = 0; i < rec_b->count; i++) rec_names[i] = rec_b->items[i].dataset;
-    qsort(rec_names, rec_b->count, sizeof(*rec_names), compare_names);
+    char **rec_keys = malloc(rec_b->count * sizeof(*rec_keys));
+    if (!rec_keys) return -1;
+    size_t built = 0;
+    for (size_t i = 0; i < rec_b->count; i++) {
+        char key[STR_BUF_LARGE + STR_BUF_MED + 2];
+        int n = snprintf(key, sizeof(key), "%s\x1f%s", rec_b->items[i].dataset, rec_b->items[i].prefix);
+        if (n < 0 || (size_t)n >= sizeof(key)) continue;
+        if ((rec_keys[built] = strdup(key)) == NULL) {
+            for (size_t j = 0; j < built; j++) free(rec_keys[j]);
+            free(rec_keys);
+            return -1;
+        }
+        built++;
+    }
+    qsort(rec_keys, built, sizeof(*rec_keys), compare_names);
     size_t write_idx = 0;
     for (size_t i = 0; i < std_b->count; i++) {
-        if (is_recursively_covered(std_b->items[i].dataset, rec_names, rec_b->count)) {
+        if (is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built)) {
             free(std_b->items[i].dataset);
             free(std_b->items[i].prefix);
         } else {
@@ -599,7 +613,8 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
         }
     }
     std_b->count = write_idx;
-    free(rec_names);
+    for (size_t i = 0; i < built; i++) free(rec_keys[i]);
+    free(rec_keys);
     return 0;
 }
 
