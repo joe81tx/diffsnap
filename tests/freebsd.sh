@@ -480,9 +480,9 @@ fi
 grep -q "Skipping $DS/a: already covered by a recursive ancestor with prefix 'recSameNest'" "$LOG" \
   && ok "nested recursive overlap dedup logged the skip" \
   || bad "nested recursive overlap dedup did not log the skip (silent drop)"
-grep -q "cannot create snapshots\|multiple snapshots of same fs" "$LOG" \
-  && bad "zfs rejected batch due to nested recursive collision (dedup did not prevent it)" \
-  || ok "no zfs collision error from nested recursive overlap"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- ancestor+descendant likely collided" \
+  || ok "no zfs snapshot batch failure"
 archive_log "23 - nested recursive overlap (same prefix)"
 
 echo "== 24. Nested recursive overlap, different prefix: both kept, split into separate passes =="
@@ -494,9 +494,9 @@ CONF
 rm -f /tmp/trace_nested.log
 truss -f -a -o /tmp/trace_nested.log -- "$BIN" || bad "truss failed to run for section 24 (exit $?)"
 [ -s /tmp/trace_nested.log ] || bad "truss trace file empty/missing for section 24 -- results below are unreliable"
-grep -q "cannot create snapshots\|multiple snapshots of same fs" "$LOG" \
-  && bad "zfs rejected batch: ancestor+descendant recursive snapshots were not split into separate passes" \
-  || ok "no zfs collision error (ancestor+descendant correctly split into separate passes)"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- ancestor+descendant likely collided" \
+  || ok "no zfs snapshot batch failure"
 grep -q "Created=$DS@recX.*Recursive" "$LOG" \
   && ok "recursive ancestor snapshot created (different prefix, kept)" \
   || bad "recursive ancestor snapshot missing"
