@@ -26,6 +26,9 @@
 #define ZFS_PATH "/sbin/zfs"
 #endif
 #define DIFFSNAP_VERSION "1.0"
+#ifndef BUILD_SHA
+#define BUILD_SHA "unknown"
+#endif
 
 #define ALLOC_CHUNK_BATCH 32
 #define ALLOC_CHUNK_PRUNE 128
@@ -61,7 +64,7 @@ typedef struct { char **keys; size_t count; size_t capacity; } seen_set_t;
 typedef struct { int fd; line_handler_t handler; void *data; int is_stderr; char buf[STR_BUF_XLARGE]; size_t used; int failed; } stream_reader_t;
 
 static void print_version(void) {
-    printf("diffsnap %s\n", DIFFSNAP_VERSION);
+    printf("diffsnap %s (%s)\n", DIFFSNAP_VERSION, BUILD_SHA);
 }
 
 static void print_help(const char *progname) {
