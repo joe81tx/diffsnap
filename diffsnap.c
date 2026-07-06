@@ -54,7 +54,7 @@
 static FILE *log_fp = NULL;
 
 typedef int (*line_handler_t)(const char *line, void *data);
-typedef struct { char *dataset; char *prefix; size_t retention; size_t extra_pass; int snap_failed; } batch_item_t;
+typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
 typedef struct { char **snaps; size_t count; size_t capacity; const char *match_str; size_t match_len; } prune_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
@@ -411,7 +411,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = strdup(dataset), *p = strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .extra_pass = 0, .snap_failed = 0 };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0 };
     return 0;
 }
 
@@ -434,12 +434,14 @@ static int same_zfs_dataset(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
-static size_t batch_dataset_pass(const batch_ctx_t *ctx, size_t item_idx) {
-    size_t pass = ctx->items[item_idx].extra_pass;
-    for (size_t i = 0; i < item_idx; i++) {
-        if (same_zfs_dataset(ctx->items[i].dataset, ctx->items[item_idx].dataset)) pass++;
+static void batch_assign_duplicate_passes(batch_ctx_t *ctx) {
+    for (size_t i = 0; i < ctx->count; i++) {
+        size_t pass = 0;
+        for (size_t k = 0; k < i; k++) {
+            if (same_zfs_dataset(ctx->items[k].dataset, ctx->items[i].dataset)) pass++;
+        }
+        ctx->items[i].pass = pass;
     }
-    return pass;
 }
 
 static int is_strict_descendant(const char *child, const char *parent) {
@@ -475,33 +477,43 @@ static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
     }
     rec_b->count = write_idx;
     free(covered);
-
-    int changed;
-    do {
-        changed = 0;
-        for (size_t j = 0; j < rec_b->count; j++) {
-            for (size_t i = 0; i < rec_b->count; i++) {
-                if (i == j) continue;
+    batch_assign_duplicate_passes(rec_b);
+    order_entry_t *order = malloc(rec_b->count * sizeof(order_entry_t));
+    if (!order) return -1;
+    for (size_t i = 0; i < rec_b->count; i++) {
+        order[i].idx = i;
+        order[i].len = strlen(rec_b->items[i].dataset);
+    }
+    qsort(order, rec_b->count, sizeof(order_entry_t), compare_order_entry);
+    for (size_t oi = 0; oi < rec_b->count; oi++) {
+        size_t j = order[oi].idx;
+        int collision;
+        do {
+            collision = 0;
+            for (size_t oa = 0; oa < oi; oa++) {
+                size_t i = order[oa].idx;
                 if (is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset) &&
-                    batch_dataset_pass(rec_b, i) == batch_dataset_pass(rec_b, j)) {
-                    rec_b->items[j].extra_pass++;
-                    changed = 1;
+                    rec_b->items[i].pass == rec_b->items[j].pass) {
+                    rec_b->items[j].pass++;
+                    collision = 1;
+                    break;
                 }
             }
-        }
-    } while (changed);
+        } while (collision);
+    }
+    free(order);
     return 0;
 }
 
 static int batch_item_in_root_pass(const batch_ctx_t *ctx, size_t item_idx, const char *root_dataset, size_t pass) {
-    return same_zfs_root(ctx->items[item_idx].dataset, root_dataset) && batch_dataset_pass(ctx, item_idx) == pass;
+    return same_zfs_root(ctx->items[item_idx].dataset, root_dataset) && ctx->items[item_idx].pass == pass;
 }
 
 static size_t batch_root_pass_count(const batch_ctx_t *ctx, const char *root_dataset) {
     size_t pass_count = 0;
     for (size_t i = 0; i < ctx->count; i++) {
         if (!same_zfs_root(ctx->items[i].dataset, root_dataset)) continue;
-        size_t item_pass = batch_dataset_pass(ctx, i) + 1;
+        size_t item_pass = ctx->items[i].pass + 1;
         if (item_pass > pass_count) pass_count = item_pass;
     }
     return pass_count;
@@ -557,6 +569,14 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
             if (zfs_snapshot_batch_root_pass(ctx, recursive, timestamp, ctx->items[i].dataset, pass) != 0) status = -1;
     }
     return status;
+}
+
+typedef struct { size_t idx; size_t len; } order_entry_t;
+
+static int compare_order_entry(const void *a, const void *b) {
+    const order_entry_t *ea = (const order_entry_t *)a, *eb = (const order_entry_t *)b;
+    if (ea->len != eb->len) return (ea->len < eb->len) ? -1 : 1;
+    return 0;
 }
 
 static int compare_names(const void *a, const void *b) {
@@ -816,6 +836,7 @@ int main(int argc, char *argv[]) {
     }
     if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = 1; goto cleanup; }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
+    batch_assign_duplicate_passes(&std_b);
     char snap_time[STR_BUF_SMALL];
     if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
     
