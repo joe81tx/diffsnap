@@ -508,7 +508,69 @@ nestedcalls=$(grep -c "$nested_snap_pattern" /tmp/trace_nested.log)
 [ "$nestedcalls" -eq 2 ] && ok "ancestor and descendant issued as 2 separate 'zfs snapshot' calls" || bad "expected 2 separate snapshot invocations, got $nestedcalls"
 archive_log "24 - nested recursive overlap (different prefix, separate passes)"
 
-echo "== 25. Cleanup =="
+echo "== 25. Recursive same-dataset duplicate (different prefixes): baseline dedup within rec_b =="
+# dataset   interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          recDup1   yes        0
+$DS         1         2          recDup2   yes        0
+CONF
+rm -f /tmp/trace_recdup.log
+truss -f -a -o /tmp/trace_recdup.log -- "$BIN" || bad "truss failed to run for section 25 (exit $?)"
+[ -s /tmp/trace_recdup.log ] || bad "truss trace file empty/missing for section 25 -- results below are unreliable"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- same-dataset recursive duplicates likely collided" \
+  || ok "no zfs snapshot batch failure"
+grep -q "Created=$DS@recDup1.*Recursive" "$LOG" && ok "first duplicate recursive snapshot created" || bad "first duplicate recursive snapshot missing"
+grep -q "Created=$DS@recDup2.*Recursive" "$LOG" && ok "second duplicate recursive snapshot created" || bad "second duplicate recursive snapshot missing"
+recdup_snap_pattern='zfs", "snapshot"'
+recdupcalls=$(grep -c "$recdup_snap_pattern" /tmp/trace_recdup.log)
+[ "$recdupcalls" -eq 2 ] && ok "duplicate dataset issued as 2 separate 'zfs snapshot -r' calls (baseline pass dedup)" || bad "expected 2 separate snapshot invocations, got $recdupcalls"
+archive_log "25 - recursive same-dataset duplicate"
+
+echo "== 26. Three-level nested recursive chain, distinct prefixes: multiple pass bumps =="
+# dataset   interval  retention  prefix   recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          lvl0     yes        0
+$DS/a       1         2          lvl1     yes        0
+$DS/a/c     1         2          lvl2     yes        0
+CONF
+zfs create -p "$DS/a/c" 2>/dev/null
+rm -f /tmp/trace_chain.log
+truss -f -a -o /tmp/trace_chain.log -- "$BIN" || bad "truss failed to run for section 26 (exit $?)"
+[ -s /tmp/trace_chain.log ] || bad "truss trace file empty/missing for section 26 -- results below are unreliable"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- 3-level chain likely collided" \
+  || ok "no zfs snapshot batch failure"
+grep -q "Created=$DS@lvl0.*Recursive" "$LOG" && ok "level-0 ancestor snapshot created" || bad "level-0 ancestor snapshot missing"
+grep -q "Created=$DS/a@lvl1.*Recursive" "$LOG" && ok "level-1 snapshot created" || bad "level-1 snapshot missing"
+grep -q "Created=$DS/a/c@lvl2.*Recursive" "$LOG" && ok "level-2 (deepest) snapshot created" || bad "level-2 snapshot missing"
+chain_snap_pattern='zfs", "snapshot"'
+chaincalls=$(grep -c "$chain_snap_pattern" /tmp/trace_chain.log)
+[ "$chaincalls" -eq 3 ] && ok "3-level chain correctly split into 3 separate passes" || bad "expected 3 separate snapshot invocations, got $chaincalls"
+archive_log "26 - three-level nested recursive chain"
+
+echo "== 27. Duplicate ancestor plus descendant: pass assignment must avoid all ancestor passes =="
+# dataset   interval  retention  prefix   recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS         1         2          dupA     yes        0
+$DS         1         2          dupB     yes        0
+$DS/a       1         2          dupC     yes        0
+CONF
+rm -f /tmp/trace_dupanc.log
+truss -f -a -o /tmp/trace_dupanc.log -- "$BIN" || bad "truss failed to run for section 27 (exit $?)"
+[ -s /tmp/trace_dupanc.log ] || bad "truss trace file empty/missing for section 27 -- results below are unreliable"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- duplicate ancestor + descendant likely collided" \
+  || ok "no zfs snapshot batch failure"
+grep -q "Created=$DS@dupA.*Recursive" "$LOG" && ok "first duplicate ancestor snapshot created" || bad "first duplicate ancestor snapshot missing"
+grep -q "Created=$DS@dupB.*Recursive" "$LOG" && ok "second duplicate ancestor snapshot created" || bad "second duplicate ancestor snapshot missing"
+grep -q "Created=$DS/a@dupC.*Recursive" "$LOG" && ok "descendant snapshot created despite duplicated ancestor" || bad "descendant snapshot missing"
+dupanc_snap_pattern='zfs", "snapshot"'
+dupanccalls=$(grep -c "$dupanc_snap_pattern" /tmp/trace_dupanc.log)
+[ "$dupanccalls" -eq 3 ] && ok "duplicate ancestor + descendant correctly split into 3 separate passes" || bad "expected 3 separate snapshot invocations, got $dupanccalls"
+archive_log "27 - duplicate ancestor plus descendant pass assignment"
+
+echo "== 28. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
