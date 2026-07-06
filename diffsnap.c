@@ -449,6 +449,14 @@ static int is_strict_descendant(const char *child, const char *parent) {
     return strncmp(child, parent, plen) == 0 && child[plen] == '/';
 }
 
+typedef struct { size_t idx; size_t len; } order_entry_t;
+
+static int compare_order_entry(const void *a, const void *b) {
+    const order_entry_t *ea = (const order_entry_t *)a, *eb = (const order_entry_t *)b;
+    if (ea->len != eb->len) return (ea->len < eb->len) ? -1 : 1;
+    return 0;
+}
+
 static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
     if (rec_b->count == 0) return 0;
     int *covered = calloc(rec_b->count, sizeof(int));
@@ -569,14 +577,6 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
             if (zfs_snapshot_batch_root_pass(ctx, recursive, timestamp, ctx->items[i].dataset, pass) != 0) status = -1;
     }
     return status;
-}
-
-typedef struct { size_t idx; size_t len; } order_entry_t;
-
-static int compare_order_entry(const void *a, const void *b) {
-    const order_entry_t *ea = (const order_entry_t *)a, *eb = (const order_entry_t *)b;
-    if (ea->len != eb->len) return (ea->len < eb->len) ? -1 : 1;
-    return 0;
 }
 
 static int compare_names(const void *a, const void *b) {
