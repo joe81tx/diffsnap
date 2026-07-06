@@ -490,7 +490,7 @@ $DS 1 2 recDup2 yes 0
 CONF
 rm -f /tmp/trace_recdup.log
 strace -f -e trace=execve -o /tmp/trace_recdup.log "$BIN"
-[ -s /tmp/trace_recdup.log ] || bad "strace trace file empty/missing for section 26 -- results below are unreliable"
+[ -s /tmp/trace_recdup.log ] || bad "strace trace file empty/missing for section 25 -- results below are unreliable"
 grep -q "zfs snapshot batch execution failed" "$LOG" \
   && bad "zfs snapshot batch failed -- same-dataset recursive duplicates likely collided" \
   || ok "no zfs snapshot batch failure"
@@ -502,10 +502,6 @@ archive_log "25 - recursive same-dataset duplicate"
 
 echo "== 26. Three-level nested recursive chain, distinct prefixes: multiple pass bumps =="
 # dataset          interval  retention  prefix    recursive  min_bytes
-cat > "$CONF" <<CONF
-$DS 1 2 lvl0 yes 0
-$DS/a 1 2 lvl1 yes 0
-CONF
 zfs create -p "$DS/a/c" 2>/dev/null
 cat > "$CONF" <<CONF
 $DS 1 2 lvl0 yes 0
@@ -514,7 +510,7 @@ $DS/a/c 1 2 lvl2 yes 0
 CONF
 rm -f /tmp/trace_chain.log
 strace -f -e trace=execve -o /tmp/trace_chain.log "$BIN"
-[ -s /tmp/trace_chain.log ] || bad "strace trace file empty/missing for section 27 -- results below are unreliable"
+[ -s /tmp/trace_chain.log ] || bad "strace trace file empty/missing for section 26 -- results below are unreliable"
 grep -q "zfs snapshot batch execution failed" "$LOG" \
   && bad "zfs snapshot batch failed -- 3-level chain likely collided" \
   || ok "no zfs snapshot batch failure"
@@ -534,7 +530,7 @@ $DS/a 1 2 dupC yes 0
 CONF
 rm -f /tmp/trace_dupanc.log
 strace -f -e trace=execve -o /tmp/trace_dupanc.log "$BIN"
-[ -s /tmp/trace_dupanc.log ] || bad "strace trace file empty/missing for section 28 -- results below are unreliable"
+[ -s /tmp/trace_dupanc.log ] || bad "strace trace file empty/missing for section 27 -- results below are unreliable"
 grep -q "zfs snapshot batch execution failed" "$LOG" \
   && bad "zfs snapshot batch failed -- duplicate ancestor + descendant likely collided" \
   || ok "no zfs snapshot batch failure"
