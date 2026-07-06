@@ -47,7 +47,7 @@
         if (!token) { \
             log_msg("Error: Config error for %s: %s", dataset, err_msg); \
             global_status = 1; \
-            goto next_line; \
+            continue; \
         } \
     } while (0)
 
@@ -809,7 +809,6 @@ int main(int argc, char *argv[]) {
         if (found->written < min_bytes) continue;
         if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
         else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
-    next_line: ;
     }
     if (ferror(conf)) {
         log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(errno));
