@@ -141,7 +141,9 @@ $DS/a 1 2 p2 no 0
 $DS/a 1 2 p3 no 0
 $DS/b 1 2 p1 no 0
 CONF
+rm -f /tmp/trace_batch.log
 strace -f -e trace=execve -o /tmp/trace_batch.log "$BIN"
+[ -s /tmp/trace_batch.log ] || bad "strace trace file empty/missing for section 5 -- results below are unreliable"
 grep -q "cannot create snapshots" "$LOG" && bad "same-dataset collision still occurs" || ok "no same-dataset collision"
 snap_pattern='\["[^"]*zfs[^"]*", *"snapshot"'
 snapcalls=$(grep -cE "$snap_pattern" /tmp/trace_batch.log)
@@ -329,7 +331,9 @@ $DS/a 1 2 gettest no 0
 CONF
 zfs snapshot "$DS/a@marker" 2>/dev/null
 zfs bookmark "$DS/a@marker" "$DS/a#marker" 2>/dev/null
+rm -f /tmp/trace_get.log
 strace -f -e trace=execve -o /tmp/trace_get.log "$BIN"
+[ -s /tmp/trace_get.log ] || bad "strace trace file empty/missing for section 19 -- results below are unreliable"
 grep -qE '"get".*"-t".*"filesystem,volume"' /tmp/trace_get.log \
   && ok "zfs get invoked with -t filesystem,volume filter" \
   || bad "zfs get missing -t filesystem,volume filter"
@@ -391,7 +395,13 @@ WRAP
 $DS/a 1 2 scopetest no 0
 CONF
   POOL="${DS%%/*}"
+  rm -f /tmp/trace_scope.log
+  # Note: strace mirrors the traced program's exit status, and $BIN is
+  # expected to exit non-zero here (simulated snapshot failure), so we
+  # deliberately do not check strace's own exit code -- only that it
+  # actually produced a trace file.
   strace -f -e trace=execve -o /tmp/trace_scope.log "$BIN"
+  [ -s /tmp/trace_scope.log ] || bad "strace trace file empty/missing for section 21 -- results below are unreliable"
   grep -qE '"list".*"-r".*"'"$POOL"'"' /tmp/trace_scope.log \
     && ok "single-root batch verification used scoped -r zfs list ($POOL)" \
     || bad "expected scoped zfs list -r $POOL not found in trace"
@@ -403,7 +413,7 @@ CONF
 fi
 archive_log "21 - inventory scoping"
 
-echo "== 22. Overlap dedup only applies to matching prefix =="
+echo "== 22. Overlap dedup only applies to matching prefix (recursive parent + non-recursive child) =="
 # dataset          interval  retention  prefix    recursive  min_bytes
 cat > "$CONF" <<CONF
 $DS 1 2 recA yes 0
@@ -422,9 +432,57 @@ CONF
 "$BIN"
 if grep -q "Created=$DS/a@recSame" "$LOG"; then bad "same-prefix child NOT deduped (overlap logic broken)"
 else ok "same-prefix child correctly deduped against recursive parent"; fi
+grep -q "Skipping $DS/a: covered by a recursive ancestor with prefix 'recSame'" "$LOG" \
+  && ok "std/rec overlap dedup logged the skip" \
+  || bad "std/rec overlap dedup did not log the skip (silent drop)"
 archive_log "22 - prefix-aware overlap dedup"
 
-echo "== 23. Cleanup =="
+echo "== 23. Nested recursive overlap, same prefix: descendant dropped before any zfs call =="
+# dataset          interval  retention  prefix         recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS 1 2 recSameNest yes 0
+$DS/a 1 2 recSameNest yes 0
+CONF
+"$BIN"
+grep -q "Created=$DS@recSameNest.*Recursive" "$LOG" \
+  && ok "recursive ancestor snapshot created" \
+  || bad "recursive ancestor snapshot missing"
+if grep -q "Created=$DS/a@recSameNest" "$LOG"; then
+  bad "nested recursive descendant NOT deduped (would collide with -r ancestor snapshot)"
+else
+  ok "nested recursive descendant correctly deduped (same prefix, both recursive)"
+fi
+grep -q "Skipping $DS/a: already covered by a recursive ancestor with prefix 'recSameNest'" "$LOG" \
+  && ok "nested recursive overlap dedup logged the skip" \
+  || bad "nested recursive overlap dedup did not log the skip (silent drop)"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- ancestor+descendant likely collided" \
+  || ok "no zfs snapshot batch failure"
+archive_log "23 - nested recursive overlap (same prefix)"
+
+echo "== 24. Nested recursive overlap, different prefix: both kept, split into separate passes =="
+# dataset          interval  retention  prefix  recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS 1 2 recX yes 0
+$DS/a 1 2 recY yes 0
+CONF
+rm -f /tmp/trace_nested.log
+strace -f -e trace=execve -o /tmp/trace_nested.log "$BIN"
+[ -s /tmp/trace_nested.log ] || bad "strace trace file empty/missing for section 24 -- results below are unreliable"
+grep -q "zfs snapshot batch execution failed" "$LOG" \
+  && bad "zfs snapshot batch failed -- ancestor+descendant likely collided" \
+  || ok "no zfs snapshot batch failure"
+grep -q "Created=$DS@recX.*Recursive" "$LOG" \
+  && ok "recursive ancestor snapshot created (different prefix, kept)" \
+  || bad "recursive ancestor snapshot missing"
+grep -q "Created=$DS/a@recY.*Recursive" "$LOG" \
+  && ok "recursive descendant snapshot created (different prefix, kept)" \
+  || bad "recursive descendant snapshot missing"
+nestedcalls=$(grep -cE "$snap_pattern" /tmp/trace_nested.log)
+[ "$nestedcalls" -eq 2 ] && ok "ancestor and descendant issued as 2 separate 'zfs snapshot' calls" || bad "expected 2 separate snapshot invocations, got $nestedcalls"
+archive_log "24 - nested recursive overlap (different prefix, separate passes)"
+
+echo "== 25. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
