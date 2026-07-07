@@ -120,33 +120,9 @@ FreeBSD Crontab Configuration
 * * * * * root /usr/local/sbin/diffsnap
 ```
 
-Linux systemd Unit Files:
-
-```ini
-# /etc/systemd/system/diffsnap.service
-[Unit]
-Description=Create ZFS snapshots using diffsnap
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/diffsnap
-```
-
-```ini
-# /etc/systemd/system/diffsnap.timer
-[Unit]
-Description=Run diffsnap every minute
-
-[Timer]
-OnCalendar=*:*
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
+Linux systemd Configuration:
 
 ```sh
-sudo systemctl daemon-reload
 sudo systemctl enable diffsnap.timer --now
 ```
 
