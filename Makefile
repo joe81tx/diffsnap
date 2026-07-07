@@ -56,20 +56,25 @@ install: $(PROG)
 		$(INSTALL_DATA) diffsnap.conf "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
 	$(INSTALL) -d $(DESTDIR)$(LOGCONFDIR)
 	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
-ifeq ($(OS_NAME),Linux)
-	$(INSTALL) -d $(DESTDIR)$(INITDIR_Linux)
-	$(INSTALL_DATA) systemd/diffsnap.service $(DESTDIR)$(INITDIR_Linux)/diffsnap.service
-	$(INSTALL_DATA) systemd/diffsnap.timer $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer
-endif
+	@if [ "$(OS_NAME)" = "Linux" ]; then \
+		$(INSTALL) -d $(DESTDIR)$(INITDIR_Linux); \
+		$(INSTALL_DATA) cron/diffsnap.service $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
+		$(INSTALL_DATA) cron/diffsnap.timer $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
+	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
+		$(INSTALL) -d $(DESTDIR)$(ETCDIR)/cron.d; \
+		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap; \
+	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
 	rm -f $(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
 	rm -f $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
-ifeq ($(OS_NAME),Linux)
-	rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service
-	rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer
-endif
+	@if [ "$(OS_NAME)" = "Linux" ]; then \
+		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
+		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
+	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
+		rm -f $(DESTDIR)$(ETCDIR)/cron.d/diffsnap; \
+	fi
 
 clean:
 	rm -f $(PROG) *.o
