@@ -8,6 +8,7 @@ OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/s
 OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
 OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo newsyslog.conf.d/diffsnap.conf ;; *) echo logrotate.d/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
+INITDIR_Linux = /etc/systemd/system
 BUILD_SHA != git -c safe.directory="*" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown
 
 CC ?= cc
@@ -55,10 +56,20 @@ install: $(PROG)
 		$(INSTALL_DATA) diffsnap.conf "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
 	$(INSTALL) -d $(DESTDIR)$(LOGCONFDIR)
 	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
+ifeq ($(OS_NAME),Linux)
+	$(INSTALL) -d $(DESTDIR)$(INITDIR_Linux)
+	$(INSTALL_DATA) systemd/diffsnap.service $(DESTDIR)$(INITDIR_Linux)/diffsnap.service
+	$(INSTALL_DATA) systemd/diffsnap.timer $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer
+endif
 
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
 	rm -f $(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
 	rm -f $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
+ifeq ($(OS_NAME),Linux)
+	rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service
+	rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer
+endif
+
 clean:
 	rm -f $(PROG) *.o
