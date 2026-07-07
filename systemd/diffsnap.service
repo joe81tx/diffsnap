@@ -1,0 +1,6 @@
+[Unit]
+Description=Create ZFS snapshots using diffsnap
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/diffsnap
