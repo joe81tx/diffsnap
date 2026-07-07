@@ -6,7 +6,7 @@ OS_ETCDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc ;; *) echo /etc ;
 OS_RUNSTATEDIR != case "$(OS_NAME)" in FreeBSD) echo /var/run ;; *) echo /run ;; esac
 OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/sbin/zfs ]; then echo /usr/sbin/zfs; else echo /sbin/zfs; fi ;; esac
 OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
-OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo newsyslog.conf.d/diffsnap.conf ;; *) echo logrotate.d/diffsnap ;; esac
+OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo logrotation/diffsnap.conf ;; *) echo logrotation/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
 INITDIR_Linux = /etc/systemd/system
 BUILD_SHA != git -c safe.directory="*" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown
