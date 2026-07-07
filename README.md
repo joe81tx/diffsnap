@@ -114,6 +114,7 @@ For example, if `diffsnap` is scheduled every 20 minutes, datasets configured fo
 The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using `zfs allow`. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
 FreeBSD Crontab Configuration  
+
 The file below will be installed automatically. Modify it to adjust the schedule or delete it to disable running `diffsnap` automatically.
 ```cron
 # /usr/local/etc/cron.d/diffsnap
