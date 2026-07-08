@@ -109,7 +109,7 @@ rpool/USERDATA 1440 14 daily yes 1
 ## Scheduling
 `diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. `diffsnap` only evaluates datasets when it is invoked. If the scheduler doesn't run `diffsnap` at the expected interval time, that evaluation is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
-For example, if `diffsnap` is scheduled every 20 minutes, datasets configured for 15-minute intervals can only be evaluated at minutes 0, 20, and 40, so three of four intended evaluations are skipped. For this reason, running `diffsnap` every minute is recommended.
+For example, if `diffsnap` is scheduled every 20 minutes (0, 20, 40), datasets configured for 15-minute intervals (0, 15, 30, 45) will only overlap at 0 and the other 3 intervals will be skipped. Running `diffsnap` every minute avoids these unintential skips.
 
 The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using `zfs allow`. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
