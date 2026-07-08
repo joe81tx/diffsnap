@@ -62,7 +62,9 @@ install: $(PROG)
 		$(INSTALL_DATA) cron/diffsnap.timer $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
 	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
 		$(INSTALL) -d $(DESTDIR)$(ETCDIR)/cron.d; \
-		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap; \
+		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
+		test -f "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" || \
+			$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap" \
 	fi
 
 uninstall:
@@ -73,7 +75,7 @@ uninstall:
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
 	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
-		rm -f $(DESTDIR)$(ETCDIR)/cron.d/diffsnap; \
+		rm -f $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
 	fi
 
 clean:
