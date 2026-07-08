@@ -38,7 +38,7 @@ The Makefile selects OS-specific defaults at build time:
 | **Lock** | `/var/run/diffsnap.lock` | `/run/diffsnap.lock` |
 | **ZFS** | `/sbin/zfs` | `/usr/sbin/zfs` if present, otherwise `/sbin/zfs` |
 
-*Overriding the log file requires manual updates to the log rotation config post install
+*Overriding the log file requires manual updates to the log rotation config after installation
 
 Path defaults can be overridden at build time:
 
