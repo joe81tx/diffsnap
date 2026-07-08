@@ -92,7 +92,7 @@ Fields:
 - `retention`: number of matching snapshots to keep.
 - `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.
 - `recursive`: `yes` or `no`.
-- `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots.
+- `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots. Using 1 instead captures any change.
 
 If recursive datasets overlap with the same snapshot prefix the ancestor configuration takes precedence and descendant entries are ignored.
 
