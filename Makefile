@@ -55,7 +55,7 @@ install: $(PROG)
 	test -f "$(DESTDIR)$(ETCDIR)/diffsnap.conf" || \
 		$(INSTALL_DATA) diffsnap.conf "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
 	$(INSTALL) -d $(DESTDIR)$(LOGCONFDIR)
-	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME) \
+	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
 	@if [ "$(OS_NAME)" = "Linux" ]; then \
 		$(INSTALL) -d $(DESTDIR)$(INITDIR_Linux); \
 		$(INSTALL_DATA) cron/diffsnap.service $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
@@ -63,8 +63,9 @@ install: $(PROG)
 	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
 		$(INSTALL) -d $(DESTDIR)$(ETCDIR)/cron.d; \
 		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
-		test -f "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" || \
+		if [ ! -f "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" ]; then \
 			$(INSTALL_DATA) cron/diffsnap "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap"; \
+		fi; \
 	fi
 
 uninstall:
