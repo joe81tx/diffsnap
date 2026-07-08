@@ -76,7 +76,7 @@ uninstall:
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
 	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
-		rm -f $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
+		rm -f $(DESTDIR)$(ETCDIR)/diffsnap.cron.sample; \
 	fi
 
 clean:
