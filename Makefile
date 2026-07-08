@@ -62,7 +62,7 @@ install: $(PROG)
 		$(INSTALL_DATA) cron/diffsnap.timer $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
 	elif [ "$(OS_NAME)" = "FreeBSD" ]; then \
 		$(INSTALL) -d $(DESTDIR)$(ETCDIR)/cron.d; \
-		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
+		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/diffsnap.cron.sample; \
 		if [ ! -f "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" ]; then \
 			$(INSTALL_DATA) cron/diffsnap "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap"; \
 		fi; \
