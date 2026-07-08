@@ -64,7 +64,7 @@ install: $(PROG)
 		$(INSTALL) -d $(DESTDIR)$(ETCDIR)/cron.d; \
 		$(INSTALL_DATA) cron/diffsnap $(DESTDIR)$(ETCDIR)/cron.d/diffsnap.sample; \
 		test -f "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" || \
-			$(INSTALL_DATA) cron/diffsnap "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap" \
+			$(INSTALL_DATA) cron/diffsnap "$(DESTDIR)$(ETCDIR)/cron.d/diffsnap"; \
 	fi
 
 uninstall:
