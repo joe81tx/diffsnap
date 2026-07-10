@@ -33,6 +33,15 @@
 #define ALLOC_CHUNK_BATCH 32
 #define ALLOC_CHUNK_PRUNE 128
 #define ALLOC_CHUNK_METRIC 256
+/*
+ * Conservative cap on the total bytes of snapshot-name arguments packed
+ * into a single `zfs snapshot` invocation. Real OS command-line limits vary
+ * (Linux's ARG_MAX is usually a couple MB; other platforms differ), so
+ * rather than querying per-platform limits we use one fixed, comfortably
+ * conservative budget everywhere. If a root+pass would exceed it, it's
+ * split into multiple `zfs snapshot` calls instead of one call per dataset.
+ */
+#define ARGV_BYTES_CAP (128 * 1024)
 #define STR_BUF_SMALL 32
 #define STR_BUF_MED 64
 #define ZFS_NAME_MAX 256
@@ -54,9 +63,8 @@
 static FILE *log_fp = NULL;
 
 typedef int (*line_handler_t)(const char *line, void *data);
-typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; } batch_item_t;
+typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; long long written; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
-typedef struct { char **snaps; size_t count; size_t capacity; const char *match_str; size_t match_len; } prune_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
 typedef struct { char name[STR_BUF_LARGE]; long long written; } metric_item_t;
 typedef struct { metric_item_t *items; size_t count; size_t capacity; } metric_ctx_t;
@@ -173,13 +181,6 @@ static void format_bytes(long long bytes, char *buf, size_t buf_size) {
     } else {
         snprintf(buf, buf_size, "%.2f%s", d_bytes, units[i]);
     }
-}
-
-static void prune_ctx_free(prune_ctx_t *ctx) {
-    if (!ctx->snaps) return;
-    for (size_t i = 0; i < ctx->count; i++) free(ctx->snaps[i]);
-    free(ctx->snaps);
-    ctx->snaps = NULL; ctx->count = 0; ctx->capacity = 0;
 }
 
 static void name_list_free(name_list_t *list) {
@@ -363,46 +364,47 @@ static int zfs_destroy(const char *snap_name, int recursive) {
     return exec_cmd_stream(argv, NULL, NULL);
 }
 
-static int handle_prune_line(const char *line, void *data) {
-    prune_ctx_t *ctx = (prune_ctx_t *)data;
-    const char *at = strchr(line, '@');
-    if (at && strncmp(at + 1, ctx->match_str, ctx->match_len) == 0) {
-        if (date_stamp_like(at + 1 + ctx->match_len)) {
-            if (ctx->count >= ctx->capacity) {
-                size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_PRUNE : ctx->capacity * 2;
-                char **tmp = realloc(ctx->snaps, new_cap * sizeof(char *));
-                if (!tmp) return -1;
-                ctx->snaps = tmp; ctx->capacity = new_cap;
-            }
-            if ((ctx->snaps[ctx->count] = strdup(line)) == NULL) return -1;
-            ctx->count++;
-        }
-    }
-    return 0;
-}
-
-static int prune_old_snapshots(const char *dataset, const char *prefix, size_t max_snaps, int recursive) {
+/*
+ * Prunes snapshots for a single dataset/prefix using a snapshot inventory that
+ * was already fetched once (in creation-descending order, newest first) for
+ * the whole run. `matches` is scratch space owned by the caller and reused
+ * across calls so we don't malloc/free per dataset. Entries in `matches` are
+ * borrowed pointers into `inventory`; they must not be freed here.
+ */
+static int prune_from_inventory(const name_list_t *inventory, const char *dataset, const char *prefix,
+                                 size_t max_snaps, int recursive, char ***matches, size_t *matches_cap) {
     char match_str[STR_BUF_LARGE];
     int match_rc = snprintf(match_str, sizeof(match_str), "%s_", prefix);
     if (match_rc < 0 || (size_t)match_rc >= sizeof(match_str)) return -1;
-    prune_ctx_t ctx = { .snaps = NULL, .count = 0, .capacity = 0, .match_str = match_str, .match_len = (size_t)match_rc };
-    const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", "-S", "creation", dataset, NULL};
-    if (exec_cmd_stream(argv, handle_prune_line, &ctx) != 0) {
-        log_msg("Error: Failed to list snapshots for %s", dataset);
-        prune_ctx_free(&ctx); return -1;
+    size_t match_len = (size_t)match_rc;
+    size_t dataset_len = strlen(dataset);
+
+    size_t match_count = 0;
+    for (size_t i = 0; i < inventory->count; i++) {
+        const char *line = inventory->names[i];
+        const char *at = strchr(line, '@');
+        if (!at) continue;
+        if ((size_t)(at - line) != dataset_len || strncmp(line, dataset, dataset_len) != 0) continue;
+        if (strncmp(at + 1, match_str, match_len) != 0) continue;
+        if (!date_stamp_like(at + 1 + match_len)) continue;
+        if (match_count >= *matches_cap) {
+            size_t new_cap = *matches_cap == 0 ? ALLOC_CHUNK_PRUNE : *matches_cap * 2;
+            char **tmp = realloc(*matches, new_cap * sizeof(char *));
+            if (!tmp) return -1;
+            *matches = tmp; *matches_cap = new_cap;
+        }
+        (*matches)[match_count++] = (char *)line;
     }
     int prune_errors = 0;
-    while (ctx.count > max_snaps) {
-        char *oldest = ctx.snaps[--ctx.count];
+    while (match_count > max_snaps) {
+        char *oldest = (*matches)[--match_count];
         if (zfs_destroy(oldest, recursive) == 0) log_msg("Pruned=%s%s", oldest, recursive ? " Recursive" : "");
         else { log_msg("Error: Failed to prune snapshot %s", oldest); prune_errors++; }
-        free(oldest); ctx.snaps[ctx.count] = NULL;
     }
-    prune_ctx_free(&ctx);
     return (prune_errors == 0) ? 0 : -1;
 }
 
-static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention) {
+static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long written) {
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_BATCH : ctx->capacity * 2;
         batch_item_t *tmp = realloc(ctx->items, new_cap * sizeof(batch_item_t));
@@ -411,7 +413,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = strdup(dataset), *p = strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0 };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = written };
     return 0;
 }
 
@@ -527,37 +529,79 @@ static size_t batch_root_pass_count(const batch_ctx_t *ctx, const char *root_dat
     return pass_count;
 }
 
-static void batch_mark_root_pass_failed(batch_ctx_t *ctx, const char *root_dataset, size_t pass) {
-    for (size_t i = 0; i < ctx->count; i++)
-        if (batch_item_in_root_pass(ctx, i, root_dataset, pass)) ctx->items[i].snap_failed = 1;
+static void batch_mark_indices_failed(batch_ctx_t *ctx, const size_t *indices, size_t count) {
+    for (size_t k = 0; k < count; k++) ctx->items[indices[k]].snap_failed = 1;
 }
 
-static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset, size_t pass) {
-    size_t snap_count = 0, total_bytes = 0;
-    for (size_t i = 0; i < ctx->count; i++) {
-        if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
-        snap_count++;
-        total_bytes += strlen(ctx->items[i].dataset) + strlen(ctx->items[i].prefix) + strlen(timestamp) + 3;
-    }
-    if (snap_count == 0) return 0;
-    size_t total_args = (recursive ? 3 : 2) + snap_count + 1;
+/*
+ * Executes one `zfs snapshot [-r] ds1@snap ds2@snap ...` call covering
+ * exactly the items referenced by `indices` (a subset of one root+pass that
+ * fits under ARGV_BYTES_CAP). On failure, only these items are marked
+ * snap_failed -- not the whole root+pass -- since a sibling chunk that
+ * already succeeded (or hasn't run yet) shouldn't be penalized for this
+ * chunk's failure.
+ */
+static int zfs_snapshot_exec_chunk(batch_ctx_t *ctx, int recursive, const char *timestamp,
+                                    const size_t *indices, size_t chunk_count, size_t chunk_bytes) {
+    size_t total_args = (recursive ? 3 : 2) + chunk_count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
-    if (!argv) { batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
+    if (!argv) { batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
     size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
-    char *arena = malloc(total_bytes), *offset = arena;
-    if (!arena) { free(argv); batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
-    for (size_t i = 0; i < ctx->count; i++) {
-        if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
-        size_t remaining = total_bytes - (size_t)(offset - arena);
+    char *arena = malloc(chunk_bytes), *offset = arena;
+    if (!arena) { free(argv); batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
+    for (size_t k = 0; k < chunk_count; k++) {
+        size_t i = indices[k];
+        size_t remaining = chunk_bytes - (size_t)(offset - arena);
         int written = snprintf(offset, remaining, "%s@%s_%s", ctx->items[i].dataset, ctx->items[i].prefix, timestamp);
-        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_root_pass_failed(ctx, root_dataset, pass); return -1; }
+        if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
         argv[idx++] = offset; offset += written + 1;
     }
     argv[idx] = NULL;
     int rc = exec_cmd_stream(argv, NULL, NULL);
-    if (rc != 0) batch_mark_root_pass_failed(ctx, root_dataset, pass);
+    if (rc != 0) batch_mark_indices_failed(ctx, indices, chunk_count);
     free(arena); free(argv); return rc;
+}
+
+/*
+ * Snapshots every item in this root+pass, splitting into as many
+ * `zfs snapshot` invocations as needed to keep each one's total argument
+ * bytes under ARGV_BYTES_CAP. Items are packed greedily in their existing
+ * order; a chunk always contains at least one item even if that single
+ * item's own bytes exceed the cap (can't split further, and in practice
+ * unreachable given the ~800-byte ceiling on one snapshot name).
+ */
+static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset, size_t pass) {
+    size_t *indices = NULL, count = 0, capacity = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
+        if (count >= capacity) {
+            size_t new_cap = capacity == 0 ? ALLOC_CHUNK_BATCH : capacity * 2;
+            size_t *tmp = realloc(indices, new_cap * sizeof(size_t));
+            if (!tmp) { free(indices); ctx->items[i].snap_failed = 1; return -1; }
+            indices = tmp; capacity = new_cap;
+        }
+        indices[count++] = i;
+    }
+    if (count == 0) { free(indices); return 0; }
+
+    int status = 0;
+    size_t start = 0;
+    while (start < count) {
+        size_t chunk_bytes = 0, end = start;
+        while (end < count) {
+            size_t i = indices[end];
+            size_t item_bytes = strlen(ctx->items[i].dataset) + strlen(ctx->items[i].prefix) + strlen(timestamp) + 3;
+            if (end > start && chunk_bytes + item_bytes > ARGV_BYTES_CAP) break;
+            chunk_bytes += item_bytes;
+            end++;
+        }
+        size_t chunk_count = end - start;
+        if (zfs_snapshot_exec_chunk(ctx, recursive, timestamp, &indices[start], chunk_count, chunk_bytes) != 0) status = -1;
+        start = end;
+    }
+    free(indices);
+    return status;
 }
 
 static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *timestamp) {
@@ -604,17 +648,17 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
     return 0;
 }
 
-static size_t batch_distinct_roots(const batch_ctx_t *ctx, char *root_buf, size_t root_buf_size) {
+static size_t distinct_roots_from_datasets(const char *const *datasets, size_t count, char *root_buf, size_t root_buf_size) {
     size_t distinct = 0;
     const char *first_root_dataset = NULL;
-    for (size_t i = 0; i < ctx->count; i++) {
+    for (size_t i = 0; i < count; i++) {
         int seen = 0;
         for (size_t j = 0; j < i; j++) {
-            if (same_zfs_root(ctx->items[i].dataset, ctx->items[j].dataset)) { seen = 1; break; }
+            if (same_zfs_root(datasets[i], datasets[j])) { seen = 1; break; }
         }
         if (!seen) {
             distinct++;
-            if (distinct == 1) first_root_dataset = ctx->items[i].dataset;
+            if (distinct == 1) first_root_dataset = datasets[i];
         }
     }
     if (distinct == 1) {
@@ -626,22 +670,39 @@ static size_t batch_distinct_roots(const batch_ctx_t *ctx, char *root_buf, size_
     return distinct;
 }
 
-static int load_snapshot_inventory(name_list_t *list, const batch_ctx_t *batch) {
+/*
+ * Loads every snapshot relevant to this run exactly once, covering both the
+ * standard and recursive batches together (items 5 and 6). Sorted newest-
+ * first by creation time, matching what per-item pruning previously relied
+ * on from its own individual `zfs list -S creation` call. This single
+ * listing is reused both to verify snapshots that zfs_snapshot_batch flagged
+ * as failed, and to drive pruning for every item in both batches.
+ */
+static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t *std_b, const batch_ctx_t *rec_b) {
+    size_t total = std_b->count + rec_b->count;
+    if (total == 0) return 0;
+    const char **datasets = malloc(total * sizeof(char *));
+    if (!datasets) return -1;
+    size_t idx = 0;
+    for (size_t i = 0; i < std_b->count; i++) datasets[idx++] = std_b->items[i].dataset;
+    for (size_t i = 0; i < rec_b->count; i++) datasets[idx++] = rec_b->items[i].dataset;
+
     char root[STR_BUF_LARGE];
-    size_t distinct = batch_distinct_roots(batch, root, sizeof(root));
+    size_t distinct = distinct_roots_from_datasets(datasets, total, root, sizeof(root));
+    free(datasets);
+
     int rc;
     if (distinct == 1) {
-        const char *const argv[] = {ZFS_PATH, "list", "-H", "-r", "-t", "snapshot", "-o", "name", root, NULL};
+        const char *const argv[] = {ZFS_PATH, "list", "-H", "-r", "-t", "snapshot", "-o", "name", "-S", "creation", root, NULL};
         rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
     } else {
-        const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", NULL};
+        const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", "-S", "creation", NULL};
         rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
     }
     if (rc != 0) {
         name_list_free(list);
         return -1;
     }
-    if (list->count > 0) qsort(list->names, list->count, sizeof(*list->names), compare_names);
     return 0;
 }
 
@@ -694,37 +755,44 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     return 0;
 }
 
-static int process_batch(batch_ctx_t *batch, metric_ctx_t *metrics, const char *snap_time, int recursive) {
+static int create_batch_snapshots(batch_ctx_t *batch, const char *snap_time, int recursive) {
     int rc = zfs_snapshot_batch(batch, recursive, snap_time);
-    int status = rc != 0 ? 1 : 0;
-    name_list_t snapshots = { NULL, 0, 0 };
-    int can_verify = 1;
-    int need_inventory = 0;
-    for (size_t i = 0; i < batch->count; i++) {
-        if (batch->items[i].snap_failed) { need_inventory = 1; break; }
-    }
     if (rc != 0) log_msg("Error: %s zfs snapshot batch execution failed", recursive ? "recursive" : "standard");
-    if (need_inventory && load_snapshot_inventory(&snapshots, batch) != 0) {
-        log_msg("Error: Unable to list snapshots for %sbatch verification", recursive ? "recursive " : "");
-        can_verify = 0;
-    }
+    return rc;
+}
+
+/*
+ * Verifies (for items zfs_snapshot_batch flagged as failed) and prunes every
+ * item in `batch`, using an inventory that was already fetched once for the
+ * whole run (both std_b and rec_b together) rather than issuing a fresh zfs
+ * list call here. `sorted_names`/`sorted_count` is an alphabetically-sorted
+ * copy of inventory's pointers, used for bsearch-based verification;
+ * `matches`/`matches_cap` is pruning scratch space reused across calls.
+ */
+static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int inventory_ok,
+                           char **sorted_names, size_t sorted_count,
+                           char ***matches, size_t *matches_cap,
+                           const char *snap_time, int recursive) {
+    int status = 0;
     for (size_t i = 0; i < batch->count; i++) {
         char snap_name[STR_BUF_XLARGE];
         int len = snprintf(snap_name, sizeof(snap_name), "%s@%s_%s", batch->items[i].dataset, batch->items[i].prefix, snap_time);
         if (len < 0 || (size_t)len >= sizeof(snap_name)) { log_msg("Error: %sSnapshot name too long for %s", recursive ? "Recursive " : "", batch->items[i].dataset); status = 1; continue; }
         if (batch->items[i].snap_failed) {
-            if (!can_verify) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
-            if (!name_index_contains(snapshots.names, snapshots.count, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
+            if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
+            if (!name_index_contains(sorted_names, sorted_count, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
         }
-        metric_item_t key = {0};
-        memcpy(key.name, batch->items[i].dataset, strlen(batch->items[i].dataset) + 1);
-        metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
         char h_bytes[STR_BUF_SMALL] = "0";
-        if (found && found->written != -1) format_bytes(found->written, h_bytes, sizeof(h_bytes));
+        if (batch->items[i].written != -1) format_bytes(batch->items[i].written, h_bytes, sizeof(h_bytes));
         log_msg("Created=%s Written=%s%s", snap_name, h_bytes, recursive ? " Recursive" : "");
-        if (prune_old_snapshots(batch->items[i].dataset, batch->items[i].prefix, batch->items[i].retention, recursive) != 0) status = 1;
+        if (!inventory_ok) {
+            log_msg("Error: Unable to prune %ssnapshots for %s: snapshot inventory unavailable", recursive ? "recursive " : "", batch->items[i].dataset);
+            status = 1;
+            continue;
+        }
+        if (prune_from_inventory(inventory, batch->items[i].dataset, batch->items[i].prefix,
+                                  batch->items[i].retention, recursive, matches, matches_cap) != 0) status = 1;
     }
-    name_list_free(&snapshots);
     return status;
 }
 
@@ -827,8 +895,8 @@ int main(int argc, char *argv[]) {
         if (!found) { log_msg("Error: Configured dataset not found: %s", dataset); global_status = 1; continue; }
         if (found->written == -1) { log_msg("Error: Invalid written metric for %s", dataset); global_status = 1; continue; }
         if (found->written < min_bytes) continue;
-        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
-        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val, found->written) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, found->written) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
     next_line: ;
     }
     if (ferror(conf)) {
@@ -841,8 +909,41 @@ int main(int argc, char *argv[]) {
     char snap_time[STR_BUF_SMALL];
     if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
     
-    if (process_batch(&std_b, &metrics, snap_time, 0) != 0) global_status = 1;
-    if (process_batch(&rec_b, &metrics, snap_time, 1) != 0) global_status = 1;
+    if (create_batch_snapshots(&std_b, snap_time, 0) != 0) global_status = 1;
+    if (create_batch_snapshots(&rec_b, snap_time, 1) != 0) global_status = 1;
+
+    /* One shared snapshot listing, fetched after all snapshot creation is
+     * done, reused for verification and pruning across both batches. */
+    name_list_t inventory = { NULL, 0, 0 };
+    char **sorted_names = NULL;
+    size_t sorted_count = 0;
+    int inventory_ok = 1;
+    char **prune_matches = NULL;
+    size_t prune_matches_cap = 0;
+
+    if (std_b.count > 0 || rec_b.count > 0) {
+        if (load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) != 0) {
+            log_msg("Error: Unable to list snapshots for batch verification and pruning");
+            inventory_ok = 0;
+        } else if (inventory.count > 0) {
+            sorted_names = malloc(inventory.count * sizeof(char *));
+            if (!sorted_names) {
+                log_msg("Error: Failed to allocate memory for snapshot verification index");
+                inventory_ok = 0;
+            } else {
+                memcpy(sorted_names, inventory.names, inventory.count * sizeof(char *));
+                qsort(sorted_names, inventory.count, sizeof(char *), compare_names);
+                sorted_count = inventory.count;
+            }
+        }
+    }
+
+    if (finalize_batch(&std_b, &inventory, inventory_ok, sorted_names, sorted_count, &prune_matches, &prune_matches_cap, snap_time, 0) != 0) global_status = 1;
+    if (finalize_batch(&rec_b, &inventory, inventory_ok, sorted_names, sorted_count, &prune_matches, &prune_matches_cap, snap_time, 1) != 0) global_status = 1;
+
+    free(prune_matches);
+    free(sorted_names);
+    name_list_free(&inventory);
     ret_code = global_status;
 cleanup:
     free(line); if (conf) fclose(conf); free(metrics.items); batch_free(&std_b); batch_free(&rec_b); seen_set_free(&seen); if (log_fp) fclose(log_fp); close(lock_fd); return ret_code;
