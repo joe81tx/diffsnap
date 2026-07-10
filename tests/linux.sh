@@ -32,6 +32,31 @@ archive_log() {
   : > "$LOG"
 }
 
+# Installs a test wrapper (written by the caller to $1, a temp file) over
+# $ZFS_REAL. Retries briefly on ETXTBSY ("Text file busy"), which can occur
+# if a zfs child process spawned by a just-finished diffsnap run hasn't
+# fully released its text-segment mapping on the binary yet -- a timing
+# race, not a diffsnap defect. Logs a FAIL and returns 1 if the target
+# stays busy past the retry budget, rather than silently proceeding with a
+# stale/unwrapped binary.
+install_zfs_wrapper() {
+  local src="$1" tries=0 max_tries=25
+  local errfile
+  errfile=$(mktemp)
+  while ! cp "$src" "$ZFS_REAL" 2>"$errfile"; do
+    tries=$((tries+1))
+    if [ "$tries" -ge "$max_tries" ]; then
+      cat "$errfile" >&2
+      rm -f "$errfile"
+      bad "failed to install zfs test wrapper after $max_tries attempts (target busy)"
+      return 1
+    fi
+    sleep 0.2
+  done
+  rm -f "$errfile"
+  chmod +x "$ZFS_REAL"
+}
+
 echo "== Preflight: required commands =="
 missing=0
 for cmd in zfs strace flock timedatectl "$BIN"; do
@@ -253,7 +278,7 @@ else
   cp -a "$ZFS_REAL" "$ZFS_BACKUP"
   restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
   trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
-  cat > "$ZFS_REAL" <<'WRAP'
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
 #!/bin/bash
 REAL="$0.diffsnap_test_backup"
 if [ "$1" = "snapshot" ]; then
@@ -262,7 +287,8 @@ if [ "$1" = "snapshot" ]; then
 fi
 exec "$REAL" "$@"
 WRAP
-  chmod +x "$ZFS_REAL"
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+  rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 longerr no 0
@@ -270,6 +296,9 @@ CONF
   "$BIN"; rc=$?
   [ $rc -lt 128 ] && ok "no crash on >512-byte zfs stderr line" || bad "crashed on >512-byte zfs stderr line (exit $rc)"
   grep -q "Error: zfs:" "$LOG" && ok "oversized stderr line logged (split across reader buffer, not lost)" || bad "oversized stderr line not logged"
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
   restore_real_zfs
   trap restore_clock_and_ntp EXIT
 fi
@@ -350,7 +379,7 @@ else
   cp -a "$ZFS_REAL" "$ZFS_BACKUP"
   restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
   trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
-  cat > "$ZFS_REAL" <<'WRAP'
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
 #!/bin/bash
 REAL="$0.diffsnap_test_backup"
 if [ "$1" = "get" ]; then
@@ -358,7 +387,8 @@ if [ "$1" = "get" ]; then
 fi
 exec "$REAL" "$@"
 WRAP
-  chmod +x "$ZFS_REAL"
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+  rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 skiptest no 0
@@ -366,6 +396,9 @@ CONF
   "$BIN"
   grep -q "Skipping metric line with oversized dataset name" "$LOG" && ok "oversized metric line logged and skipped" || bad "oversized metric line not logged"
   grep -q "Created=$DS/a@skiptest" "$LOG" && ok "valid dataset still snapshotted despite earlier bad line" || bad "good line lost after bad line (batch aborted?)"
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
   restore_real_zfs
   trap restore_clock_and_ntp EXIT
 fi
@@ -380,7 +413,7 @@ else
   cp -a "$ZFS_REAL" "$ZFS_BACKUP"
   restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
   trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
-  cat > "$ZFS_REAL" <<'WRAP'
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
 #!/bin/bash
 REAL="$0.diffsnap_test_backup"
 if [ "$1" = "snapshot" ]; then
@@ -389,7 +422,8 @@ if [ "$1" = "snapshot" ]; then
 fi
 exec "$REAL" "$@"
 WRAP
-  chmod +x "$ZFS_REAL"
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+  rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
 $DS/a 1 2 scopetest no 0
@@ -408,6 +442,9 @@ CONF
   grep -q "Snapshot not created: $DS/a@scopetest" "$LOG" \
     && ok "simulated snapshot failure correctly detected via inventory check" \
     || bad "expected 'Snapshot not created' message missing"
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
   restore_real_zfs
   trap restore_clock_and_ntp EXIT
 fi
@@ -542,7 +579,127 @@ dupanccalls=$(grep -cE "$snap_pattern" /tmp/trace_dupanc.log)
 archive_log "27 - duplicate ancestor plus descendant pass assignment"
 
 
-echo "== 28. Cleanup =="
+echo "== 28. Prune matching does not cross-match dataset name prefixes (e.g. DS/a vs DS/ab) =="
+zfs create "$DS/ab" 2>/dev/null
+# dataset          interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/a 1 1 xmatch no 0
+$DS/ab 1 1 xmatch no 0
+CONF
+"$BIN"; sleep 1; "$BIN"; sleep 1; "$BIN"
+count_a=$(zfs list -t snap -H -o name | grep -c "^$DS/a@xmatch")
+count_ab=$(zfs list -t snap -H -o name | grep -c "^$DS/ab@xmatch")
+[ "$count_a" -eq 1 ] && ok "retention correct for $DS/a (not cross-matched with $DS/ab)" || bad "retention violated for $DS/a (count=$count_a) -- possible dataset-name boundary bug"
+[ "$count_ab" -eq 1 ] && ok "retention correct for $DS/ab (not cross-matched with $DS/a)" || bad "retention violated for $DS/ab (count=$count_ab) -- possible dataset-name boundary bug"
+zfs destroy -R "$DS/ab" 2>/dev/null
+archive_log "28 - dataset name prefix boundary in prune matching"
+
+echo "== 29. Combined batch verification: one shared zfs list call covers both std and recursive batches =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run combined-inventory test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
+#!/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "snapshot" ]; then
+  echo "error: simulated snapshot failure" >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+WRAP
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+  rm -f /tmp/diffsnap_zfs_wrapper.$$
+  # dataset          interval  retention  prefix    recursive  min_bytes
+  cat > "$CONF" <<CONF
+$DS/a 1 2 combA no 0
+$DS/b 1 2 combB yes 0
+CONF
+  rm -f /tmp/trace_comb.log
+  strace -f -e trace=execve -o /tmp/trace_comb.log "$BIN"
+  [ -s /tmp/trace_comb.log ] || bad "strace trace file empty/missing for section 29 -- results below are unreliable"
+  list_calls=$(grep -E '"list".*"-t".*"snapshot"' /tmp/trace_comb.log | grep -vc "diffsnap_test_backup")
+  [ "$list_calls" -eq 1 ] && ok "exactly one shared zfs list call covers both std and recursive verification (count=$list_calls)" || bad "expected exactly 1 zfs list call for combined verification, got $list_calls"
+  grep -q "Snapshot not created: $DS/a@combA" "$LOG" && ok "std batch failure correctly detected via shared inventory" || bad "std batch failure not detected"
+  grep -q "Snapshot not created: $DS/b@combB" "$LOG" && ok "recursive batch failure correctly detected via shared inventory" || bad "recursive batch failure not detected"
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "29 - combined batch verification single shared list call"
+
+echo "== 30. Pruning reuses one shared snapshot listing instead of one zfs list call per dataset =="
+# dataset          interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/a 1 2 prlist1 no 0
+$DS/b 1 2 prlist2 no 0
+CONF
+rm -f /tmp/trace_prlist.log
+strace -f -e trace=execve -o /tmp/trace_prlist.log "$BIN"
+[ -s /tmp/trace_prlist.log ] || bad "strace trace file empty/missing for section 30 -- results below are unreliable"
+list_calls=$(grep -E '"list".*"-t".*"snapshot"' /tmp/trace_prlist.log | grep -vc "diffsnap_test_backup")
+[ "$list_calls" -eq 1 ] && ok "single shared zfs list call used for pruning across multiple datasets (count=$list_calls)" || bad "expected exactly 1 zfs list call for pruning, got $list_calls (old per-dataset behavior?)"
+archive_log "30 - shared listing reused for pruning across multiple datasets"
+
+echo "== 31. Shared inventory listing failure blocks verification AND pruning for all items (coupled failure) =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run coupled-failure test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
+#!/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "list" ] && [ "$2" = "-H" ]; then
+  echo "error: simulated list failure" >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+WRAP
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+  rm -f /tmp/diffsnap_zfs_wrapper.$$
+  # dataset          interval  retention  prefix    recursive  min_bytes
+  cat > "$CONF" <<CONF
+$DS/a 1 2 listfail no 0
+CONF
+  "$BIN"
+  grep -q "Unable to list snapshots for batch verification and pruning" "$LOG" && ok "shared inventory failure logged" || bad "shared inventory failure not logged"
+  grep -q "Unable to prune.*snapshots for $DS/a: snapshot inventory unavailable" "$LOG" && ok "pruning correctly skipped and logged when inventory unavailable" || bad "pruning failure not logged when inventory unavailable"
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "31 - shared inventory listing failure coupling"
+
+echo "== 32. Written= byte count reflects actual data written (cached metric value used in log) =="
+mp=$(zfs get -H -o value mountpoint "$DS/a")
+dd if=/dev/urandom of="$mp/testfile" bs=1M count=2 2>/dev/null
+POOL="${DS%%/*}"
+zpool sync "$POOL" 2>/dev/null || sync
+# dataset          interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/a 1 2 wtest no 0
+CONF
+"$BIN"
+writtenline=$(grep "Created=$DS/a@wtest" "$LOG")
+echo "$writtenline" | grep -Eq 'Written=[0-9]' && ! echo "$writtenline" | grep -q "Written=0 " \
+  && ok "Written= byte count reflects real data (non-zero, correctly cached value): $writtenline" \
+  || bad "Written= value missing or zero despite real data written: $writtenline"
+rm -f "$mp/testfile"
+archive_log "32 - written byte count accuracy"
+
+echo "== 33. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"

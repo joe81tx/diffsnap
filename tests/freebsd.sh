@@ -426,7 +426,7 @@ CONF
 rm -f /tmp/trace_scope.log
 truss -f -a -o /tmp/trace_scope.log -- "$BIN" || bad "truss failed to run for section 21 (exit $?)"
 [ -s /tmp/trace_scope.log ] || bad "truss trace file empty/missing for section 21 -- results below are unreliable"
-  list_pattern='"list", "-H", "-r", "-t", "snapshot", "-o", "name", "'"$POOL"'"'
+  list_pattern='"list", "-H", "-r", "-t", "snapshot", "-o", "name", "-S", "creation", "'"$POOL"'"'
   grep -q "$list_pattern" /tmp/trace_scope.log \
     && ok "single-root batch verification used scoped -r zfs list ($POOL)" \
     || bad "expected scoped zfs list -r $POOL not found in trace"
@@ -570,7 +570,115 @@ dupanccalls=$(grep -c "$dupanc_snap_pattern" /tmp/trace_dupanc.log)
 [ "$dupanccalls" -eq 3 ] && ok "duplicate ancestor + descendant correctly split into 3 separate passes" || bad "expected 3 separate snapshot invocations, got $dupanccalls"
 archive_log "27 - duplicate ancestor plus descendant pass assignment"
 
-echo "== 28. Cleanup =="
+echo "== 28. Prune matching does not cross-match dataset name prefixes (e.g. DS/a vs DS/ab) =="
+zfs create "$DS/ab" 2>/dev/null
+cat > "$CONF" <<CONF
+$DS/a       1         1          xmatch    no         0
+$DS/ab      1         1          xmatch    no         0
+CONF
+"$BIN"; sleep 1; "$BIN"; sleep 1; "$BIN"
+count_a=$(zfs list -t snap -H -o name | grep -c "^$DS/a@xmatch")
+count_ab=$(zfs list -t snap -H -o name | grep -c "^$DS/ab@xmatch")
+[ "$count_a" -eq 1 ] && ok "retention correct for $DS/a (not cross-matched with $DS/ab)" || bad "retention violated for $DS/a (count=$count_a) -- possible dataset-name boundary bug"
+[ "$count_ab" -eq 1 ] && ok "retention correct for $DS/ab (not cross-matched with $DS/a)" || bad "retention violated for $DS/ab (count=$count_ab) -- possible dataset-name boundary bug"
+zfs destroy -R "$DS/ab" 2>/dev/null
+archive_log "28 - dataset name prefix boundary in prune matching"
+
+echo "== 29. Combined batch verification: one shared zfs list call covers both std and recursive batches =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run combined-inventory test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > "$ZFS_REAL" <<'WRAP'
+#!/usr/local/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "snapshot" ]; then
+  echo "error: simulated snapshot failure" >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+WRAP
+  chmod +x "$ZFS_REAL"
+  # dataset   interval  retention  prefix     recursive  min_bytes
+  cat > "$CONF" <<CONF
+$DS/a       1         2          combA      no         0
+$DS/b       1         2          combB      yes        0
+CONF
+  rm -f /tmp/trace_comb.log
+  truss -f -a -o /tmp/trace_comb.log -- "$BIN" || bad "truss failed to run for section 29 (exit $?)"
+  [ -s /tmp/trace_comb.log ] || bad "truss trace file empty/missing for section 29 -- results below are unreliable"
+  list_calls=$(grep '"list", "-H".*"-t", "snapshot"' /tmp/trace_comb.log | grep -vc "diffsnap_test_backup")
+  [ "$list_calls" -eq 1 ] && ok "exactly one shared zfs list call covers both std and recursive verification (count=$list_calls)" || bad "expected exactly 1 zfs list call for combined verification, got $list_calls"
+  grep -q "Snapshot not created: $DS/a@combA" "$LOG" && ok "std batch failure correctly detected via shared inventory" || bad "std batch failure not detected"
+  grep -q "Snapshot not created: $DS/b@combB" "$LOG" && ok "recursive batch failure correctly detected via shared inventory" || bad "recursive batch failure not detected"
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "29 - combined batch verification single shared list call"
+
+echo "== 30. Pruning reuses one shared snapshot listing instead of one zfs list call per dataset =="
+cat > "$CONF" <<CONF
+$DS/a       1         2          prlist1   no         0
+$DS/b       1         2          prlist2   no         0
+CONF
+rm -f /tmp/trace_prlist.log
+truss -f -a -o /tmp/trace_prlist.log -- "$BIN" || bad "truss failed to run for section 30 (exit $?)"
+[ -s /tmp/trace_prlist.log ] || bad "truss trace file empty/missing for section 30 -- results below are unreliable"
+list_calls=$(grep '"list", "-H".*"-t", "snapshot"' /tmp/trace_prlist.log | grep -vc "diffsnap_test_backup")
+[ "$list_calls" -eq 1 ] && ok "single shared zfs list call used for pruning across multiple datasets (count=$list_calls)" || bad "expected exactly 1 zfs list call for pruning, got $list_calls (old per-dataset behavior?)"
+archive_log "30 - shared listing reused for pruning across multiple datasets"
+
+echo "== 31. Shared inventory listing failure blocks verification AND pruning for all items (coupled failure) =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run coupled-failure test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  cat > "$ZFS_REAL" <<'WRAP'
+#!/usr/local/bin/bash
+REAL="$0.diffsnap_test_backup"
+if [ "$1" = "list" ] && [ "$2" = "-H" ]; then
+  echo "error: simulated list failure" >&2
+  exit 1
+fi
+exec "$REAL" "$@"
+WRAP
+  chmod +x "$ZFS_REAL"
+  cat > "$CONF" <<CONF
+$DS/a       1         2          listfail   no         0
+CONF
+  "$BIN"
+  grep -q "Unable to list snapshots for batch verification and pruning" "$LOG" && ok "shared inventory failure logged" || bad "shared inventory failure not logged"
+  grep -q "Unable to prune.*snapshots for $DS/a: snapshot inventory unavailable" "$LOG" && ok "pruning correctly skipped and logged when inventory unavailable" || bad "pruning failure not logged when inventory unavailable"
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+fi
+archive_log "31 - shared inventory listing failure coupling"
+
+echo "== 32. Written= byte count reflects actual data written (cached metric value used in log) =="
+mp=$(zfs get -H -o value mountpoint "$DS/a")
+dd if=/dev/urandom of="$mp/testfile" bs=1m count=2 2>/dev/null
+POOL="${DS%%/*}"
+zpool sync "$POOL" 2>/dev/null || sync
+cat > "$CONF" <<CONF
+$DS/a       1         2          wtest     no         0
+CONF
+"$BIN"
+writtenline=$(grep "Created=$DS/a@wtest" "$LOG")
+echo "$writtenline" | grep -Eq 'Written=[0-9]' && ! echo "$writtenline" | grep -q "Written=0 " \
+  && ok "Written= byte count reflects real data (non-zero, correctly cached value): $writtenline" \
+  || bad "Written= value missing or zero despite real data written: $writtenline"
+rm -f "$mp/testfile"
+archive_log "32 - written byte count accuracy"
+
+echo "== 33. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
