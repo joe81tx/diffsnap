@@ -361,8 +361,8 @@ zfs bookmark "$DS/a@marker" "$DS/a#marker" 2>/dev/null
 rm -f /tmp/trace_get.log
 truss -f -a -o /tmp/trace_get.log -- "$BIN" || bad "truss failed to run for section 19 (exit $?)"
 [ -s /tmp/trace_get.log ] || bad "truss trace file empty/missing for section 19 -- results below are unreliable"
-get_pattern='"get", "-H", "-p", "-t", "filesystem,volume"'
-grep -q "$get_pattern" /tmp/trace_get.log \
+get_pattern='"get", "-H", "-p".*"-t", "filesystem,volume"'
+grep -qE "$get_pattern" /tmp/trace_get.log \
   && ok "zfs get invoked with -t filesystem,volume filter" \
   || bad "zfs get missing -t filesystem,volume filter"
 zfs destroy "$DS/a#marker" 2>/dev/null
