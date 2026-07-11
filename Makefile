@@ -9,7 +9,7 @@ OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.con
 OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo logrotation/diffsnap.conf ;; *) echo logrotation/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
 INITDIR_Linux = /etc/systemd/system
-BUILD_SHA != git -c safe.directory="*" describe --always --dirty --abbrev=7 2>/dev/null || echo unknown
+BUILD_SHA ?= git -c safe.directory="*" describe --always --dirty --abbrev=7 2>/dev/null || echo unknown
 
 CC ?= cc
 CPPFLAGS ?=
