@@ -687,13 +687,20 @@ static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const c
             size_t new_cap = capacity == 0 ? ALLOC_CHUNK_BATCH : capacity * 2;
             size_t *tmp = realloc(indices, new_cap * sizeof(size_t));
             if (!tmp) {
-                /* Every index already collected here was never passed to
-                 * zfs_snapshot_exec_chunk, so it must be marked failed too --
-                 * not just the item we were about to add -- or it silently
-                 * keeps snap_failed==0 and finalize_batch will log a false
-                 * "Created=" line and prune real snapshots on that premise. */
+                /* The whole root+pass attempt is abandoned here: items
+                 * already collected in `indices` were never passed to
+                 * zfs_snapshot_exec_chunk, AND every remaining item from i
+                 * onward that belongs to this root+pass is never even
+                 * visited by the rest of this loop (we return immediately).
+                 * Both groups must be marked snap_failed, or the unvisited
+                 * ones silently keep snap_failed==0 and finalize_batch logs
+                 * a false "Created=" line and prunes real snapshots on that
+                 * premise -- exactly like the already-collected ones would
+                 * without the first part of this fix. */
                 batch_mark_indices_failed(ctx, indices, count);
-                ctx->items[i].snap_failed = 1;
+                for (size_t j = i; j < ctx->count; j++) {
+                    if (batch_item_in_root_pass(ctx, j, root_dataset, pass)) ctx->items[j].snap_failed = 1;
+                }
                 free(indices);
                 return -1;
             }

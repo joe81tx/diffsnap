@@ -271,6 +271,30 @@ int main(void) {
         printf("\n");
     }
 
+    printf("== Test 12: exec_cmd_stream_lenient treats a total execv failure as a hard failure, not lenient success ==\n");
+    {
+        /*
+         * Test 2 above proves the lenient wrapper does what it was built
+         * for: tolerate a nonzero exit from a target that DID run (one bad
+         * root among several). That is a different failure mode from the
+         * one here: argv[0] pointing at something that can't be executed
+         * at all (bad ZFS_PATH, permissions, binary removed). In that
+         * case the forked child hits _exit(EXIT_EXEC_FAILED) before ever
+         * running real zfs logic. Before the fix, exec_cmd_stream_lenient
+         * only checked WIFEXITED (true here) and ignored the exit status
+         * entirely, so this was indistinguishable from lenient success --
+         * the scoped `zfs get` call would silently return zero metrics,
+         * and every due dataset would then get logged as "Configured
+         * dataset not found" instead of one clear top-level error.
+         */
+        const char *const argv[] = {"/nonexistent/path/definitely/not/a/real/binary", NULL};
+        int strict_rc = exec_cmd_stream(argv, NULL, NULL);
+        int lenient_rc = exec_cmd_stream_lenient(argv, NULL, NULL);
+        CHECK(strict_rc != 0, "strict: execv failure is treated as failure (baseline, unaffected by the fix)");
+        CHECK(lenient_rc != 0, "lenient: execv failure is ALSO treated as failure (the bug fix under test -- must not be conflated with a tolerable nonzero zfs exit)");
+        printf("\n");
+    }
+
     printf("================================\n");
     printf("RESULTS: %d checks run, %d failed\n", g_tests_run, g_tests_failed);
     printf("================================\n");
