@@ -63,7 +63,7 @@
 static FILE *log_fp = NULL;
 
 typedef int (*line_handler_t)(const char *line, void *data);
-typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; long long written; } batch_item_t;
+typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; long long written; long long min_bytes; } batch_item_t;
 typedef struct { batch_item_t *items; size_t count; size_t capacity; } batch_ctx_t;
 typedef struct { char **names; size_t count; size_t capacity; } name_list_t;
 typedef struct { char name[STR_BUF_LARGE]; long long written; } metric_item_t;
@@ -287,18 +287,21 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
     return ((out_reader && out_reader->failed) || (err_reader && err_reader->failed)) ? -1 : 0;
 }
 
-static int exec_cmd_stream(const char *const argv[], line_handler_t handler, void *data) {
+typedef struct { int processing_rc; int child_exited; int child_status; int wait_failed; } exec_result_t;
+
+static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler_t handler, void *data) {
+    exec_result_t result = {0};
     int out_pfd[2] = {-1, -1}, err_pfd[2] = {-1, -1};
-    if (handler && pipe2(out_pfd, O_CLOEXEC) == -1) return -1;
+    if (handler && pipe2(out_pfd, O_CLOEXEC) == -1) { result.processing_rc = -1; return result; }
     if (pipe2(err_pfd, O_CLOEXEC) == -1) {
         if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
-        return -1;
+        result.processing_rc = -1; return result;
     }
     pid_t pid = fork();
     if (pid == -1) {
         if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
         close(err_pfd[0]); close(err_pfd[1]);
-        return -1;
+        result.processing_rc = -1; return result;
     }
     if (pid == 0) {
         if (handler) {
@@ -314,15 +317,37 @@ static int exec_cmd_stream(const char *const argv[], line_handler_t handler, voi
         execv(argv[0], (char *const *)argv);
         _exit(EXIT_EXEC_FAILED);
     }
-    int processing_rc = 0;
     if (handler) close(out_pfd[1]);
     close(err_pfd[1]);
     stream_reader_t out_reader = { .fd = handler ? out_pfd[0] : -1, .handler = handler, .data = data, .is_stderr = 0, .used = 0, .failed = 0 };
     stream_reader_t err_reader = { .fd = err_pfd[0], .handler = NULL, .data = NULL, .is_stderr = 1, .used = 0, .failed = 0 };
-    processing_rc = drain_command_streams(handler ? &out_reader : NULL, &err_reader);
+    result.processing_rc = drain_command_streams(handler ? &out_reader : NULL, &err_reader);
     int status; pid_t wpid;
     do { wpid = waitpid(pid, &status, 0); } while (wpid == -1 && errno == EINTR);
-    return (wpid != -1 && processing_rc == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+    result.wait_failed = (wpid == -1);
+    result.child_exited = (wpid != -1) && WIFEXITED(status);
+    result.child_status = result.child_exited ? WEXITSTATUS(status) : -1;
+    return result;
+}
+
+static int exec_cmd_stream(const char *const argv[], line_handler_t handler, void *data) {
+    exec_result_t r = exec_cmd_stream_core(argv, handler, data);
+    return (!r.wait_failed && r.processing_rc == 0 && r.child_exited && r.child_status == 0) ? 0 : -1;
+}
+
+/*
+ * Like exec_cmd_stream, but a nonzero child exit status is NOT treated as
+ * failure -- only internal plumbing failures (pipe/fork/handler) and
+ * abnormal termination (signal, failure to reap) are. Used for `zfs get`
+ * calls scoped to specific dataset roots: one bad/nonexistent root makes
+ * the whole `zfs get` invocation exit nonzero even though it still printed
+ * valid, usable output for every other root. Rejecting the whole result in
+ * that case would turn "one typo logged" into "entire run aborted" --
+ * worse than the unscoped call's behavior it's meant to optimize.
+ */
+static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t handler, void *data) {
+    exec_result_t r = exec_cmd_stream_core(argv, handler, data);
+    return (!r.wait_failed && r.processing_rc == 0 && r.child_exited) ? 0 : -1;
 }
 
 static int handle_metric_line(const char *line, void *data) {
@@ -355,6 +380,44 @@ static int handle_metric_line(const char *line, void *data) {
 }
 
 static int compare_metrics(const void *a, const void *b) { return strcmp(((metric_item_t *)a)->name, ((metric_item_t *)b)->name); }
+
+/*
+ * Applies the metrics-based filtering that used to happen inline during
+ * config parsing (found/invalid/min_bytes checks), now deferred until
+ * after metrics have actually been fetched -- which itself is deferred
+ * until after parsing, so it can be skipped or scoped based on what's
+ * actually due this run. Removes items that fail the check; keeps and
+ * caches .written for items that pass, exactly as batch_add used to.
+ */
+static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metrics, int *global_status) {
+    size_t write_idx = 0;
+    for (size_t i = 0; i < ctx->count; i++) {
+        metric_item_t key = {0};
+        memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
+        metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+        int keep;
+        if (!found) {
+            log_msg("Error: Configured dataset not found: %s", ctx->items[i].dataset);
+            *global_status = 1; keep = 0;
+        } else if (found->written == -1) {
+            log_msg("Error: Invalid written metric for %s", ctx->items[i].dataset);
+            *global_status = 1; keep = 0;
+        } else if (found->written < ctx->items[i].min_bytes) {
+            keep = 0; /* below threshold: skip silently, same as before */
+        } else {
+            ctx->items[i].written = found->written;
+            keep = 1;
+        }
+        if (keep) {
+            if (write_idx != i) ctx->items[write_idx] = ctx->items[i];
+            write_idx++;
+        } else {
+            free(ctx->items[i].dataset);
+            free(ctx->items[i].prefix);
+        }
+    }
+    ctx->count = write_idx;
+}
 static int zfs_destroy(const char *snap_name, int recursive) {
     if (recursive) {
         const char *const argv[] = {ZFS_PATH, "destroy", "-r", snap_name, NULL};
@@ -404,7 +467,7 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
     return (prune_errors == 0) ? 0 : -1;
 }
 
-static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long written) {
+static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long written, long long min_bytes) {
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_BATCH : ctx->capacity * 2;
         batch_item_t *tmp = realloc(ctx->items, new_cap * sizeof(batch_item_t));
@@ -413,7 +476,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = strdup(dataset), *p = strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = written };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = written, .min_bytes = min_bytes };
     return 0;
 }
 
@@ -434,6 +497,42 @@ static int same_zfs_root(const char *a, const char *b) {
 
 static int same_zfs_dataset(const char *a, const char *b) {
     return strcmp(a, b) == 0;
+}
+
+typedef struct { char **roots; size_t count; size_t capacity; } root_list_t;
+
+static void root_list_free(root_list_t *list) {
+    for (size_t i = 0; i < list->count; i++) free(list->roots[i]);
+    free(list->roots);
+    list->roots = NULL; list->count = 0; list->capacity = 0;
+}
+
+static int root_list_add_unique(root_list_t *list, const char *dataset) {
+    size_t len = zfs_root_len(dataset);
+    for (size_t i = 0; i < list->count; i++) {
+        if (strlen(list->roots[i]) == len && strncmp(list->roots[i], dataset, len) == 0) return 0;
+    }
+    if (list->count >= list->capacity) {
+        size_t new_cap = list->capacity == 0 ? ALLOC_CHUNK_BATCH : list->capacity * 2;
+        char **tmp = realloc(list->roots, new_cap * sizeof(char *));
+        if (!tmp) return -1;
+        list->roots = tmp; list->capacity = new_cap;
+    }
+    char *r = malloc(len + 1);
+    if (!r) return -1;
+    memcpy(r, dataset, len);
+    r[len] = '\0';
+    list->roots[list->count++] = r;
+    return 0;
+}
+
+/* Collects the distinct dataset roots referenced by both batches (i.e. the
+ * roots that are actually due this run), for scoping the `zfs get written`
+ * call to just what's needed instead of the whole pool. */
+static int collect_due_roots(root_list_t *list, const batch_ctx_t *b1, const batch_ctx_t *b2) {
+    for (size_t i = 0; i < b1->count; i++) if (root_list_add_unique(list, b1->items[i].dataset) != 0) return -1;
+    for (size_t i = 0; i < b2->count; i++) if (root_list_add_unique(list, b2->items[i].dataset) != 0) return -1;
+    return 0;
 }
 
 static void batch_assign_duplicate_passes(batch_ctx_t *ctx) {
@@ -843,9 +942,6 @@ int main(int argc, char *argv[]) {
         ret_code = 1; goto cleanup;
     }
     setvbuf(log_fp, NULL, _IOLBF, 0);
-    const char *const m_argv[] = {ZFS_PATH, "get", "-H", "-p", "-t", "filesystem,volume", "-o", "name,value", "written", NULL};
-    if (exec_cmd_stream(m_argv, handle_metric_line, &metrics) != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
-    qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
     conf = fopen(CONF_PATH, "r");
     if (!conf) {
         int saved_errno = errno;
@@ -890,18 +986,66 @@ int main(int argc, char *argv[]) {
         if (seen_rc == -1) { log_msg("Error: Failed to track config entry for %s", dataset); global_status = 1; continue; }
         if (seen_rc == 1) { log_msg("Error: Config error for %s: duplicate dataset/prefix '%s' in config, skipping", dataset, prefix); global_status = 1; continue; }
         if (current_day_mins % interval_mins != 0) continue;
-        metric_item_t key = {0}; memcpy(key.name, dataset, strlen(dataset) + 1);
-        metric_item_t *found = bsearch(&key, metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
-        if (!found) { log_msg("Error: Configured dataset not found: %s", dataset); global_status = 1; continue; }
-        if (found->written == -1) { log_msg("Error: Invalid written metric for %s", dataset); global_status = 1; continue; }
-        if (found->written < min_bytes) continue;
-        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val, found->written) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
-        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, found->written) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val, -1, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, -1, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
     next_line: ;
     }
     if (ferror(conf)) {
         log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(errno));
         ret_code = 1; goto cleanup;
+    }
+    if (std_b.count + rec_b.count > 0) {
+        /* Only fetch metrics -- and only for the roots actually due this
+         * run -- when something is actually due. Scoping to exact due
+         * roots (not the whole pool) and skipping the call entirely when
+         * nothing's due both follow from the same idea: don't pay for
+         * `zfs get written` data nothing will use. */
+        root_list_t due_roots = { NULL, 0, 0 };
+        if (collect_due_roots(&due_roots, &std_b, &rec_b) != 0) {
+            log_msg("Error: Failed to determine dataset roots for metrics fetch");
+            root_list_free(&due_roots);
+            ret_code = 1; goto cleanup;
+        }
+        size_t roots_bytes = 0;
+        for (size_t i = 0; i < due_roots.count; i++) roots_bytes += strlen(due_roots.roots[i]) + 1;
+        /* Reuse the same byte budget as snapshot-batch chunking: if the
+         * due roots' names alone would risk an overlong command line,
+         * fall back to the unscoped call (today's behavior) rather than
+         * trying to chunk `zfs get` -- there's no less-granular substitute
+         * to chunk down to the way there is for `zfs snapshot`, so falling
+         * back to the thing that already works is strictly simpler. */
+        int use_scoped = (roots_bytes <= ARGV_BYTES_CAP);
+
+        size_t fixed_argc = use_scoped ? 10 : 9; /* "-r" only present when scoped */
+        size_t m_argc = fixed_argc + (use_scoped ? due_roots.count : 0) + 1; /* +1 for NULL */
+        const char **m_argv = malloc(m_argc * sizeof(char *));
+        if (!m_argv) {
+            log_msg("Error: Failed to allocate metrics command");
+            root_list_free(&due_roots);
+            ret_code = 1; goto cleanup;
+        }
+        size_t idx = 0;
+        m_argv[idx++] = ZFS_PATH; m_argv[idx++] = "get"; m_argv[idx++] = "-H"; m_argv[idx++] = "-p";
+        if (use_scoped) m_argv[idx++] = "-r";
+        m_argv[idx++] = "-t"; m_argv[idx++] = "filesystem,volume";
+        m_argv[idx++] = "-o"; m_argv[idx++] = "name,value"; m_argv[idx++] = "written";
+        if (use_scoped) for (size_t i = 0; i < due_roots.count; i++) m_argv[idx++] = due_roots.roots[i];
+        m_argv[idx] = NULL;
+
+        /* Scoped calls use the lenient exit-code handling: a single bad
+         * root (typo, since-destroyed dataset) makes `zfs get` exit
+         * nonzero even though it printed valid output for every other
+         * root. The unscoped fallback never names a target that could be
+         * wrong, so it keeps the strict check. */
+        int fetch_rc = use_scoped ? exec_cmd_stream_lenient(m_argv, handle_metric_line, &metrics)
+                                   : exec_cmd_stream(m_argv, handle_metric_line, &metrics);
+        free(m_argv);
+        root_list_free(&due_roots);
+        if (fetch_rc != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        batch_filter_by_metrics(&std_b, &metrics, &global_status);
+        batch_filter_by_metrics(&rec_b, &metrics, &global_status);
     }
     if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = 1; goto cleanup; }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
