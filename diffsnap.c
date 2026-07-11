@@ -347,7 +347,16 @@ static int exec_cmd_stream(const char *const argv[], line_handler_t handler, voi
  */
 static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t handler, void *data) {
     exec_result_t r = exec_cmd_stream_core(argv, handler, data);
-    return (!r.wait_failed && r.processing_rc == 0 && r.child_exited) ? 0 : -1;
+    if (r.wait_failed || r.processing_rc != 0 || !r.child_exited) return -1;
+    /*
+     * EXIT_EXEC_FAILED is our own sentinel for "execv never ran the target
+     * at all" (bad ZFS_PATH, permissions, etc.) -- a total failure, not a
+     * per-root lookup miss. Treating it as lenient-success would silently
+     * accept zero metrics and make every due dataset get logged as
+     * "Configured dataset not found" instead of one clear top-level error.
+     */
+    if (r.child_status == EXIT_EXEC_FAILED) return -1;
+    return 0;
 }
 
 static int handle_metric_line(const char *line, void *data) {
@@ -677,7 +686,17 @@ static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const c
         if (count >= capacity) {
             size_t new_cap = capacity == 0 ? ALLOC_CHUNK_BATCH : capacity * 2;
             size_t *tmp = realloc(indices, new_cap * sizeof(size_t));
-            if (!tmp) { free(indices); ctx->items[i].snap_failed = 1; return -1; }
+            if (!tmp) {
+                /* Every index already collected here was never passed to
+                 * zfs_snapshot_exec_chunk, so it must be marked failed too --
+                 * not just the item we were about to add -- or it silently
+                 * keeps snap_failed==0 and finalize_batch will log a false
+                 * "Created=" line and prune real snapshots on that premise. */
+                batch_mark_indices_failed(ctx, indices, count);
+                ctx->items[i].snap_failed = 1;
+                free(indices);
+                return -1;
+            }
             indices = tmp; capacity = new_cap;
         }
         indices[count++] = i;
