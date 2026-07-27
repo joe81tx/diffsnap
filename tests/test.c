@@ -167,7 +167,7 @@ int main(void) {
         qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
 
         int global_status = 0;
-        batch_filter_by_metrics(&b, &metrics, &global_status);
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 1, "item is kept (found, valid, written >= min_bytes)");
         CHECK(b.items[0].written == 5000, ".written is cached from the metric lookup");
         CHECK(global_status == 0, "no error flagged");
@@ -184,7 +184,7 @@ int main(void) {
 
         metric_ctx_t metrics = {0}; /* empty: nothing matches */
         int global_status = 0;
-        batch_filter_by_metrics(&b, &metrics, &global_status);
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 0, "not-found item is removed from the batch");
         CHECK(global_status == 1, "global_status is flagged (matches old inline-check behavior)");
 
@@ -204,7 +204,7 @@ int main(void) {
         metrics.count = 1;
 
         int global_status = 0;
-        batch_filter_by_metrics(&b, &metrics, &global_status);
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 0, "invalid-metric item is removed");
         CHECK(global_status == 1, "global_status is flagged");
 
@@ -225,7 +225,7 @@ int main(void) {
         metrics.count = 1;
 
         int global_status = 0;
-        batch_filter_by_metrics(&b, &metrics, &global_status);
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 0, "below-threshold item is removed");
         CHECK(global_status == 0, "global_status is NOT flagged (this is a normal skip, not an error)");
 
@@ -253,7 +253,7 @@ int main(void) {
         qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
 
         int global_status = 0;
-        batch_filter_by_metrics(&b, &metrics, &global_status);
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 3, "exactly 3 of 5 items survive (2 removed: not-found, below-threshold)");
         int has_keep1 = 0, has_keep2 = 0, has_keep3 = 0;
         long long w1 = 0, w2 = 0, w3 = 0;
@@ -271,7 +271,172 @@ int main(void) {
         printf("\n");
     }
 
-    printf("== Test 12: exec_cmd_stream_lenient treats a total execv failure as a hard failure, not lenient success ==\n");
+    printf("== Test 12: sum_subtree_written -- sums root + nested descendants at multiple depths ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(4, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/data");           metrics.items[0].written = 1000;
+        strcpy(metrics.items[1].name, "pool/data/child");     metrics.items[1].written = 2000;
+        strcpy(metrics.items[2].name, "pool/data/child/gc");  metrics.items[2].written = 3000; /* grandchild */
+        strcpy(metrics.items[3].name, "pool/data/child2");    metrics.items[3].written = 4000;
+        metrics.count = 4;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/data", &sum);
+        CHECK(rc == 0, "sum_subtree_written succeeds for a subtree with nested descendants");
+        CHECK(sum == 10000, "sum includes root + all descendants at every depth (1000+2000+3000+4000)");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 13: sum_subtree_written -- lexicographic sibling ordering does not corrupt the sum ==\n");
+    {
+        /*
+         * '-' and '.' both sort before '/' in ASCII, so siblings like
+         * "pool/data-old" and "pool/data.bak" sort BETWEEN "pool/data" and
+         * "pool/data/child" in the metrics array. A naive
+         * scan-forward-from-bsearch-hit approach would either include
+         * these siblings' written bytes in "pool/data"'s subtree sum (if it
+         * didn't check the boundary at all) or stop too early once it hit
+         * the first non-descendant (missing pool/data/child entirely). The
+         * lower-bound search for "pool/data/" plus the is_strict_descendant
+         * boundary check must get this right regardless of what sorts in
+         * between.
+         */
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(4, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/data");        metrics.items[0].written = 100;
+        strcpy(metrics.items[1].name, "pool/data-old");    metrics.items[1].written = 999999; /* sibling, sorts before pool/data/child */
+        strcpy(metrics.items[2].name, "pool/data.bak");    metrics.items[2].written = 888888; /* sibling, sorts before pool/data/child */
+        strcpy(metrics.items[3].name, "pool/data/child");  metrics.items[3].written = 200;
+        metrics.count = 4;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/data", &sum);
+        CHECK(rc == 0, "sum_subtree_written succeeds despite lexicographically-interleaved siblings");
+        CHECK(sum == 300, "siblings 'pool/data-old' and 'pool/data.bak' are excluded from the sum (100+200, not +999999+888888)");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 14: sum_subtree_written -- invalid (-1) descendant is excluded and logged, not fatal ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(3, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/data");        metrics.items[0].written = 100;
+        strcpy(metrics.items[1].name, "pool/data/child1"); metrics.items[1].written = -1; /* invalid */
+        strcpy(metrics.items[2].name, "pool/data/child2"); metrics.items[2].written = 200;
+        metrics.count = 3;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/data", &sum);
+        CHECK(rc == 0, "an invalid descendant does NOT void the whole subtree sum");
+        CHECK(sum == 300, "invalid descendant's bytes are excluded from the sum (100+200, not counting child1)");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 15: sum_subtree_written -- invalid (-1) value on the ROOT itself IS fatal ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(2, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/data");        metrics.items[0].written = -1; /* invalid root */
+        strcpy(metrics.items[1].name, "pool/data/child");  metrics.items[1].written = 200;
+        metrics.count = 2;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/data", &sum);
+        CHECK(rc == -1, "an invalid value on the root dataset itself fails the whole call (unlike a bad descendant)");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 16: sum_subtree_written -- root missing from metrics entirely is fatal ==\n");
+    {
+        metric_ctx_t metrics = {0}; /* empty */
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/data", &sum);
+        CHECK(rc == -1, "a root dataset absent from the metrics array fails the call");
+        printf("\n");
+    }
+
+    printf("== Test 17: sum_subtree_written -- leaf dataset with no descendants sums to just its own value ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(1, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/leaf"); metrics.items[0].written = 42;
+        metrics.count = 1;
+
+        long long sum = -999;
+        int rc = sum_subtree_written(&metrics, "pool/leaf", &sum);
+        CHECK(rc == 0, "a leaf with no descendants still succeeds");
+        CHECK(sum == 42, "sum is exactly the root's own written value");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 18: batch_filter_by_metrics(recursive=1) -- quiescent parent kept because a descendant is active ==\n");
+    {
+        /*
+         * This is the actual bug the recursive/min_bytes fix addresses:
+         * a recursive entry whose named (parent) dataset is itself
+         * near-idle must still be snapshotted if activity happened
+         * anywhere in its subtree, since a recursive snapshot covers the
+         * whole tree.
+         */
+        batch_ctx_t b = {0};
+        batch_add(&b, "pool/parent", "p", 1, -1, 5000); /* min_bytes=5000 */
+
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(2, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/parent");       metrics.items[0].written = 10;   /* parent itself is quiescent */
+        strcpy(metrics.items[1].name, "pool/parent/child"); metrics.items[1].written = 9000; /* child is very active */
+        metrics.count = 2;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        int global_status = 0;
+        batch_filter_by_metrics(&b, &metrics, 1, &global_status);
+        CHECK(b.count == 1, "recursive entry is KEPT: subtree total (10+9000) clears min_bytes even though the parent alone would not");
+        if (b.count == 1) CHECK(b.items[0].written == 9010, ".written is cached as the full subtree sum, not just the parent's own value");
+        CHECK(global_status == 0, "no error flagged");
+
+        free(metrics.items);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 19: batch_filter_by_metrics(recursive=1) -- whole subtree quiescent is still skipped silently ==\n");
+    {
+        batch_ctx_t b = {0};
+        batch_add(&b, "pool/parent", "p", 1, -1, 5000);
+
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(2, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/parent");       metrics.items[0].written = 10;
+        strcpy(metrics.items[1].name, "pool/parent/child"); metrics.items[1].written = 20;
+        metrics.count = 2;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        int global_status = 0;
+        batch_filter_by_metrics(&b, &metrics, 1, &global_status);
+        CHECK(b.count == 0, "recursive entry is dropped: subtree total (30) is still below min_bytes (5000)");
+        CHECK(global_status == 0, "global_status is NOT flagged (normal skip, not an error, same as the non-recursive case)");
+
+        free(metrics.items);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 20: exec_cmd_stream_lenient treats a total execv failure as a hard failure, not lenient success ==\n");
     {
         /*
          * Test 2 above proves the lenient wrapper does what it was built
