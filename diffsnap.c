@@ -1181,5 +1181,21 @@ int main(int argc, char *argv[]) {
     name_list_free(&inventory);
     ret_code = global_status;
 cleanup:
-    free(line); if (conf) fclose(conf); free(metrics.items); batch_free(&std_b); batch_free(&rec_b); seen_set_free(&seen); if (log_fp) fclose(log_fp); close(lock_fd); return ret_code;
+free(line);
+if (conf)
+    fclose(conf);
+
+free(metrics.items);
+batch_free(&std_b);
+batch_free(&rec_b);
+seen_set_free(&seen);
+
+if (log_fp && fclose(log_fp) != 0) {
+    fprintf(stderr, "%s: failed to flush log file %s: %s\n",
+            progname, LOG_PATH, strerror(errno));
+    ret_code = 1;
+}
+
+close(lock_fd);
+return ret_code;
 }
