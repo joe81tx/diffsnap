@@ -128,7 +128,7 @@ if grep -q "$DS/a@rectest" "$LOG"; then bad "overlap dedup failed: $DS/a snapsho
 else ok "overlap dedup: $DS/a correctly excluded (covered by recursive parent)"; fi
 grep -q "skipme" "$LOG" && bad "min_bytes threshold not respected" || ok "min_bytes skip correct (no skipme entry)"
 grep -c "duplicate dataset/prefix" "$LOG" | grep -q "^1$" && ok "duplicate entry detected" || bad "duplicate detection failed"
-grep -q "Configured dataset not found: nosuch/dataset" "$LOG" && ok "missing dataset logged" || bad "missing dataset not logged"
+grep -q "Configured dataset not found or has invalid written metric: nosuch/dataset" "$LOG" && ok "missing dataset logged" || bad "missing dataset not logged"
 archive_log "2 - feature matrix"
 
 echo "== 3. Retention drains to exactly 1 =="
@@ -255,7 +255,7 @@ $maxds 1 2 buftest no 0
 CONF
 "$BIN"
 if grep -q "dataset name too long" "$LOG"; then bad "256-char dataset name incorrectly rejected by diffsnap's buffer check"
-elif grep -q "Configured dataset not found: $maxds" "$LOG"; then ok "256-char dataset name accepted intact by diffsnap's parser (buffer boundary correct)"
+elif grep -q "Configured dataset not found or has invalid written metric: $maxds" "$LOG"; then ok "256-char dataset name accepted intact by diffsnap's parser (buffer boundary correct)"
 else bad "unexpected result for buffer-limit dataset name test"; fi
 archive_log "10 - dataset name at buffer limit"
 
@@ -699,7 +699,48 @@ echo "$writtenline" | grep -Eq 'Written=[0-9]' && ! echo "$writtenline" | grep -
 rm -f "$mp/testfile"
 archive_log "32 - written byte count accuracy"
 
-echo "== 33. Cleanup =="
+echo "== 33. Recursive min_bytes: subtree total (parent + descendants) gates the snapshot, not just the parent's own written bytes =="
+POOL="${DS%%/*}"
+zfs create "$DS/recmin" 2>/dev/null
+zfs create "$DS/recmin/child" 2>/dev/null
+
+echo "-- 33a. Parent alone is quiescent; child is active; subtree SUM clears the threshold -> snapshot IS taken --"
+parent_written=$(zfs get -H -p -o value written "$DS/recmin")
+if [ "$parent_written" -ge 1000000 ] 2>/dev/null; then
+  bad "test setup invalid: $DS/recmin's own written ($parent_written) already exceeds the 1000000 threshold on its own -- this run wouldn't actually exercise subtree summing"
+else
+  ok "test setup valid: $DS/recmin's own written ($parent_written) is below the threshold by itself (proves the pass below depends on the child's bytes, not just the parent's)"
+fi
+child_mp=$(zfs get -H -o value mountpoint "$DS/recmin/child")
+dd if=/dev/urandom of="$child_mp/data" bs=1M count=2 2>/dev/null
+zpool sync "$POOL" 2>/dev/null || sync
+# dataset          interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/recmin 1 2 recminA yes 1000000
+CONF
+"$BIN"
+grep -q "Created=$DS/recmin@recminA.*Recursive" "$LOG" \
+  && ok "recursive snapshot created: quiescent parent + active child clears min_bytes via subtree sum" \
+  || bad "recursive snapshot missing: subtree summing did not credit the child's written bytes to the parent's threshold check"
+recminA_line=$(grep "Created=$DS/recmin@recminA" "$LOG")
+echo "$recminA_line" | grep -Eq 'Written=[0-9]' && ! echo "$recminA_line" | grep -q "Written=0 " \
+  && ok "logged Written= reflects the real (non-zero) subtree total: $recminA_line" \
+  || bad "logged Written= missing or zero despite 2MB written to the child: $recminA_line"
+
+echo "-- 33b. Both parent and child quiescent (relative to the snapshot just taken); subtree SUM stays below threshold -> silently skipped --"
+# dataset          interval  retention  prefix    recursive  min_bytes
+cat > "$CONF" <<CONF
+$DS/recmin 1 2 recminB yes 999999999999
+CONF
+"$BIN"
+grep -q "recminB" "$LOG" \
+  && bad "quiescent recursive subtree (parent+child both below threshold) was unexpectedly snapshotted or errored" \
+  || ok "quiescent recursive subtree correctly skipped silently (no Created=, no error)"
+
+zfs destroy -R "$DS/recmin" 2>/dev/null
+archive_log "33 - recursive min_bytes subtree summing"
+
+echo "== 34. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"
