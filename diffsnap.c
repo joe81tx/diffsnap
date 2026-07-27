@@ -1077,8 +1077,12 @@ int main(int argc, char *argv[]) {
         else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, -1, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
     next_line: ;
     }
-    if (ferror(conf)) {
-        log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(errno));
+    /* getline() may fail before it performs a stream read (for example,
+     * while growing line).  Such failures need not set ferror(), so EOF is
+     * the only successful reason for the loop to end. */
+    int config_read_errno = errno;
+    if (!feof(conf)) {
+        log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(config_read_errno));
         ret_code = 1; goto cleanup;
     }
     if (std_b.count + rec_b.count > 0) {
