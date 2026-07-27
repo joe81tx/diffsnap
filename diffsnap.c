@@ -390,6 +390,56 @@ static int handle_metric_line(const char *line, void *data) {
 
 static int compare_metrics(const void *a, const void *b) { return strcmp(((metric_item_t *)a)->name, ((metric_item_t *)b)->name); }
 
+/* Forward declaration: defined later in the file, needed here by
+ * sum_subtree_written(). */
+static int is_strict_descendant(const char *child, const char *parent);
+
+/*
+ * Sums `written` for `dataset` itself plus every strict descendant present
+ * in the sorted metrics array. Uses the same is_strict_descendant()
+ * name/child boundary check used elsewhere, not a bare prefix match, so a
+ * sibling like "tank/data2" is never mistaken for a child of "tank/data".
+ *
+ * The root dataset (the one actually named in the config) must have a
+ * valid written value or the whole entry is rejected -- same as the
+ * non-recursive path. A descendant with an invalid (-1) written value is
+ * logged and excluded from the sum rather than voiding the whole subtree,
+ * since one unreadable child shouldn't suppress a legitimate recursive
+ * snapshot triggered by activity elsewhere in the tree.
+ *
+ * Returns 0 and sets *out_sum on success; -1 if the root itself is
+ * missing/invalid.
+ */
+static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset, long long *out_sum) {
+    metric_item_t key = {0};
+    memcpy(key.name, dataset, strlen(dataset) + 1);
+    metric_item_t *root = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+    if (!root || root->written == -1) return -1;
+    long long sum = root->written;
+
+    char prefix_key[STR_BUF_LARGE + 1];
+    int n = snprintf(prefix_key, sizeof(prefix_key), "%s/", dataset);
+    if (n < 0 || (size_t)n >= sizeof(prefix_key)) return -1;
+
+    size_t lo = 0, hi = metrics->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(metrics->items[mid].name, prefix_key) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    for (size_t i = lo; i < metrics->count; i++) {
+        if (!is_strict_descendant(metrics->items[i].name, dataset)) break;
+        if (metrics->items[i].written == -1) {
+            log_msg("Error: Invalid written metric for %s, excluding from recursive total for %s",
+                     metrics->items[i].name, dataset);
+            continue;
+        }
+        sum += metrics->items[i].written;
+    }
+    *out_sum = sum;
+    return 0;
+}
+
 /*
  * Applies the metrics-based filtering that used to happen inline during
  * config parsing (found/invalid/min_bytes checks), now deferred until
@@ -397,24 +447,35 @@ static int compare_metrics(const void *a, const void *b) { return strcmp(((metri
  * until after parsing, so it can be skipped or scoped based on what's
  * actually due this run. Removes items that fail the check; keeps and
  * caches .written for items that pass, exactly as batch_add used to.
+ *
+ * When `recursive` is set, .written is the sum of the named dataset's own
+ * written bytes plus every strict descendant's (see sum_subtree_written),
+ * so min_bytes reflects activity anywhere in the subtree -- not just on
+ * the named dataset itself.
  */
-static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metrics, int *global_status) {
+static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metrics, int recursive, int *global_status) {
     size_t write_idx = 0;
     for (size_t i = 0; i < ctx->count; i++) {
-        metric_item_t key = {0};
-        memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
-        metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+        long long written = 0;
+        int ok;
+        if (recursive) {
+            ok = (sum_subtree_written(metrics, ctx->items[i].dataset, &written) == 0);
+        } else {
+            metric_item_t key = {0};
+            memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
+            metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+            ok = found && found->written != -1;
+            if (ok) written = found->written;
+        }
         int keep;
-        if (!found) {
-            log_msg("Error: Configured dataset not found: %s", ctx->items[i].dataset);
+        if (!ok) {
+            log_msg("Error: %sdataset not found or has invalid written metric: %s",
+                     recursive ? "Configured recursive " : "Configured ", ctx->items[i].dataset);
             *global_status = 1; keep = 0;
-        } else if (found->written == -1) {
-            log_msg("Error: Invalid written metric for %s", ctx->items[i].dataset);
-            *global_status = 1; keep = 0;
-        } else if (found->written < ctx->items[i].min_bytes) {
+        } else if (written < ctx->items[i].min_bytes) {
             keep = 0; /* below threshold: skip silently, same as before */
         } else {
-            ctx->items[i].written = found->written;
+            ctx->items[i].written = written;
             keep = 1;
         }
         if (keep) {
@@ -1070,8 +1131,8 @@ int main(int argc, char *argv[]) {
         if (fetch_rc != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
         qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
 
-        batch_filter_by_metrics(&std_b, &metrics, &global_status);
-        batch_filter_by_metrics(&rec_b, &metrics, &global_status);
+        batch_filter_by_metrics(&std_b, &metrics, 0, &global_status);
+        batch_filter_by_metrics(&rec_b, &metrics, 1, &global_status);
     }
     if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = 1; goto cleanup; }
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
