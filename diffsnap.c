@@ -362,10 +362,6 @@ static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t hand
 static int handle_metric_line(const char *line, void *data) {
     metric_ctx_t *ctx = (metric_ctx_t *)data;
     char line_copy[STR_BUF_XLARGE];
-    if (strlen(line) >= sizeof(line_copy)) {
-        log_msg("Error: Skipping oversized zfs get line");
-        return 0;
-    }
     strcpy(line_copy, line);
     char *saveptr = NULL;
     char *name = strtok_r(line_copy, " \t", &saveptr);
