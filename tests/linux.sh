@@ -97,15 +97,15 @@ zfs create "$DS/a"
 zfs create "$DS/b"
 
 echo "== 1. Crash regression: malformed lines must not segfault or die from any signal =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
 badline
-$DS/a notanumber 2 t1 no 0
-$DS/a 1 0 t1 no 0
-$DS/a 1 2 bad!prefix no 0
-$DS/a 1 2 t1 maybe 0
-$DS/a 1 2 t1 no notanumber
-$DS/a 1 2 t1 no 0 trailing
+$DS/a,notanumber,2,t1,no,0
+$DS/a,1,0,t1,no,0
+$DS/a,1,2,bad!prefix,no,0
+$DS/a,1,2,t1,maybe,0
+$DS/a,1,2,t1,no,notanumber
+$DS/a,1,2,t1,no,0,trailing
 CONF
 "$BIN"; rc=$?
 if [ $rc -ge 128 ]; then bad "process died from signal on malformed lines (exit $rc, signal $((rc-128)))"
@@ -114,13 +114,13 @@ grep -c "Config error" "$LOG" | grep -q "^7$" && ok "all 7 malformed lines logge
 archive_log "1 - crash regression"
 
 echo "== 2. Feature matrix: valid config =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 rectest yes 0
-$DS/a 1 2 rectest no 0
-$DS/b 1 2 skipme no 999999999999
-$DS/a 1 2 rectest no 0
-nosuch/dataset 1 2 t1 no 0
+$DS,1,2,rectest,yes,0
+$DS/a,1,2,rectest,no,0
+$DS/b,1,2,skipme,no,999999999999
+$DS/a,1,2,rectest,no,0
+nosuch/dataset,1,2,t1,no,0
 CONF
 "$BIN"
 grep -q "Created=$DS@rectest.*Recursive" "$LOG" && ok "recursive snapshot created" || bad "recursive snapshot missing"
@@ -132,9 +132,9 @@ grep -q "Configured dataset not found or has invalid written metric: nosuch/data
 archive_log "2 - feature matrix"
 
 echo "== 3. Retention drains to exactly 1 =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 1 rtest no 0
+$DS/a,1,1,rtest,no,0
 CONF
 "$BIN"; sleep 1; "$BIN"
 count=$(zfs list -t snap -H -o name | grep -c "$DS/a@rtest")
@@ -159,12 +159,12 @@ zfs destroy "${DS}_clone"
 archive_log "4 - clone-blocked destroy"
 
 echo "== 5. Batching: same-dataset collision fixed, cross-dataset batching preserved =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 p1 no 0
-$DS/a 1 2 p2 no 0
-$DS/a 1 2 p3 no 0
-$DS/b 1 2 p1 no 0
+$DS/a,1,2,p1,no,0
+$DS/a,1,2,p2,no,0
+$DS/a,1,2,p3,no,0
+$DS/b,1,2,p1,no,0
 CONF
 rm -f /tmp/trace_batch.log
 strace -f -e trace=execve -o /tmp/trace_batch.log "$BIN"
@@ -178,10 +178,10 @@ crossbatch=$(grep -E "$snap_pattern" /tmp/trace_batch.log | grep -c "clonetest/a
 archive_log "5 - batching"
 
 echo "== 6. Interval boundary matrix (per --help spec) =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 50 3 i50 no 0
-$DS/a 1440 3 iday no 0
+$DS/a,50,3,i50,no,0
+$DS/a,1440,3,iday,no,0
 CONF
 SAVED_DATETIME=$(date +"%Y-%m-%d %H:%M:%S")
 timedatectl set-ntp false
@@ -226,32 +226,32 @@ echo "$out2" | grep -q "another instance is already running" \
 archive_log "7 - lock enforcement"
 
 echo "== 8. Maximum-length prefix accepted =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 maxprefix=$(printf 'a%.0s' $(seq 1 63))
 cat > "$CONF" <<CONF
-$DS/a 1 2 $maxprefix no 0
+$DS/a,1,2,$maxprefix,no,0
 CONF
 "$BIN"
 grep -q "Created=$DS/a@${maxprefix}_" "$LOG" && ok "max-length (63-char) prefix accepted" || bad "max-length prefix rejected unexpectedly"
 archive_log "8 - max prefix accepted"
 
 echo "== 9. Prefix exceeding limit rejected =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 overprefix=$(printf 'a%.0s' $(seq 1 64))
 cat > "$CONF" <<CONF
-$DS/a 1 2 $overprefix no 0
+$DS/a,1,2,$overprefix,no,0
 CONF
 "$BIN"
 grep -q "prefix too long" "$LOG" && ok "over-length (64-char) prefix rejected" || bad "over-length prefix not rejected as expected"
 archive_log "9 - prefix exceeding limit rejected"
 
 echo "== 10. Dataset name at diffsnap's internal buffer limit (256 chars) =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 maxds_child_len=$((256 - ${#DS} - 1))
 maxds_child=$(printf 'x%.0s' $(seq 1 $maxds_child_len))
 maxds="$DS/$maxds_child"
 cat > "$CONF" <<CONF
-$maxds 1 2 buftest no 0
+$maxds,1,2,buftest,no,0
 CONF
 "$BIN"
 if grep -q "dataset name too long" "$LOG"; then bad "256-char dataset name incorrectly rejected by diffsnap's buffer check"
@@ -260,10 +260,10 @@ else bad "unexpected result for buffer-limit dataset name test"; fi
 archive_log "10 - dataset name at buffer limit"
 
 echo "== 11. Dataset name exceeding buffer limit rejected =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 overds="${maxds}xxxxxxxxxx"
 cat > "$CONF" <<CONF
-$overds 1 2 buftest2 no 0
+$overds,1,2,buftest2,no,0
 CONF
 "$BIN"
 grep -q "dataset name too long" "$LOG" && ok "over-length dataset name (${#overds} chars) rejected" || bad "over-length dataset name not rejected as expected"
@@ -291,7 +291,7 @@ WRAP
   rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 longerr no 0
+$DS/a,1,2,longerr,no,0
 CONF
   "$BIN"; rc=$?
   [ $rc -lt 128 ] && ok "no crash on >512-byte zfs stderr line" || bad "crashed on >512-byte zfs stderr line (exit $rc)"
@@ -342,9 +342,9 @@ else echo "SKIP: 'nobody' user not available on this system"; fi
 archive_log "17 - missing log permissions"
 
 echo "== 18. Recursive retention pruning behaves correctly =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 1 rectest2 yes 0
+$DS,1,1,rectest2,yes,0
 CONF
 "$BIN"; sleep 1; "$BIN"
 parentcount=$(zfs list -t snap -H -o name | grep -c "^$DS@rectest2")
@@ -354,9 +354,9 @@ childcount=$(zfs list -t snap -H -o name | grep -c "^$DS/a@rectest2")
 archive_log "18 - recursive retention pruning"
 
 echo "== 19. zfs get invoked with -t filesystem,volume filter =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 gettest no 0
+$DS/a,1,2,gettest,no,0
 CONF
 zfs snapshot "$DS/a@marker" 2>/dev/null
 zfs bookmark "$DS/a@marker" "$DS/a#marker" 2>/dev/null
@@ -391,7 +391,7 @@ WRAP
   rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 skiptest no 0
+$DS/a,1,2,skiptest,no,0
 CONF
   "$BIN"
   grep -q "Skipping metric line with oversized dataset name" "$LOG" && ok "oversized metric line logged and skipped" || bad "oversized metric line not logged"
@@ -426,7 +426,7 @@ WRAP
   rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset   interval  retention  prefix     recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 scopetest no 0
+$DS/a,1,2,scopetest,no,0
 CONF
   POOL="${DS%%/*}"
   rm -f /tmp/trace_scope.log
@@ -451,20 +451,20 @@ fi
 archive_log "21 - inventory scoping"
 
 echo "== 22. Overlap dedup only applies to matching prefix (recursive parent + non-recursive child) =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 recA yes 0
-$DS/a 1 2 recB no 0
+$DS,1,2,recA,yes,0
+$DS/a,1,2,recB,no,0
 CONF
 "$BIN"
 grep -q "Created=$DS/a@recB" "$LOG" \
   && ok "different-prefix child NOT deduped against recursive parent" \
   || bad "different-prefix child incorrectly deduped"
 
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 recSame yes 0
-$DS/a 1 2 recSame no 0
+$DS,1,2,recSame,yes,0
+$DS/a,1,2,recSame,no,0
 CONF
 "$BIN"
 if grep -q "Created=$DS/a@recSame" "$LOG"; then bad "same-prefix child NOT deduped (overlap logic broken)"
@@ -475,10 +475,10 @@ grep -q "Skipping $DS/a: covered by a recursive ancestor with prefix 'recSame'" 
 archive_log "22 - prefix-aware overlap dedup"
 
 echo "== 23. Nested recursive overlap, same prefix: descendant dropped before any zfs call =="
-# dataset          interval  retention  prefix         recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 recSameNest yes 0
-$DS/a 1 2 recSameNest yes 0
+$DS,1,2,recSameNest,yes,0
+$DS/a,1,2,recSameNest,yes,0
 CONF
 "$BIN"
 grep -q "Created=$DS@recSameNest.*Recursive" "$LOG" \
@@ -498,10 +498,10 @@ grep -q "zfs snapshot batch execution failed" "$LOG" \
 archive_log "23 - nested recursive overlap (same prefix)"
 
 echo "== 24. Nested recursive overlap, different prefix: both kept, split into separate passes =="
-# dataset          interval  retention  prefix  recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 recX yes 0
-$DS/a 1 2 recY yes 0
+$DS,1,2,recX,yes,0
+$DS/a,1,2,recY,yes,0
 CONF
 rm -f /tmp/trace_nested.log
 strace -f -e trace=execve -o /tmp/trace_nested.log "$BIN"
@@ -520,10 +520,10 @@ nestedcalls=$(grep -cE "$snap_pattern" /tmp/trace_nested.log)
 archive_log "24 - nested recursive overlap (different prefix, separate passes)"
 
 echo "== 25. Recursive same-dataset duplicate (different prefixes): baseline dedup within rec_b =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 recDup1 yes 0
-$DS 1 2 recDup2 yes 0
+$DS,1,2,recDup1,yes,0
+$DS,1,2,recDup2,yes,0
 CONF
 rm -f /tmp/trace_recdup.log
 strace -f -e trace=execve -o /tmp/trace_recdup.log "$BIN"
@@ -538,12 +538,12 @@ recdupcalls=$(grep -cE "$snap_pattern" /tmp/trace_recdup.log)
 archive_log "25 - recursive same-dataset duplicate"
 
 echo "== 26. Three-level nested recursive chain, distinct prefixes: multiple pass bumps =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 zfs create -p "$DS/a/c" 2>/dev/null
 cat > "$CONF" <<CONF
-$DS 1 2 lvl0 yes 0
-$DS/a 1 2 lvl1 yes 0
-$DS/a/c 1 2 lvl2 yes 0
+$DS,1,2,lvl0,yes,0
+$DS/a,1,2,lvl1,yes,0
+$DS/a/c,1,2,lvl2,yes,0
 CONF
 rm -f /tmp/trace_chain.log
 strace -f -e trace=execve -o /tmp/trace_chain.log "$BIN"
@@ -559,11 +559,11 @@ chaincalls=$(grep -cE "$snap_pattern" /tmp/trace_chain.log)
 archive_log "26 - three-level nested recursive chain"
 
 echo "== 27. Duplicate ancestor plus descendant: pass assignment must avoid all ancestor passes =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS 1 2 dupA yes 0
-$DS 1 2 dupB yes 0
-$DS/a 1 2 dupC yes 0
+$DS,1,2,dupA,yes,0
+$DS,1,2,dupB,yes,0
+$DS/a,1,2,dupC,yes,0
 CONF
 rm -f /tmp/trace_dupanc.log
 strace -f -e trace=execve -o /tmp/trace_dupanc.log "$BIN"
@@ -581,10 +581,10 @@ archive_log "27 - duplicate ancestor plus descendant pass assignment"
 
 echo "== 28. Prune matching does not cross-match dataset name prefixes (e.g. DS/a vs DS/ab) =="
 zfs create "$DS/ab" 2>/dev/null
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 1 xmatch no 0
-$DS/ab 1 1 xmatch no 0
+$DS/a,1,1,xmatch,no,0
+$DS/ab,1,1,xmatch,no,0
 CONF
 "$BIN"; sleep 1; "$BIN"; sleep 1; "$BIN"
 count_a=$(zfs list -t snap -H -o name | grep -c "^$DS/a@xmatch")
@@ -616,8 +616,8 @@ WRAP
   rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset          interval  retention  prefix    recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 combA no 0
-$DS/b 1 2 combB yes 0
+$DS/a,1,2,combA,no,0
+$DS/b,1,2,combB,yes,0
 CONF
   rm -f /tmp/trace_comb.log
   strace -f -e trace=execve -o /tmp/trace_comb.log "$BIN"
@@ -635,10 +635,10 @@ fi
 archive_log "29 - combined batch verification single shared list call"
 
 echo "== 30. Pruning reuses one shared snapshot listing instead of one zfs list call per dataset =="
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 prlist1 no 0
-$DS/b 1 2 prlist2 no 0
+$DS/a,1,2,prlist1,no,0
+$DS/b,1,2,prlist2,no,0
 CONF
 rm -f /tmp/trace_prlist.log
 strace -f -e trace=execve -o /tmp/trace_prlist.log "$BIN"
@@ -669,7 +669,7 @@ WRAP
   rm -f /tmp/diffsnap_zfs_wrapper.$$
   # dataset          interval  retention  prefix    recursive  min_bytes
   cat > "$CONF" <<CONF
-$DS/a 1 2 listfail no 0
+$DS/a,1,2,listfail,no,0
 CONF
   "$BIN"
   grep -q "Unable to list snapshots for batch verification and pruning" "$LOG" && ok "shared inventory failure logged" || bad "shared inventory failure not logged"
@@ -687,9 +687,9 @@ mp=$(zfs get -H -o value mountpoint "$DS/a")
 dd if=/dev/urandom of="$mp/testfile" bs=1M count=2 2>/dev/null
 POOL="${DS%%/*}"
 zpool sync "$POOL" 2>/dev/null || sync
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/a 1 2 wtest no 0
+$DS/a,1,2,wtest,no,0
 CONF
 "$BIN"
 writtenline=$(grep "Created=$DS/a@wtest" "$LOG")
@@ -714,9 +714,9 @@ fi
 child_mp=$(zfs get -H -o value mountpoint "$DS/recmin/child")
 dd if=/dev/urandom of="$child_mp/data" bs=1M count=2 2>/dev/null
 zpool sync "$POOL" 2>/dev/null || sync
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/recmin 1 2 recminA yes 1000000
+$DS/recmin,1,2,recminA,yes,1000000
 CONF
 "$BIN"
 grep -q "Created=$DS/recmin@recminA.*Recursive" "$LOG" \
@@ -728,9 +728,9 @@ echo "$recminA_line" | grep -Eq 'Written=[0-9]' && ! echo "$recminA_line" | grep
   || bad "logged Written= missing or zero despite 2MB written to the child: $recminA_line"
 
 echo "-- 33b. Both parent and child quiescent (relative to the snapshot just taken); subtree SUM stays below threshold -> silently skipped --"
-# dataset          interval  retention  prefix    recursive  min_bytes
+# dataset,interval,retention,prefix,recursive,min_bytes
 cat > "$CONF" <<CONF
-$DS/recmin 1 2 recminB yes 999999999999
+$DS/recmin,1,2,recminB,yes,999999999999
 CONF
 "$BIN"
 grep -q "recminB" "$LOG" \

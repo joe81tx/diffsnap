@@ -237,7 +237,7 @@ while [ "$i" -lt "$N" ]; do
     echo "zfs said: $create_err"
     exit 1
   fi
-  echo "$name 1 1 $PREFIX no 0" >> "$CONF"
+  echo "$name,1,1,$PREFIX,no,0" >> "$CONF"
   i=$((i+1))
   if [ $((i % 50)) -eq 0 ]; then echo "  ...$i/$N created"; fi
 done
