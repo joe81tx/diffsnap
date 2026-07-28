@@ -91,7 +91,7 @@ Fields:
 - `interval_minutes`: Minutes between snapshots - intervals carry over hour boundaries and reset at midnight. 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10). Values greater than 1439 only match at midnight.
 - `retention`: number of matching snapshots to keep.
 - `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.
-- `recursive`: `yes` or `no`.
+- `recursive`: `yes` or `no`. If `yes` and the same `prefix` is used for a configured child the parent takes precedence. If recursive, written bytes total parent + children. 
 - `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots. Using 1 instead captures any change.
 
 If recursive datasets overlap with the same snapshot prefix the ancestor configuration takes precedence and descendant entries are ignored.
