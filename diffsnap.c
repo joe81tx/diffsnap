@@ -52,7 +52,7 @@
 
 #define REQUIRE_TOKEN(err_msg) \
     do { \
-        token = strtok_r(NULL, " \t", &saveptr); \
+        token = strtok_r(NULL, ",", &saveptr); \
         if (!token) { \
             log_msg("Error: Config error for %s: %s", dataset, err_msg); \
             global_status = 1; \
@@ -86,8 +86,8 @@ static void print_help(const char *progname) {
         "  Log:    %s\n"
         "  Lock:   %s\n"
         "\n"
-        "Config fields, space separated:\n"
-        "  dataset interval_minutes retention prefix recursive min_bytes\n"
+        "Config fields, comma separated:\n"
+        "  dataset,interval_minutes,retention,prefix,recursive,min_bytes\n"
         "\n"
         "Field notes:\n"
         "  dataset           ZFS dataset name\n"
@@ -102,7 +102,7 @@ static void print_help(const char *progname) {
         "  Intervals greater than 1439 only match at midnight.\n"
         "\n"
         "Example config line:\n"
-        "  zroot/home 60 24 hourly no 1000000\n"
+        "  zroot/home,60,24,hourly,no,1000000\n"
         "\n"
         "Example cron line:\n"
         "  * * * * * root /usr/local/sbin/diffsnap\n",
@@ -147,7 +147,10 @@ static void log_msg(const char *fmt, ...) {
     struct tm tm_info;
     char timestamp[STR_BUF_SMALL];
     
-    if (localtime_r(&t, &tm_info) == NULL || strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
+    if (localtime_r(&t, &tm_info) == NULL) {
+        snprintf(timestamp, sizeof(timestamp), "unknown-time");
+        fprintf(log_fp, "%s Error: localtime_r failed while formatting log timestamp\n", timestamp);
+    } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
     fprintf(log_fp, "%s ", timestamp);
@@ -364,8 +367,8 @@ static int handle_metric_line(const char *line, void *data) {
     char line_copy[STR_BUF_XLARGE];
     strcpy(line_copy, line);
     char *saveptr = NULL;
-    char *name = strtok_r(line_copy, " \t", &saveptr);
-    char *value = strtok_r(NULL, " \t", &saveptr);
+    char *name = strtok_r(line_copy, "\t", &saveptr);
+    char *value = strtok_r(NULL, "\t", &saveptr);
     if (!name || !value) return 0;
     if (strlen(name) >= sizeof(ctx->items[0].name)) {
         log_msg("Error: Skipping metric line with oversized dataset name: %s", name);
@@ -939,6 +942,17 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     return 0;
 }
 
+/* Plain linear scan over the (unsorted) inventory, used only for verifying
+ * items flagged snap_failed -- a rare case, so there's no need for the
+ * sorted-copy/bsearch machinery a hot path would justify. Same style as
+ * the scan in prune_from_inventory. */
+static int inventory_contains(const name_list_t *inventory, const char *name) {
+    for (size_t i = 0; i < inventory->count; i++) {
+        if (strcmp(inventory->names[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
 static int create_batch_snapshots(batch_ctx_t *batch, const char *snap_time, int recursive) {
     int rc = zfs_snapshot_batch(batch, recursive, snap_time);
     if (rc != 0) log_msg("Error: %s zfs snapshot batch execution failed", recursive ? "recursive" : "standard");
@@ -949,12 +963,12 @@ static int create_batch_snapshots(batch_ctx_t *batch, const char *snap_time, int
  * Verifies (for items zfs_snapshot_batch flagged as failed) and prunes every
  * item in `batch`, using an inventory that was already fetched once for the
  * whole run (both std_b and rec_b together) rather than issuing a fresh zfs
- * list call here. `sorted_names`/`sorted_count` is an alphabetically-sorted
- * copy of inventory's pointers, used for bsearch-based verification;
- * `matches`/`matches_cap` is pruning scratch space reused across calls.
+ * list call here. Verification is a linear scan over `inventory` (see
+ * inventory_contains) -- snap_failed items are rare, so there's no need to
+ * build a sorted index for it. `matches`/`matches_cap` is pruning scratch
+ * space reused across calls.
  */
 static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int inventory_ok,
-                           char **sorted_names, size_t sorted_count,
                            char ***matches, size_t *matches_cap,
                            const char *snap_time, int recursive) {
     int status = 0;
@@ -964,7 +978,7 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
         if (len < 0 || (size_t)len >= sizeof(snap_name)) { log_msg("Error: %sSnapshot name too long for %s", recursive ? "Recursive " : "", batch->items[i].dataset); status = 1; continue; }
         if (batch->items[i].snap_failed) {
             if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
-            if (!name_index_contains(sorted_names, sorted_count, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
+            if (!inventory_contains(inventory, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
         }
         char h_bytes[STR_BUF_SMALL] = "0";
         if (batch->items[i].written != -1) format_bytes(batch->items[i].written, h_bytes, sizeof(h_bytes));
@@ -1035,7 +1049,7 @@ int main(int argc, char *argv[]) {
         ret_code = 1; goto cleanup;
     }
     time_t t = time(NULL); struct tm tm_info; 
-    if (localtime_r(&t, &tm_info) == NULL) { ret_code = 1; goto cleanup; }
+    if (localtime_r(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
     long long current_day_mins = (tm_info.tm_hour * 60) + tm_info.tm_min;
     while (getline(&line, &line_cap, conf) != -1) {
@@ -1043,7 +1057,7 @@ int main(int argc, char *argv[]) {
         if (line[0] == '\0' || line[0] == '#') continue;
         char dataset[STR_BUF_LARGE] = {0}, prefix[STR_BUF_MED] = {0}, recursive_str[STR_BUF_SMALL] = {0};
         long long interval_mins = 0, retention_val = 0, min_bytes = 0;
-        char *endptr, *saveptr = NULL, *token = strtok_r(line, " \t", &saveptr);
+        char *endptr, *saveptr = NULL, *token = strtok_r(line, ",", &saveptr);
         if (!token) continue;
         if (copy_token(dataset, sizeof(dataset), token) != 0) { log_msg("Error: Config error: dataset name too long"); global_status = 1; continue; }
         REQUIRE_TOKEN("missing interval field"); errno = 0; interval_mins = strtoll(token, &endptr, 10);
@@ -1060,7 +1074,7 @@ int main(int argc, char *argv[]) {
         REQUIRE_TOKEN("missing recursive field");
         if (copy_token(recursive_str, sizeof(recursive_str), token) != 0) { log_msg("Error: Config error for %s: recursive field too long", dataset); global_status = 1; continue; }
         REQUIRE_TOKEN("missing min_bytes field"); errno = 0; min_bytes = strtoll(token, &endptr, 10);
-        if (errno == ERANGE || *endptr != '\0' || min_bytes < 0 || strtok_r(NULL, " \t", &saveptr) != NULL) {
+        if (errno == ERANGE || *endptr != '\0' || min_bytes < 0 || strtok_r(NULL, ",", &saveptr) != NULL) {
             log_msg("Error: Config error for %s: invalid byte threshold or trailing garbage", dataset); global_status = 1; continue;
         }
         int is_recursive;
@@ -1148,8 +1162,6 @@ int main(int argc, char *argv[]) {
     /* One shared snapshot listing, fetched after all snapshot creation is
      * done, reused for verification and pruning across both batches. */
     name_list_t inventory = { NULL, 0, 0 };
-    char **sorted_names = NULL;
-    size_t sorted_count = 0;
     int inventory_ok = 1;
     char **prune_matches = NULL;
     size_t prune_matches_cap = 0;
@@ -1158,24 +1170,13 @@ int main(int argc, char *argv[]) {
         if (load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) != 0) {
             log_msg("Error: Unable to list snapshots for batch verification and pruning");
             inventory_ok = 0;
-        } else if (inventory.count > 0) {
-            sorted_names = malloc(inventory.count * sizeof(char *));
-            if (!sorted_names) {
-                log_msg("Error: Failed to allocate memory for snapshot verification index");
-                inventory_ok = 0;
-            } else {
-                memcpy(sorted_names, inventory.names, inventory.count * sizeof(char *));
-                qsort(sorted_names, inventory.count, sizeof(char *), compare_names);
-                sorted_count = inventory.count;
-            }
         }
     }
 
-    if (finalize_batch(&std_b, &inventory, inventory_ok, sorted_names, sorted_count, &prune_matches, &prune_matches_cap, snap_time, 0) != 0) global_status = 1;
-    if (finalize_batch(&rec_b, &inventory, inventory_ok, sorted_names, sorted_count, &prune_matches, &prune_matches_cap, snap_time, 1) != 0) global_status = 1;
+    if (finalize_batch(&std_b, &inventory, inventory_ok, &prune_matches, &prune_matches_cap, snap_time, 0) != 0) global_status = 1;
+    if (finalize_batch(&rec_b, &inventory, inventory_ok, &prune_matches, &prune_matches_cap, snap_time, 1) != 0) global_status = 1;
 
     free(prune_matches);
-    free(sorted_names);
     name_list_free(&inventory);
     ret_code = global_status;
 cleanup:
