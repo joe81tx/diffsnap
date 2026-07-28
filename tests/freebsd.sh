@@ -84,11 +84,15 @@ zfs create "$DS/b"
 
 echo "== 1. Crash regression: malformed lines must not segfault or die from any signal =="
 # dataset,interval,retention,prefix,recursive,min_bytes
+# (the 5th line below has a stray space after a comma, landing on the
+#  prefix field -- config values are NOT trimmed, so this must be
+#  rejected, not silently accepted with a leading-space prefix)
 cat > "$CONF" <<CONF
 badline
 $DS/a,notanumber,2,t1,no,0
 $DS/a,1,0,t1,no,0
 $DS/a,1,2,bad!prefix,no,0
+$DS/a,1,2, t1,no,0
 $DS/a,1,2,t1,maybe,0
 $DS/a,1,2,t1,no,notanumber
 $DS/a,1,2,t1,no,0,trailing
@@ -96,7 +100,7 @@ CONF
 "$BIN"; rc=$?
 if [ $rc -ge 128 ]; then bad "process died from signal on malformed lines (exit $rc, signal $((rc-128)))"
 else ok "no fatal signal on malformed lines (exit $rc)"; fi
-grep -c "Config error" "$LOG" | grep -q "^7$" && ok "all 7 malformed lines logged" || bad "malformed line count mismatch: $(grep -c 'Config error' "$LOG")"
+grep -c "Config error" "$LOG" | grep -q "^8$" && ok "all 8 malformed lines logged" || bad "malformed line count mismatch: $(grep -c 'Config error' "$LOG")"
 archive_log "1 - crash regression"
 
 echo "== 2. Feature matrix: valid config =="
@@ -719,7 +723,49 @@ grep -q "recminB" "$LOG" \
 zfs destroy -R "$DS/recmin" 2>/dev/null
 archive_log "33 - recursive min_bytes subtree summing"
 
-echo "== 34. Cleanup =="
+echo "== 34. Dataset name containing a space is handled correctly end-to-end =="
+# ZFS dataset names are permitted to contain spaces. This exercises the
+# whole pipeline for one: comma-separated config parsing (a space can no
+# longer be confused with the field separator), zfs get/metrics matching
+# (handle_metric_line tokenizes on tab only, not space), snapshot
+# creation via a direct execve'd argv array (no shell involved, so no
+# quoting/escaping concern), and retention/pruning -- alongside a
+# same-prefix sibling dataset WITHOUT a space, to confirm the space
+# doesn't confuse prune-matching's dataset-name boundary logic either.
+SPACE_DS="$DS/space test"
+zfs create "$SPACE_DS" 2>/dev/null
+mp=$(zfs get -H -o value mountpoint "$SPACE_DS")
+dd if=/dev/urandom of="$mp/data" bs=1m count=2 2>/dev/null
+POOL="${DS%%/*}"
+zpool sync "$POOL" 2>/dev/null || sync
+# dataset,interval,retention,prefix,recursive,min_bytes
+cat > "$CONF" <<CONF
+$SPACE_DS,1,1,spacetest,no,0
+$DS/a,1,1,spacetest,no,0
+CONF
+"$BIN"
+grep -qF "Created=$SPACE_DS@spacetest" "$LOG" \
+  && ok "snapshot created for a dataset name containing a space, with the space preserved intact in the log" \
+  || bad "snapshot missing or name corrupted for dataset containing a space"
+writtenline=$(grep -F "Created=$SPACE_DS@spacetest" "$LOG")
+echo "$writtenline" | grep -Eq 'Written=[0-9]' && ! echo "$writtenline" | grep -q "Written=0 " \
+  && ok "Written= for the space-containing dataset reflects real data (metric line correctly matched despite the space)" \
+  || bad "Written= missing or zero for space-containing dataset -- metric line matching likely broken by the space"
+zfs list -t snap -H -o name | grep -qF "${SPACE_DS}@spacetest" \
+  && ok "real snapshot with the space-containing name actually exists on disk" \
+  || bad "real snapshot with space-containing name not found via zfs list"
+grep -qF "Created=$DS/a@spacetest" "$LOG" \
+  && ok "sibling dataset without a space in its name still snapshotted correctly in the same batch" \
+  || bad "sibling dataset without a space was not correctly snapshotted"
+sleep 1; "$BIN"; sleep 1; "$BIN"
+count_space=$(zfs list -t snap -H -o name | grep -cF "${SPACE_DS}@spacetest")
+count_a=$(zfs list -t snap -H -o name | grep -c "^$DS/a@spacetest")
+[ "$count_space" -eq 1 ] && ok "retention=1 held for the space-containing dataset (count=$count_space)" || bad "retention=1 violated for space-containing dataset (count=$count_space)"
+[ "$count_a" -eq 1 ] && ok "retention=1 held for the sibling dataset, unaffected by the space-containing one (count=$count_a)" || bad "retention=1 violated for sibling dataset (count=$count_a)"
+zfs destroy -R "$SPACE_DS" 2>/dev/null
+archive_log "34 - dataset name containing a space"
+
+echo "== 35. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"

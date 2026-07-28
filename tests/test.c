@@ -460,6 +460,36 @@ int main(void) {
         printf("\n");
     }
 
+    printf("== Test 21: handle_metric_line preserves a space embedded in the dataset name (tab-only delimiter) ==\n");
+    {
+        /*
+         * ZFS dataset names are permitted to contain spaces. Before the
+         * fix, handle_metric_line tokenized zfs get output on " \t"
+         * (space OR tab), so a space embedded in the dataset name itself
+         * was indistinguishable from the name/value column separator --
+         * the name would be truncated at the space and the remainder
+         * would corrupt/misalign the written-value field. Tokenizing on
+         * tab only (the actual column separator `zfs get -H` uses) is
+         * required to parse these lines correctly.
+         */
+        const char *const echo_candidates[] = {"/bin/echo", "/usr/bin/echo", NULL};
+        const char *echo_bin = find_bin(echo_candidates);
+        CHECK(echo_bin != NULL, "found an echo binary");
+        if (echo_bin) {
+            metric_ctx_t ctx = {0};
+            const char *const argv[] = {echo_bin, "pool/my dataset\t54321", NULL};
+            int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+            CHECK(rc == 0, "strict call with echo succeeds");
+            CHECK(ctx.count == 1, "handler received exactly one parsed line");
+            if (ctx.count == 1) {
+                CHECK(strcmp(ctx.items[0].name, "pool/my dataset") == 0, "dataset name with an embedded space is parsed intact, not split at the space");
+                CHECK(ctx.items[0].written == 54321, "written value parsed correctly despite the space earlier in the line");
+            }
+            free(ctx.items);
+        }
+        printf("\n");
+    }
+
     printf("================================\n");
     printf("RESULTS: %d checks run, %d failed\n", g_tests_run, g_tests_failed);
     printf("================================\n");
