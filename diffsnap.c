@@ -409,7 +409,8 @@ static int is_strict_descendant(const char *child, const char *parent);
 static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset, long long *out_sum) {
     metric_item_t key = {0};
     memcpy(key.name, dataset, strlen(dataset) + 1);
-    metric_item_t *root = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+    metric_item_t *root = metrics->count ?
+        bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
     if (!root || root->written == -1) return -1;
     long long sum = root->written;
 
@@ -459,7 +460,8 @@ static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metric
         } else {
             metric_item_t key = {0};
             memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
-            metric_item_t *found = bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics);
+            metric_item_t *found = metrics->count ?
+                bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
             ok = found && found->written != -1;
             if (ok) written = found->written;
         }
@@ -1129,7 +1131,7 @@ int main(int argc, char *argv[]) {
         free(m_argv);
         root_list_free(&due_roots);
         if (fetch_rc != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
-        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+        if (metrics.count > 0) qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
 
         batch_filter_by_metrics(&std_b, &metrics, 0, &global_status);
         batch_filter_by_metrics(&rec_b, &metrics, 1, &global_status);
