@@ -81,7 +81,7 @@ diffsnap
 ```
 
 ```text
-dataset interval_minutes retention prefix recursive min_bytes
+dataset,interval_minutes,retention,prefix,recursive,min_bytes
 ```
 Snapshots will be named `dataset@prefix_date_time`
 
@@ -94,16 +94,14 @@ Fields:
 - `recursive`: `yes` or `no`. If `yes` and the same `prefix` is used for a configured child the parent takes precedence. If recursive, written bytes total parent + children. 
 - `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots. Using 1 instead captures any change.
 
-If recursive datasets overlap with the same snapshot prefix the ancestor configuration takes precedence and descendant entries are ignored.
-
 Blank lines and lines beginning with `#` are ignored.
 
 Example config:  
 
 ```text
-zroot/jails 30 100 diffsnap no 1000000
-tank/media 5 100 diffsnap no 1000000
-rpool/USERDATA 1440 14 daily yes 1
+zroot/jails,30,100,diffsnap,no,1000000
+tank/media,5,100,diffsnap,no,1000000
+rpool/USERDATA,1440,14,daily,yes,1
 ```
 
 ## Scheduling
