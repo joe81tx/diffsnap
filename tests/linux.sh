@@ -59,7 +59,7 @@ install_zfs_wrapper() {
 
 echo "== Preflight: required commands =="
 missing=0
-for cmd in zfs strace flock timedatectl "$BIN"; do
+for cmd in zfs strace flock timedatectl realpath "$BIN"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "MISSING: required command not found: $cmd"
     missing=1
@@ -786,7 +786,67 @@ count_a=$(zfs list -t snap -H -o name | grep -c "^$DS/a@spacetest")
 zfs destroy -R "$SPACE_DS" 2>/dev/null
 archive_log "34 - dataset name containing a space"
 
-echo "== 35. Cleanup =="
+echo "== 35. Lock/log/config file descriptors are not leaked into zfs child processes (close-on-exec) =="
+ZFS_REAL=$(command -v zfs)
+ZFS_BACKUP="${ZFS_REAL}.diffsnap_test_backup"
+if [ -f "$ZFS_BACKUP" ]; then
+  bad "refusing to run fd close-on-exec test: stale backup exists at $ZFS_BACKUP (restore it manually before retrying)"
+else
+  cp -a "$ZFS_REAL" "$ZFS_BACKUP"
+  restore_real_zfs() { [ -f "$ZFS_BACKUP" ] && cp -a "$ZFS_BACKUP" "$ZFS_REAL" && rm -f "$ZFS_BACKUP"; }
+  trap 'restore_real_zfs; restore_clock_and_ntp' EXIT
+  FDLEAK_STATE=/tmp/diffsnap_fdleak_state
+  rm -f "$FDLEAK_STATE"
+  cat > /tmp/diffsnap_zfs_wrapper.$$ <<'WRAP'
+#!/bin/bash
+# Runs as every "zfs" invocation diffsnap makes. Before forwarding to the
+# real binary, inspects its OWN open file descriptors (i.e. exactly what
+# survived the parent's execve()) and records any that resolve to
+# diffsnap's lock, log, or config file -- fds that should have been
+# closed on exec and must never reach here.
+REAL="$0.diffsnap_test_backup"
+STATE=/tmp/diffsnap_fdleak_state
+for fdpath in /proc/self/fd/*; do
+  target=$(readlink "$fdpath" 2>/dev/null) || continue
+  case "$target" in
+    "$DIFFSNAP_TEST_LOCK") echo "leaked LOCK fd ($fdpath -> $target) into: zfs $*" >> "$STATE" ;;
+    "$DIFFSNAP_TEST_LOG")  echo "leaked LOG fd ($fdpath -> $target) into: zfs $*"  >> "$STATE" ;;
+    "$DIFFSNAP_TEST_CONF") echo "leaked CONF fd ($fdpath -> $target) into: zfs $*" >> "$STATE" ;;
+  esac
+done
+exec "$REAL" "$@"
+WRAP
+  if install_zfs_wrapper /tmp/diffsnap_zfs_wrapper.$$; then
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+    # dataset,interval,retention,prefix,recursive,min_bytes
+    cat > "$CONF" <<CONF
+$DS/a,1,2,cloexectest,no,0
+CONF
+    # touch first: the lock file may not exist yet at this point in the
+    # suite, and realpath needs an existing target to resolve against.
+    touch "$LOCK"
+    export DIFFSNAP_TEST_LOCK="$(realpath -m "$LOCK")" \
+           DIFFSNAP_TEST_LOG="$(realpath -m "$LOG")" \
+           DIFFSNAP_TEST_CONF="$(realpath -m "$CONF")"
+    "$BIN"; rc=$?
+    unset DIFFSNAP_TEST_LOCK DIFFSNAP_TEST_LOG DIFFSNAP_TEST_CONF
+    [ $rc -eq 0 ] && ok "diffsnap completed successfully with the fd-inspecting wrapper in place (rc=$rc)" || bad "diffsnap failed with the fd-inspecting wrapper in place (rc=$rc)"
+    if [ -s "$FDLEAK_STATE" ]; then
+      bad "lock/log/config file descriptor(s) leaked into a zfs child process:"
+      cat "$FDLEAK_STATE"
+    else
+      ok "no lock/log/config file descriptor was inherited by any zfs child process"
+    fi
+  else
+    rm -f /tmp/diffsnap_zfs_wrapper.$$
+  fi
+  restore_real_zfs
+  trap restore_clock_and_ntp EXIT
+  rm -f "$FDLEAK_STATE"
+fi
+archive_log "35 - close-on-exec for lock/log/config fds"
+
+echo "== 36. Cleanup =="
 zfs destroy -R "$DS" 2>/dev/null
 cp "$ORIG_CONF_BACKUP" "$CONF"
 rm -f "$ORIG_CONF_BACKUP"

@@ -1,15 +1,27 @@
 /*
  * test_localtime_standalone.c
  *
- * Whitebox fault-injection test for the localtime_r failure logging added
- * to log_msg(). Before the fix, a failing localtime_r inside log_msg()
- * silently fell back to an "unknown-time" timestamp with no indication
- * anything had gone wrong -- an operator staring at a log full of
- * "unknown-time" entries with no explanation. The fix makes log_msg()
- * write an explicit failure notice (via a direct fprintf to log_fp,
- * bypassing log_msg() itself to avoid recursing back into the very call
- * that's failing) whenever its own localtime_r call fails, while still
- * writing the caller's original message on the very next line.
+ * Whitebox fault-injection tests for two related log_msg() robustness
+ * fixes:
+ *
+ *   1. localtime_r failure logging: before the fix, a failing localtime_r
+ *      inside log_msg() silently fell back to an "unknown-time" timestamp
+ *      with no indication anything had gone wrong -- an operator staring
+ *      at a log full of "unknown-time" entries with no explanation. The
+ *      fix makes log_msg() write an explicit failure notice (via a direct
+ *      fprintf to log_fp, bypassing log_msg() itself to avoid recursing
+ *      back into the very call that's failing) whenever its own
+ *      localtime_r call fails, while still writing the caller's original
+ *      message on the very next line.
+ *
+ *   2. Log write-failure detection: before the fix, log_msg()'s own
+ *      fprintf/vfprintf return values were discarded, so a disk-full or
+ *      EIO on the log file mid-run silently and permanently dropped the
+ *      audit trail (Created=/Pruned=/error lines) with no effect on the
+ *      process exit status. The fix checks every fprintf/vfprintf return
+ *      value against the log file and records any failure via the
+ *      log_had_io_failure() flag, which main() checks at shutdown to
+ *      force a non-zero exit status.
  *
  * main()'s own top-level localtime_r check (log_msg("Error: localtime_r
  * failed"); goto cleanup;) is deliberately NOT exercised here. That
@@ -18,8 +30,9 @@
  * whitebox-tested, and driving it would require invoking main() itself
  * (renamed diffsnap_real_main), which needs real lock/log/config file
  * paths and has side effects the other whitebox suites deliberately
- * avoid too. The interesting, novel logic is entirely inside log_msg()'s
- * own recursion-avoidance fallback, which is what this file covers.
+ * avoid too. The interesting, novel logic covered here is entirely
+ * inside log_msg()'s own recursion-avoidance fallback and its write-error
+ * bookkeeping.
  *
  * Isolated into its own translation unit (rather than added to
  * test_metrics_scoping_standalone.c or test_oom_standalone.c) for the
@@ -27,7 +40,12 @@
  * #define localtime_r to a fault-injecting shim BEFORE #include
  * "diffsnap.c", and mixing that substitution into a file used for other
  * whitebox tests would affect every localtime_r call made during their
- * setup too, not just the one under test here.
+ * setup too, not just the one under test here. The log write-failure
+ * test added alongside it needs no such shim (it forces a real write
+ * failure by closing the underlying fd out from under log_fp), but it
+ * belongs in this file rather than test.c because it exercises the same
+ * function (log_msg) and the same log_fp global that the localtime_r
+ * tests above it already set up and tear down.
  *
  * No ZFS or network access required.
  *
@@ -42,6 +60,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /*
  * Fault-injecting localtime_r shim, installed via macro substitution
@@ -129,6 +148,46 @@ int main(void) {
         fclose(log_fp);
         log_fp = NULL;
         free(buf);
+        printf("\n");
+    }
+
+    printf("== Test: log_msg detects and records its own write failures instead of discarding them ==\n");
+    {
+        /*
+         * Force a real write failure -- not a shimmed one -- by fdopen'ing
+         * a temp file for log_fp and then closing its underlying fd out
+         * from under the FILE* without going through fclose(). The next
+         * write attempted through log_fp then fails at the OS level
+         * (EBADF), the same class of failure a disk-full or EIO would
+         * produce in production. log_had_io_failure() is the static
+         * accessor added alongside log_msg()'s fix; being in the same
+         * translation unit (diffsnap.c is #include'd above), it's called
+         * directly here.
+         */
+        char tmpl[] = "/tmp/diffsnap_test_logfail_XXXXXX";
+        int fd = mkstemp(tmpl);
+        CHECK(fd >= 0, "created a temp file to back log_fp for the write-failure test");
+        if (fd >= 0) {
+            log_fp = fdopen(fd, "w");
+            CHECK(log_fp != NULL, "fdopen succeeded on the temp file");
+            if (log_fp) {
+                /* Match production: log_fp is line-buffered there too, via
+                 * setvbuf(log_fp, NULL, _IOLBF, 0) right after fopen(). */
+                setvbuf(log_fp, NULL, _IOLBF, 0);
+                log_io_failed = 0; /* reset the static flag before the call under test */
+                CHECK(log_had_io_failure() == 0, "sanity check: no failure recorded yet against a freshly opened, healthy log_fp");
+
+                close(fd); /* invalidate the fd without telling stdio */
+
+                log_msg("this write should fail because the underlying fd was closed out from under it");
+                CHECK(log_had_io_failure() == 1, "log_msg's write failure against the closed fd is recorded via log_had_io_failure(), not silently discarded");
+
+                fclose(log_fp); /* expected to itself report an error (EBADF); either way we're done with this FILE* */
+                log_fp = NULL;
+                log_io_failed = 0; /* disarm immediately so nothing else in this binary is affected */
+            }
+        }
+        unlink(tmpl);
         printf("\n");
     }
 

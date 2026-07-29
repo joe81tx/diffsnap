@@ -48,6 +48,21 @@ static const char *find_bin(const char *const candidates[]) {
     return NULL;
 }
 
+/*
+ * Spy handler for Test 22 (stream_reader_consume overflow-ordering fix).
+ * File-scope so it can be passed as a plain line_handler_t function
+ * pointer while still recording what, if anything, it was called with.
+ */
+static int g_spy_calls = 0;
+static char g_spy_last_line[STR_BUF_XLARGE];
+
+static int spy_line_handler(const char *line, void *data) {
+    (void)data;
+    g_spy_calls++;
+    snprintf(g_spy_last_line, sizeof(g_spy_last_line), "%s", line);
+    return 0;
+}
+
 int main(void) {
     printf("== Test 1: exec_cmd_stream (strict) vs exec_cmd_stream_lenient on a clean-success process ==\n");
     {
@@ -487,6 +502,54 @@ int main(void) {
             }
             free(ctx.items);
         }
+        printf("\n");
+    }
+
+    printf("== Test 22: stream_reader_consume marks the reader failed BEFORE flushing an overlong line, so handler() never sees truncated data ==\n");
+    {
+        /*
+         * Before the fix, an overlong (>STR_BUF_XLARGE-1 byte, no embedded
+         * newline) chunk was flushed to handler() and only marked the
+         * reader failed AFTER that call -- a truncated line was briefly
+         * treated as a complete one before the failure was recorded. The
+         * fix reorders this so `failed` is set first. Calling
+         * stream_reader_consume() directly (the real static function, no
+         * shim needed) with a spy handler proves the truncated content is
+         * never handed off, regardless of how the caller might otherwise
+         * observe reader->failed.
+         */
+        g_spy_calls = 0;
+        g_spy_last_line[0] = '\0';
+
+        stream_reader_t reader = {0};
+        reader.is_stderr = 0;
+        reader.handler = spy_line_handler;
+        reader.data = NULL;
+
+        /* 600 bytes of 'A', no newline anywhere -- exceeds
+         * STR_BUF_XLARGE-1 (511) usable bytes, forcing the overflow
+         * branch inside stream_reader_consume to fire mid-line. */
+        char oversized[600];
+        memset(oversized, 'A', sizeof(oversized));
+
+        stream_reader_consume(&reader, oversized, (ssize_t)sizeof(oversized));
+
+        CHECK(reader.failed == 1, "reader is marked failed once an overlong no-newline chunk overflows the buffer");
+        CHECK(g_spy_calls == 0, "handler() was never invoked with the truncated (overflowed) line content");
+
+        /* Baseline contrast: an ordinary, well-formed line through the
+         * same function still reaches the handler normally. */
+        stream_reader_t ok_reader = {0};
+        ok_reader.is_stderr = 0;
+        ok_reader.handler = spy_line_handler;
+        ok_reader.data = NULL;
+        g_spy_calls = 0;
+        const char *normal_line = "pool/child\t12345\n";
+        stream_reader_consume(&ok_reader, normal_line, (ssize_t)strlen(normal_line));
+        CHECK(ok_reader.failed == 0, "an ordinary in-bounds line does not mark the reader failed");
+        CHECK(g_spy_calls == 1, "handler() IS invoked normally for a well-formed, in-bounds line");
+        CHECK(strcmp(g_spy_last_line, "pool/child\t12345") == 0, "handler() receives the complete, untruncated line content");
+
         printf("\n");
     }
 
