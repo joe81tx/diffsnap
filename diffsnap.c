@@ -61,6 +61,11 @@
     } while (0)
 
 static FILE *log_fp = NULL;
+/* Set when any fprintf/vfprintf to log_fp fails (e.g. disk full, EIO).
+ * log_msg() has no return value for callers to check, so this is how a
+ * mid-run logging failure gets surfaced to main()'s exit status instead of
+ * being silently swallowed. */
+static int log_io_failed = 0;
 
 typedef int (*line_handler_t)(const char *line, void *data);
 typedef struct { char *dataset; char *prefix; size_t retention; size_t pass; int snap_failed; long long written; long long min_bytes; } batch_item_t;
@@ -149,15 +154,19 @@ static void log_msg(const char *fmt, ...) {
     
     if (localtime_r(&t, &tm_info) == NULL) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
-        fprintf(log_fp, "%s Error: localtime_r failed while formatting log timestamp\n", timestamp);
+        if (fprintf(log_fp, "%s Error: localtime_r failed while formatting log timestamp\n", timestamp) < 0)
+            log_io_failed = 1;
     } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
-    fprintf(log_fp, "%s ", timestamp);
-    vfprintf(log_fp, fmt, args);
-    fprintf(log_fp, "\n");
+    if (fprintf(log_fp, "%s ", timestamp) < 0) log_io_failed = 1;
+    if (vfprintf(log_fp, fmt, args) < 0) log_io_failed = 1;
+    if (fprintf(log_fp, "\n") < 0) log_io_failed = 1;
     va_end(args);
 }
+
+/* Whether any write to the log file has failed since it was opened. */
+static int log_had_io_failure(void) { return log_io_failed; }
 
 static void early_fail(const char *fmt, ...) {
     va_list args;
@@ -236,8 +245,12 @@ static void stream_reader_consume(stream_reader_t *reader, const char *buf, ssiz
         } else if (reader->used < sizeof(reader->buf) - 1) {
             reader->buf[reader->used++] = buf[i];
         } else {
-            stream_reader_line(reader);
+            /* Mark failed *before* flushing, so a truncated (overlong)
+             * line is never handed to handler() -- only stderr lines
+             * (which are just logged, not parsed) still get flushed
+             * after this point. */
             if (!reader->is_stderr) reader->failed = 1;
+            stream_reader_line(reader);
             reader->buf[reader->used++] = buf[i];
         }
     }
@@ -524,7 +537,10 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
         if (match_count >= *matches_cap) {
             size_t new_cap = *matches_cap == 0 ? ALLOC_CHUNK_PRUNE : *matches_cap * 2;
             char **tmp = realloc(*matches, new_cap * sizeof(char *));
-            if (!tmp) return -1;
+            if (!tmp) {
+                log_msg("Error: Failed to allocate prune match list for %s", dataset);
+                return -1;
+            }
             *matches = tmp; *matches_cap = new_cap;
         }
         (*matches)[match_count++] = (char *)line;
@@ -1014,7 +1030,7 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    int lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT, 0600);
+    int lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock_fd < 0) {
         int saved_errno = errno;
         early_fail("%s: failed to open lock file %s: %s", progname, LOCK_PATH, strerror(saved_errno));
@@ -1035,13 +1051,13 @@ int main(int argc, char *argv[]) {
     batch_ctx_t std_b = { NULL, 0, 0 }, rec_b = { NULL, 0, 0 };
     seen_set_t seen = { NULL, 0, 0 };
     char *line = NULL; FILE *conf = NULL;
-    if ((log_fp = fopen(LOG_PATH, "a")) == NULL) {
+    if ((log_fp = fopen(LOG_PATH, "ae")) == NULL) {
         int saved_errno = errno;
         early_fail("%s: failed to open log file %s: %s", progname, LOG_PATH, strerror(saved_errno));
         ret_code = 1; goto cleanup;
     }
     setvbuf(log_fp, NULL, _IOLBF, 0);
-    conf = fopen(CONF_PATH, "r");
+    conf = fopen(CONF_PATH, "re");
     if (!conf) {
         int saved_errno = errno;
         early_fail("%s: failed to open config file %s: %s", progname, CONF_PATH, strerror(saved_errno));
@@ -1189,10 +1205,17 @@ batch_free(&std_b);
 batch_free(&rec_b);
 seen_set_free(&seen);
 
-if (log_fp && fclose(log_fp) != 0) {
-    fprintf(stderr, "%s: failed to flush log file %s: %s\n",
-            progname, LOG_PATH, strerror(errno));
-    ret_code = 1;
+if (log_fp) {
+    if (log_had_io_failure()) {
+        fprintf(stderr, "%s: one or more writes to log file %s failed; log is incomplete\n",
+                progname, LOG_PATH);
+        ret_code = 1;
+    }
+    if (fclose(log_fp) != 0) {
+        fprintf(stderr, "%s: failed to flush log file %s: %s\n",
+                progname, LOG_PATH, strerror(errno));
+        ret_code = 1;
+    }
 }
 
 close(lock_fd);
