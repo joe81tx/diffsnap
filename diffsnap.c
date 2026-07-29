@@ -990,14 +990,13 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
     int status = 0;
     for (size_t i = 0; i < batch->count; i++) {
         char snap_name[STR_BUF_XLARGE];
-        int len = snprintf(snap_name, sizeof(snap_name), "%s@%s_%s", batch->items[i].dataset, batch->items[i].prefix, snap_time);
-        if (len < 0 || (size_t)len >= sizeof(snap_name)) { log_msg("Error: %sSnapshot name too long for %s", recursive ? "Recursive " : "", batch->items[i].dataset); status = 1; continue; }
+        snprintf(snap_name, sizeof(snap_name), "%s@%s_%s", batch->items[i].dataset, batch->items[i].prefix, snap_time);
         if (batch->items[i].snap_failed) {
             if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
             if (!inventory_contains(inventory, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
         }
-        char h_bytes[STR_BUF_SMALL] = "0";
-        if (batch->items[i].written != -1) format_bytes(batch->items[i].written, h_bytes, sizeof(h_bytes));
+        char h_bytes[STR_BUF_SMALL];
+        format_bytes(batch->items[i].written, h_bytes, sizeof(h_bytes));
         log_msg("Created=%s Written=%s%s", snap_name, h_bytes, recursive ? " Recursive" : "");
         if (!inventory_ok) {
             log_msg("Error: Unable to prune %ssnapshots for %s: snapshot inventory unavailable", recursive ? "recursive " : "", batch->items[i].dataset);
