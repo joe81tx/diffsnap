@@ -20,6 +20,18 @@
  *   ./test_metrics_scoping
  */
 
+/*
+ * Points diffsnap.c's own ZFS_PATH constant at a fake `zfs` script instead
+ * of the real /sbin/zfs, so Tests 23-24 below can exercise real code paths
+ * that shell out (prune_from_inventory -> zfs_destroy, and
+ * zfs_snapshot_batch -> zfs_snapshot_exec_chunk) without any real ZFS pool.
+ * The script itself is written to this exact path, by name, right before
+ * Test 23 runs (see there), and removed again right after Test 24. It is a
+ * fixed path (not mkstemp'd) because ZFS_PATH has to be a compile-time
+ * string literal, not something chosen at runtime.
+ */
+#define ZFS_PATH "/tmp/diffsnap_test_metrics_scoping_fake_zfs.sh"
+
 #define main diffsnap_real_main
 #include "diffsnap.c"
 #undef main
@@ -550,6 +562,227 @@ int main(void) {
         CHECK(g_spy_calls == 1, "handler() IS invoked normally for a well-formed, in-bounds line");
         CHECK(strcmp(g_spy_last_line, "pool/child\t12345") == 0, "handler() receives the complete, untruncated line content");
 
+        printf("\n");
+    }
+
+    printf("== Test 23: prune_from_inventory's date_stamp_like gate excludes prefix-matching but non-date-shaped snapshot names ==\n");
+    {
+        /* Install the fake zfs script (shared with Test 24 below): it
+         * fails any invocation whose argument list mentions "badroot" and
+         * succeeds otherwise, so ordinary `zfs destroy` calls issued by
+         * prune_from_inventory here succeed without touching real ZFS. */
+        FILE *fzf = fopen(ZFS_PATH, "w");
+        CHECK(fzf != NULL, "fake zfs script created at ZFS_PATH for Tests 23-24");
+        if (fzf) {
+            fprintf(fzf, "#!/bin/sh\ncase \"$*\" in\n  *badroot*) exit 1 ;;\n  *) exit 0 ;;\nesac\n");
+            fclose(fzf);
+            chmod(ZFS_PATH, 0755);
+        }
+
+        /* Capture log_msg() output so we can see exactly what got pruned,
+         * the same technique test_localtime_standalone.c uses. */
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for capturing log_msg output");
+
+        name_list_t inventory = {0};
+        /* Newest-first, matching the real "-S creation" ordering that
+         * load_combined_snapshot_inventory hands to this function. The
+         * middle entry matches the prefix_ literal but is NOT date-shaped
+         * (this is exactly the case date_stamp_like exists to reject). */
+        handle_snapshot_inventory_line("pool/ds@myprefix_2026-01-03_00:00:00", &inventory);
+        handle_snapshot_inventory_line("pool/ds@myprefix_garbage-not-a-date", &inventory);
+        handle_snapshot_inventory_line("pool/ds@myprefix_2026-01-01_00:00:00", &inventory);
+        CHECK(inventory.count == 3, "all three inventory lines were recorded");
+
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        /*
+         * max_snaps=1 with 2 genuinely date-stamped entries means exactly
+         * one prune (the older one). If the malformed entry were wrongly
+         * treated as a match too, match_count would be 3 instead of 2 and
+         * pruning would fire TWICE -- destroying the malformed "snapshot"
+         * along with a real one, exactly the false-Created-line/false-prune
+         * failure mode described when this gap was first identified.
+         */
+        int rc = prune_from_inventory(&inventory, "pool/ds", "myprefix", 1, 0, &matches, &matches_cap);
+        CHECK(rc == 0, "prune_from_inventory reports success");
+
+        fflush(log_fp);
+        int pruned_count = 0;
+        if (buf) {
+            const char *p = buf;
+            while ((p = strstr(p, "Pruned=")) != NULL) { pruned_count++; p += 7; }
+        }
+        CHECK(pruned_count == 1, "exactly one snapshot was pruned -- the malformed-name entry was never counted as a match");
+        CHECK(buf != NULL && strstr(buf, "myprefix_garbage-not-a-date") == NULL,
+              "the non-date-shaped entry was never selected for pruning");
+        CHECK(buf != NULL && strstr(buf, "myprefix_2026-01-01_00:00:00") != NULL,
+              "the oldest genuinely date-stamped entry is the one that was pruned, leaving the newest one retained");
+
+        fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches); /* matches holds borrowed pointers into inventory -- only the array itself is ours to free */
+        name_list_free(&inventory);
+        printf("\n");
+    }
+
+    printf("== Test 24: zfs_snapshot_batch isolates failure to the failing root -- one root's failure does not block or falsely fail a sibling root ==\n");
+    {
+        /* Reuses the fake zfs script installed for Test 23 above (still in
+         * place at ZFS_PATH): it fails any call mentioning "badroot",
+         * succeeds otherwise. */
+        batch_ctx_t ctx = {0};
+        int rc1 = batch_add(&ctx, "badroot/x", "p", 1, -1, 0);
+        int rc2 = batch_add(&ctx, "goodroot/y", "p", 1, -1, 0);
+        CHECK(rc1 == 0 && rc2 == 0, "batch_add succeeded for both items during setup");
+
+        int rc = zfs_snapshot_batch(&ctx, 0, "2026-01-01_00:00:00");
+
+        CHECK(rc == -1, "zfs_snapshot_batch reports overall failure because one root's snapshot call failed");
+        CHECK(ctx.items[0].snap_failed == 1, "the item under the failing root (badroot) is marked snap_failed");
+        CHECK(ctx.items[1].snap_failed == 0,
+              "the item under the OTHER, healthy root (goodroot) is NOT marked failed -- one root's failure does not leak onto a sibling root");
+
+        batch_free(&ctx);
+        unlink(ZFS_PATH); /* done with the fake zfs script now */
+        printf("\n");
+    }
+
+    printf("== Test 25: trim_trailing_whitespace and copy_token handle their edge cases correctly ==\n");
+    {
+        char s1[] = "hello world   ";
+        trim_trailing_whitespace(s1);
+        CHECK(strcmp(s1, "hello world") == 0, "trailing spaces are trimmed");
+
+        char s2[] = "no trailing ws";
+        trim_trailing_whitespace(s2);
+        CHECK(strcmp(s2, "no trailing ws") == 0, "a string with no trailing whitespace is left unchanged");
+
+        char s3[] = "tabs and crlf\t\r\n";
+        trim_trailing_whitespace(s3);
+        CHECK(strcmp(s3, "tabs and crlf") == 0, "trailing tabs, CR, and LF are all trimmed together, not just plain spaces");
+
+        char s4[] = "   ";
+        trim_trailing_whitespace(s4);
+        CHECK(strcmp(s4, "") == 0, "an all-whitespace string is trimmed down to empty, not left partially intact");
+
+        char dst[8];
+        CHECK(copy_token(dst, sizeof(dst), "short") == 0, "copy_token succeeds when the source fits with room to spare");
+        CHECK(strcmp(dst, "short") == 0, "copy_token copies the exact source content");
+
+        CHECK(copy_token(dst, sizeof(dst), "1234567") == 0, "copy_token succeeds when source length is exactly dst_size-1 (leaves exactly enough room for the NUL)");
+        CHECK(strcmp(dst, "1234567") == 0, "copy_token's boundary-fitting copy is byte-exact");
+
+        char before[8];
+        memcpy(before, dst, sizeof(before));
+        CHECK(copy_token(dst, sizeof(dst), "12345678") == -1, "copy_token rejects a source that is exactly dst_size long (no room left for the NUL terminator)");
+        CHECK(memcmp(dst, before, sizeof(before)) == 0, "dst is left completely untouched when copy_token rejects an oversized source");
+        printf("\n");
+    }
+
+    printf("== Test 26: seen_set_add detects an exact (dataset, prefix) duplicate without false-positiving on a partial match ==\n");
+    {
+        seen_set_t seen = {0};
+        int rc1 = seen_set_add(&seen, "pool/ds", "myprefix");
+        CHECK(rc1 == 0, "first insertion of a (dataset, prefix) pair succeeds and is reported as new");
+        CHECK(seen.count == 1, "the set now holds exactly one key");
+
+        int rc2 = seen_set_add(&seen, "pool/ds", "myprefix");
+        CHECK(rc2 == 1, "re-inserting the exact same (dataset, prefix) pair is reported as an already-seen duplicate");
+        CHECK(seen.count == 1, "the duplicate insertion did not grow the set");
+
+        /* Same dataset, different prefix: diffsnap explicitly allows
+         * multiple prefixes per dataset, so this must NOT be a duplicate. */
+        int rc3 = seen_set_add(&seen, "pool/ds", "otherprefix");
+        CHECK(rc3 == 0, "the same dataset with a different prefix is treated as a distinct, new entry");
+        CHECK(seen.count == 2, "the set grew to two keys after the genuinely distinct entry");
+
+        /* Different dataset, same prefix: also must NOT be a duplicate. */
+        int rc4 = seen_set_add(&seen, "pool/other", "myprefix");
+        CHECK(rc4 == 0, "a different dataset with the same prefix is treated as a distinct, new entry");
+        CHECK(seen.count == 3, "the set grew to three keys after the second genuinely distinct entry");
+
+        seen_set_free(&seen);
+        printf("\n");
+    }
+
+    printf("== Test 27: format_bytes boundary and edge-case formatting ==\n");
+    {
+        char buf[32];
+
+        format_bytes(0, buf, sizeof(buf));
+        CHECK(strcmp(buf, "0") == 0, "zero bytes formats as plain \"0\"");
+
+        format_bytes(-500, buf, sizeof(buf));
+        CHECK(strcmp(buf, "0") == 0, "a negative byte count defensively also formats as \"0\", not a negative or garbage value");
+
+        format_bytes(1023, buf, sizeof(buf));
+        CHECK(strcmp(buf, "1023") == 0, "one byte under the 1024 threshold stays in plain decimal bytes, no unit suffix");
+
+        format_bytes(1024, buf, sizeof(buf));
+        CHECK(strcmp(buf, "1.00K") == 0, "exactly 1024 bytes crosses into the K unit");
+
+        format_bytes(1024LL * 1024, buf, sizeof(buf));
+        CHECK(strcmp(buf, "1.00M") == 0, "exactly 1 MiB formats with the M unit");
+
+        format_bytes(1024LL * 1024 * 1024 * 1024 * 1024, buf, sizeof(buf));
+        CHECK(strcmp(buf, "1.00P") == 0, "the largest unit (P) is used for petabyte-scale values, with no further division past it");
+        printf("\n");
+    }
+
+    printf("== Test 28: compare_order_entry sorts strictly by len, treating equal-len entries as tied ==\n");
+    {
+        order_entry_t entries[5] = {
+            { .idx = 0, .len = 30 },
+            { .idx = 1, .len = 10 },
+            { .idx = 2, .len = 20 },
+            { .idx = 3, .len = 10 },
+            { .idx = 4, .len = 5  },
+        };
+        qsort(entries, 5, sizeof(entries[0]), compare_order_entry);
+
+        CHECK(entries[0].len == 5, "the shortest entry sorts first");
+        CHECK(entries[4].len == 30, "the longest entry sorts last");
+        int nondecreasing = 1;
+        for (size_t i = 0; i + 1 < 5; i++) if (entries[i].len > entries[i + 1].len) nondecreasing = 0;
+        CHECK(nondecreasing, "the whole array ends up in non-decreasing len order");
+
+        /* Direct comparator contract, independent of qsort's algorithm
+         * choice: equal-length entries compare as tied, and the comparator
+         * is antisymmetric for unequal lengths. */
+        order_entry_t a = { .idx = 0, .len = 10 };
+        order_entry_t b = { .idx = 1, .len = 10 };
+        order_entry_t c = { .idx = 2, .len = 20 };
+        CHECK(compare_order_entry(&a, &b) == 0, "two entries with equal len compare as tied, regardless of differing idx");
+        CHECK(compare_order_entry(&a, &c) < 0, "a shorter entry compares less than a longer one");
+        CHECK(compare_order_entry(&c, &a) > 0, "the comparison is antisymmetric: the longer entry compares greater than the shorter one");
+        printf("\n");
+    }
+
+    printf("== Test 29: distinct_roots_from_datasets counts distinct roots correctly and enforces its output buffer size ==\n");
+    {
+        const char *multi_root[] = { "poolA/x", "poolB/y", "poolC/z" };
+        char root_buf[STR_BUF_LARGE];
+        size_t distinct = distinct_roots_from_datasets(multi_root, 3, root_buf, sizeof(root_buf));
+        CHECK(distinct == 3, "three datasets under three different pools are counted as three distinct roots");
+
+        const char *same_root[] = { "poolA/x", "poolA/y", "poolA/z/nested" };
+        distinct = distinct_roots_from_datasets(same_root, 3, root_buf, sizeof(root_buf));
+        CHECK(distinct == 1, "datasets that share a single top-level pool are counted as one distinct root regardless of nesting depth");
+        CHECK(strcmp(root_buf, "poolA") == 0, "the single distinct root's name is written into root_buf");
+
+        /* Buffer too small to hold the single distinct root's name: the
+         * function must fail closed (return 0) instead of silently
+         * truncating the root name it writes into the caller's buffer. */
+        const char *long_root[] = { "averyverylongpoolname/x", "averyverylongpoolname/y" };
+        char tiny_buf[4];
+        char sentinel = tiny_buf[0] = 'X';
+        distinct = distinct_roots_from_datasets(long_root, 2, tiny_buf, sizeof(tiny_buf));
+        CHECK(distinct == 0, "when the single distinct root's name does not fit in root_buf, the function reports 0 distinct roots instead of truncating it");
+        CHECK(tiny_buf[0] == sentinel, "root_buf is left completely untouched when the root name doesn't fit");
         printf("\n");
     }
 
