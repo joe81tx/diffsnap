@@ -156,14 +156,23 @@ static void log_msg(const char *fmt, ...) {
     struct tm tm_info;
     char timestamp[STR_BUF_SMALL];
     
-    /* Either failure (can't get the local time, or can't format it) just
-     * falls back to a placeholder timestamp; either way we still write
-     * exactly one log line for this call, same as the success path. */
-    if (localtime_r(&t, &tm_info) == NULL ||
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
+    /* Either failure (can't get the local time, or can't format it) falls
+     * back to a placeholder timestamp. When it's specifically localtime_r
+     * that failed, that's surfaced with an inline marker on THIS SAME
+     * line -- not as a second, separate log_fp write -- so an operator
+     * still sees it was localtime_r that broke without log_msg() ever
+     * doubling its own output for one call. */
+    int localtime_failed = 0;
+    if (localtime_r(&t, &tm_info) == NULL) {
+        localtime_failed = 1;
+        snprintf(timestamp, sizeof(timestamp), "unknown-time");
+    } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
     if (fprintf(log_fp, "%s ", timestamp) < 0) log_io_failed = 1;
+    if (localtime_failed) {
+        if (fprintf(log_fp, "[localtime_r failed, using fallback timestamp] ") < 0) log_io_failed = 1;
+    }
     if (vfprintf(log_fp, fmt, args) < 0) log_io_failed = 1;
     if (fprintf(log_fp, "\n") < 0) log_io_failed = 1;
     va_end(args);

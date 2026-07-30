@@ -4,15 +4,19 @@
  * Whitebox fault-injection tests for two related log_msg() robustness
  * fixes:
  *
- *   1. localtime_r failure logging: before the fix, a failing localtime_r
- *      inside log_msg() silently fell back to an "unknown-time" timestamp
- *      with no indication anything had gone wrong -- an operator staring
- *      at a log full of "unknown-time" entries with no explanation. The
- *      fix makes log_msg() write an explicit failure notice (via a direct
- *      fprintf to log_fp, bypassing log_msg() itself to avoid recursing
- *      back into the very call that's failing) whenever its own
- *      localtime_r call fails, while still writing the caller's original
- *      message on the very next line.
+ *   1. localtime_r failure logging: before the first fix, a failing
+ *      localtime_r inside log_msg() silently fell back to an
+ *      "unknown-time" timestamp with no indication anything had gone
+ *      wrong -- an operator staring at a log full of "unknown-time"
+ *      entries with no explanation. That first fix wrote an explicit
+ *      failure notice, but as its OWN separate fprintf to log_fp before
+ *      the caller's message -- meaning a single log_msg() call produced
+ *      TWO log lines (a diagnostic line, then the original message on the
+ *      next line) whenever localtime_r failed. The current fix keeps the
+ *      explicit "localtime_r failed" indicator (still needed so the
+ *      "unknown-time" entries stay explained, not silent again) but folds
+ *      it into the SAME line as the caller's message, so log_msg() always
+ *      writes exactly one log line per call, success or failure alike.
  *
  *   2. Log write-failure detection: before the fix, log_msg()'s own
  *      fprintf/vfprintf return values were discarded, so a disk-full or
@@ -31,8 +35,8 @@
  * (renamed diffsnap_real_main), which needs real lock/log/config file
  * paths and has side effects the other whitebox suites deliberately
  * avoid too. The interesting, novel logic covered here is entirely
- * inside log_msg()'s own recursion-avoidance fallback and its write-error
- * bookkeeping.
+ * inside log_msg()'s own single-line fallback-and-marker logic and its
+ * write-error bookkeeping.
  *
  * Isolated into its own translation unit (rather than added to
  * test_metrics_scoping_standalone.c or test_oom_standalone.c) for the
@@ -117,9 +121,25 @@ int main(void) {
         fflush(log_fp);
         CHECK(g_call_count == 1, "sanity check: the shim actually intercepted exactly one localtime_r call");
         CHECK(buf != NULL && strstr(buf, "localtime_r failed") != NULL,
-              "log output contains an explicit localtime_r failure notice, not just a silent 'unknown-time' substitution");
+              "log output contains an explicit localtime_r failure marker, not just a silent 'unknown-time' substitution");
         CHECK(buf != NULL && strstr(buf, "test message while localtime_r is failing") != NULL,
               "the original log message is still written despite the timestamp failure (not dropped entirely)");
+
+        /* This is the actual regression check for the current fix: before
+         * it, the failure marker and the caller's message were written as
+         * two SEPARATE log_fp writes ending in their own "\n" each, so a
+         * single log_msg() call produced two lines. They must now be one
+         * write, one line. */
+        size_t newline_count = 0;
+        if (buf) for (size_t i = 0; i < buf_len; i++) if (buf[i] == '\n') newline_count++;
+        CHECK(newline_count == 1,
+              "exactly one newline is written for this single log_msg() call -- the failure marker and the original message share one line, not two separate ones");
+        if (buf) {
+            const char *marker_pos = strstr(buf, "localtime_r failed");
+            const char *message_pos = strstr(buf, "test message while localtime_r is failing");
+            CHECK(marker_pos != NULL && message_pos != NULL && marker_pos < message_pos,
+                  "the failure marker appears before the original message, both within that same single line");
+        }
 
         fclose(log_fp);
         log_fp = NULL;

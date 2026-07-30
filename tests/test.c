@@ -786,6 +786,227 @@ int main(void) {
         printf("\n");
     }
 
+    printf("== Test 30: drain_command_streams (poll()-based) drains concurrent, interleaved stdout+stderr without hanging or dropping data ==\n");
+    {
+        /*
+         * Regression coverage for the select()->poll() rewrite of
+         * drain_command_streams. select()'s fd_set/FD_ISSET bookkeeping
+         * was replaced with a struct pollfd[2] array; this exercises the
+         * real subprocess path (not a direct stream_reader_consume() call
+         * like Test 22) so both fds are genuinely ready/not-ready across
+         * many poll() wakeups, not just fed a single in-memory buffer.
+         */
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a shell for the concurrent stdout/stderr test");
+        if (sh_bin) {
+            char *buf = NULL;
+            size_t buf_len = 0;
+            log_fp = open_memstream(&buf, &buf_len);
+            CHECK(log_fp != NULL, "open_memstream succeeded for capturing stderr-routed log output");
+
+            metric_ctx_t ctx = {0};
+            const char *const argv[] = {sh_bin, "-c",
+                "i=1; while [ $i -le 40 ]; do printf 'pool/ds%d\\t%d\\n' $i $((i*10)); "
+                "echo \"stderr-$i\" >&2; i=$((i+1)); done", NULL};
+            int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+            fflush(log_fp);
+
+            CHECK(rc == 0, "the concurrent stdout+stderr command succeeds");
+            CHECK(ctx.count == 40, "all 40 stdout lines were delivered to the handler through the poll()-driven drain, none dropped");
+            int has_first = 0, has_last = 0;
+            for (size_t i = 0; i < ctx.count; i++) {
+                if (strcmp(ctx.items[i].name, "pool/ds1") == 0) has_first = 1;
+                if (strcmp(ctx.items[i].name, "pool/ds40") == 0) has_last = 1;
+            }
+            CHECK(has_first && has_last, "both the first and last stdout lines survived interleaving with concurrent stderr output");
+            CHECK(buf != NULL && strstr(buf, "stderr-1") != NULL && strstr(buf, "stderr-40") != NULL,
+                  "stderr output interleaved with stdout was also fully drained and logged, not starved by the stdout side of poll()");
+
+            fclose(log_fp);
+            log_fp = NULL;
+            free(buf);
+            free(ctx.items);
+        }
+        printf("\n");
+    }
+
+    printf("== Test 31: one stream closing early does not stall or truncate draining of the other (poll() per-fd open-flag independence) ==\n");
+    {
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a shell for the early-close test");
+        if (sh_bin) {
+            char *buf = NULL;
+            size_t buf_len = 0;
+            log_fp = open_memstream(&buf, &buf_len);
+            CHECK(log_fp != NULL, "open_memstream succeeded for capturing log output");
+
+            metric_ctx_t ctx = {0};
+            /* stdout emits exactly one line and then its fd is explicitly
+             * closed; stderr keeps emitting lines well after that. If
+             * out_open's transition to closed ever incorrectly affected
+             * err_open's poll() slot (or vice versa), this would either
+             * hang forever or silently stop draining stderr the moment
+             * stdout closes. */
+            const char *const argv[] = {sh_bin, "-c",
+                "printf 'pool/only\\t99\\n'; exec 1>&-; "
+                "i=1; while [ $i -le 10 ]; do echo \"late-stderr-$i\" >&2; i=$((i+1)); done", NULL};
+            int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+            fflush(log_fp);
+
+            CHECK(rc == 0, "the command succeeds even though stdout closes long before stderr finishes");
+            CHECK(ctx.count == 1 && strcmp(ctx.items[0].name, "pool/only") == 0,
+                  "the single stdout line emitted before the close was captured");
+            CHECK(buf != NULL && strstr(buf, "late-stderr-1") != NULL && strstr(buf, "late-stderr-10") != NULL,
+                  "all stderr lines emitted AFTER stdout's fd closed were still drained to completion, not cut off early");
+
+            fclose(log_fp);
+            log_fp = NULL;
+            free(buf);
+            free(ctx.items);
+        }
+        printf("\n");
+    }
+
+    printf("== Test 32: valid_prefix's former empty-string check is confirmed dead code -- its only caller never passes an empty prefix ==\n");
+    {
+        /*
+         * The explicit `if (prefix[0] == '\0') return 0;` guard was
+         * removed as unreachable: valid_prefix's only caller in main()
+         * copies a token straight from strtok_r(), which never yields an
+         * empty token (it skips runs of delimiters), and REQUIRE_TOKEN
+         * already goto's away on a NULL token before that call. Calling
+         * valid_prefix("") directly here (something the real program
+         * never does) now returns 1, since guarding against an empty
+         * prefix is entirely the caller's responsibility going forward.
+         */
+        CHECK(valid_prefix("") == 1,
+              "valid_prefix(\"\") returns 1 now that the unreachable empty-string rejection was removed -- documents the new contract rather than silently changing behavior");
+        CHECK(valid_prefix("ok_name-1") == 1, "an ordinary alnum/underscore/hyphen prefix is still accepted");
+        CHECK(valid_prefix("bad name") == 0, "a prefix containing a disallowed character (space) is still rejected");
+        printf("\n");
+    }
+
+    printf("== Test 33: resolve_recursive_ancestor_overlaps never drives rec_b->count to 0, even when all but one item is covered ==\n");
+    {
+        /*
+         * Confirms the invariant documented above the malloc() in
+         * resolve_recursive_ancestor_overlaps: is_strict_descendant()
+         * only marks an item covered when some OTHER item is a strictly
+         * shorter ancestor, so the shortest item in the set can never be
+         * covered. A 3-level same-prefix ancestor chain drives the count
+         * down to its practical minimum (1), the closest this code path
+         * can get to 0, and must neither crash nor mis-handle that.
+         */
+        batch_ctx_t rec_b = {0};
+        batch_add(&rec_b, "pool/a", "p", 1, -1, 0);
+        batch_add(&rec_b, "pool/a/b", "p", 1, -1, 0);
+        batch_add(&rec_b, "pool/a/b/c", "p", 1, -1, 0);
+
+        int rc = resolve_recursive_ancestor_overlaps(&rec_b);
+
+        CHECK(rc == 0, "resolve_recursive_ancestor_overlaps succeeds on a 3-level same-prefix ancestor chain");
+        CHECK(rec_b.count == 1, "only the top-level ancestor survives; both descendants are covered and dropped");
+        CHECK(rec_b.count > 0 && strcmp(rec_b.items[0].dataset, "pool/a") == 0,
+              "the single survivor is the shortest (topmost) dataset in the chain, exactly as the invariant predicts");
+
+        batch_free(&rec_b);
+        printf("\n");
+    }
+
+    printf("== Test 34: resolve_recursive_ancestor_overlaps -- equal-length siblings with the same prefix cover neither one ==\n");
+    {
+        batch_ctx_t rec_b = {0};
+        batch_add(&rec_b, "pool/aaa", "p", 1, -1, 0);
+        batch_add(&rec_b, "pool/bbb", "p", 1, -1, 0); /* same length as pool/aaa, same prefix, NOT an ancestor/descendant of it */
+
+        int rc = resolve_recursive_ancestor_overlaps(&rec_b);
+
+        CHECK(rc == 0, "resolve_recursive_ancestor_overlaps succeeds on two equal-length siblings");
+        CHECK(rec_b.count == 2, "neither sibling can be an ancestor of the other (equal length), so both survive uncovered");
+
+        batch_free(&rec_b);
+        printf("\n");
+    }
+
+    printf("== Test 35: finalize_batch fails safely, not silently, when a snapshot name would not fit its buffer ==\n");
+    {
+        /*
+         * Reachable only by handing finalize_batch a batch_ctx_t built
+         * directly (bypassing config-parsing's length validation, exactly
+         * like the OOM/localtime whitebox tests bypass their own normal
+         * call paths) -- config parsing itself can never produce a
+         * dataset this long, but finalize_batch's own snprintf check must
+         * still hold if that invariant is ever violated.
+         */
+        batch_ctx_t b = {0};
+        char long_ds[500];
+        memset(long_ds, 'a', sizeof(long_ds) - 1);
+        long_ds[sizeof(long_ds) - 1] = '\0';
+        /* dataset(499) + '@'(1) + prefix(1) + '_'(1) + timestamp(19) + NUL(1)
+         * = 522 bytes, safely over STR_BUF_XLARGE (512). */
+        int rc = batch_add(&b, long_ds, "p", 1, 123, -1);
+        CHECK(rc == 0, "batch_add succeeded during setup with a deliberately oversized dataset name");
+
+        name_list_t inventory = {0};
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for capturing finalize_batch's log output");
+
+        int status = finalize_batch(&b, &inventory, 1, &matches, &matches_cap, "2026-01-01_00:00:00", 0);
+        fflush(log_fp);
+
+        CHECK(status == 1, "finalize_batch reports failure for an item whose formatted snapshot name would not fit its buffer");
+        CHECK(buf != NULL && strstr(buf, "Failed to format") != NULL,
+              "an explicit formatting-failure error is logged instead of proceeding on a silently truncated name");
+        CHECK(buf != NULL && strstr(buf, "Created=") == NULL,
+              "no false 'Created=' line is emitted for a name that couldn't be safely formatted");
+
+        fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 36: finalize_batch's snap_name formatting still succeeds normally for an ordinary, well-sized dataset ==\n");
+    {
+        /* Baseline contrast to Test 35: proves the new truncation check
+         * doesn't disturb the ordinary, overwhelmingly common case. */
+        batch_ctx_t b = {0};
+        int rc = batch_add(&b, "pool/normal", "p", 1, 4096, -1);
+        CHECK(rc == 0, "batch_add succeeded during setup");
+
+        name_list_t inventory = {0};
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded");
+
+        int status = finalize_batch(&b, &inventory, 1, &matches, &matches_cap, "2026-01-01_00:00:00", 0);
+        fflush(log_fp);
+
+        CHECK(status == 0, "status is 0: normal-length name formats fine, and pruning against the (empty) inventory has nothing to do");
+        CHECK(buf != NULL && strstr(buf, "Created=pool/normal@p_2026-01-01_00:00:00") != NULL,
+              "the Created= line uses the correctly-formatted, non-truncated snapshot name");
+
+        fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
     printf("================================\n");
     printf("RESULTS: %d checks run, %d failed\n", g_tests_run, g_tests_failed);
     printf("================================\n");
