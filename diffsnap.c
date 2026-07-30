@@ -11,7 +11,7 @@
 #include <ctype.h>
 #include <sys/wait.h>
 #include <sys/file.h>
-#include <sys/select.h>
+#include <poll.h>
 
 #ifndef CONF_PATH
 #define CONF_PATH "/usr/local/etc/diffsnap.conf"
@@ -127,8 +127,12 @@ static int copy_token(char *dst, size_t dst_size, const char *src) {
     return 0;
 }
 
+/* prefix is always non-empty here: its only caller copies a token that came
+ * straight from strtok_r(), which never yields an empty token (it skips
+ * runs of delimiters), and REQUIRE_TOKEN already goto'd away on a NULL
+ * token before we ever reach this call. An explicit empty-string check
+ * would therefore be dead code. */
 static int valid_prefix(const char *prefix) {
-    if (prefix[0] == '\0') return 0;
     for (size_t i = 0; prefix[i]; i++) {
         if (!isalnum((unsigned char)prefix[i]) && prefix[i] != '_' && prefix[i] != '-') return 0;
     }
@@ -152,11 +156,11 @@ static void log_msg(const char *fmt, ...) {
     struct tm tm_info;
     char timestamp[STR_BUF_SMALL];
     
-    if (localtime_r(&t, &tm_info) == NULL) {
-        snprintf(timestamp, sizeof(timestamp), "unknown-time");
-        if (fprintf(log_fp, "%s Error: localtime_r failed while formatting log timestamp\n", timestamp) < 0)
-            log_io_failed = 1;
-    } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
+    /* Either failure (can't get the local time, or can't format it) just
+     * falls back to a placeholder timestamp; either way we still write
+     * exactly one log line for this call, same as the success path. */
+    if (localtime_r(&t, &tm_info) == NULL ||
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
     if (fprintf(log_fp, "%s ", timestamp) < 0) log_io_failed = 1;
@@ -260,12 +264,24 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
     int out_open = out_reader && out_reader->fd >= 0;
     int err_open = err_reader && err_reader->fd >= 0;
     while (out_open || err_open) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        int max_fd = -1;
-        if (out_open) { FD_SET(out_reader->fd, &readfds); if (out_reader->fd > max_fd) max_fd = out_reader->fd; }
-        if (err_open) { FD_SET(err_reader->fd, &readfds); if (err_reader->fd > max_fd) max_fd = err_reader->fd; }
-        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) == -1) {
+        struct pollfd pfds[2];
+        stream_reader_t *pfd_reader[2];
+        nfds_t npfds = 0;
+        if (out_open) {
+            pfd_reader[npfds] = out_reader;
+            pfds[npfds].fd = out_reader->fd;
+            pfds[npfds].events = POLLIN;
+            pfds[npfds].revents = 0;
+            npfds++;
+        }
+        if (err_open) {
+            pfd_reader[npfds] = err_reader;
+            pfds[npfds].fd = err_reader->fd;
+            pfds[npfds].events = POLLIN;
+            pfds[npfds].revents = 0;
+            npfds++;
+        }
+        if (poll(pfds, npfds, -1) == -1) {
             if (errno == EINTR) continue;
             if (out_open) {
                 out_reader->failed = 1;
@@ -281,10 +297,12 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
             }
             break;
         }
-        stream_reader_t *readers[] = { out_reader, err_reader };
-        for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++) {
-            stream_reader_t *reader = readers[i];
-            if (!reader || reader->fd < 0 || !FD_ISSET(reader->fd, &readfds)) continue;
+        for (nfds_t i = 0; i < npfds; i++) {
+            stream_reader_t *reader = pfd_reader[i];
+            /* POLLIN, POLLHUP, and POLLERR all mean "read() won't block":
+             * a hangup or error still needs a read() call to observe EOF
+             * or the error, same as select() waking us on a dead fd. */
+            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             char buf[STR_BUF_XLARGE];
             ssize_t nread = read(reader->fd, buf, sizeof(buf));
             if (nread > 0) {
@@ -671,6 +689,17 @@ static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
             write_idx++;
         }
     }
+    /* write_idx (and therefore rec_b->count below) can never reach 0 here.
+     * is_strict_descendant() only marks an item covered when some *other*
+     * item in the set is a strict ancestor, which requires a strictly
+     * shorter dataset name. We entered with rec_b->count > 0, so the
+     * item(s) with the minimum dataset-name length in the set have no
+     * candidate ancestor (nothing in the set is shorter, and equal-length
+     * items can never be ancestor/descendant of each other) -- they can
+     * never be marked covered. At least one item therefore always
+     * survives, so rec_b->count is always >= 1 past this point, and the
+     * `malloc(rec_b->count * sizeof(order_entry_t))` below is never a
+     * malloc(0). */
     rec_b->count = write_idx;
     free(covered);
     batch_assign_duplicate_passes(rec_b);
@@ -990,7 +1019,14 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
     int status = 0;
     for (size_t i = 0; i < batch->count; i++) {
         char snap_name[STR_BUF_XLARGE];
-        snprintf(snap_name, sizeof(snap_name), "%s@%s_%s", batch->items[i].dataset, batch->items[i].prefix, snap_time);
+        int sn_rc = snprintf(snap_name, sizeof(snap_name), "%s@%s_%s",
+                              batch->items[i].dataset, batch->items[i].prefix, snap_time);
+        if (sn_rc < 0 || (size_t)sn_rc >= sizeof(snap_name)) {
+            log_msg("Error: Failed to format %ssnapshot name for %s",
+                     recursive ? "recursive " : "", batch->items[i].dataset);
+            status = 1;
+            continue;
+        }
         if (batch->items[i].snap_failed) {
             if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
             if (!inventory_contains(inventory, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
@@ -1114,10 +1150,20 @@ int main(int argc, char *argv[]) {
     }
     if (std_b.count + rec_b.count > 0) {
         /* Only fetch metrics -- and only for the roots actually due this
-         * run -- when something is actually due. Scoping to exact due
-         * roots (not the whole pool) and skipping the call entirely when
-         * nothing's due both follow from the same idea: don't pay for
-         * `zfs get written` data nothing will use. */
+         * run -- when something is actually due. Skipping the call
+         * entirely when nothing's due, and scoping it to exact due roots
+         * when something is, both follow from the same idea: don't pay for
+         * `zfs get written` data nothing will use.
+         *
+         * "Scoped" below means the call adds "-r" plus one dataset
+         * argument per due root: `zfs get -r ... written root1 root2 ...`,
+         * so ZFS only walks those roots' subtrees. "Unscoped" means the
+         * call has no "-r" and no dataset arguments at all, so ZFS
+         * defaults to reporting `written` for every dataset in every
+         * imported pool on the system -- not "the whole pool" in the
+         * sense of one pool, but literally everything. Unscoped is only
+         * the fallback used when the due roots' own names wouldn't fit
+         * the argv byte budget (see use_scoped below). */
         root_list_t due_roots = { NULL, 0, 0 };
         if (collect_due_roots(&due_roots, &std_b, &rec_b) != 0) {
             log_msg("Error: Failed to determine dataset roots for metrics fetch");
@@ -1127,11 +1173,12 @@ int main(int argc, char *argv[]) {
         size_t roots_bytes = 0;
         for (size_t i = 0; i < due_roots.count; i++) roots_bytes += strlen(due_roots.roots[i]) + 1;
         /* Reuse the same byte budget as snapshot-batch chunking: if the
-         * due roots' names alone would risk an overlong command line,
-         * fall back to the unscoped call (today's behavior) rather than
-         * trying to chunk `zfs get` -- there's no less-granular substitute
-         * to chunk down to the way there is for `zfs snapshot`, so falling
-         * back to the thing that already works is strictly simpler. */
+         * due roots' names alone would risk an overlong command line for
+         * the scoped call, fall back to the unscoped call (no "-r", no
+         * dataset arguments, queries every dataset) rather than trying to
+         * chunk `zfs get` -- there's no less-granular substitute to chunk
+         * down to the way there is for `zfs snapshot`, so falling back to
+         * the thing that already works is strictly simpler. */
         int use_scoped = (roots_bytes <= ARGV_BYTES_CAP);
 
         size_t fixed_argc = use_scoped ? 10 : 9; /* "-r" only present when scoped */
