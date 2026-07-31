@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,8 @@
 #define STR_BUF_XLARGE 512
 
 #define EXIT_EXEC_FAILED 127
+
+static_assert(sizeof(void *) == 8, "diffsnap requires a 64-bit architecture");
 
 #define REQUIRE_TOKEN(err_msg) \
     do { \
@@ -369,7 +372,7 @@ static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler
             if (dup2(out_pfd[1], STDOUT_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
             close(out_pfd[0]); close(out_pfd[1]);
         } else {
-            int devnull = open("/dev/null", O_WRONLY);
+            int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
             if (devnull == -1 || dup2(devnull, STDOUT_FILENO) == -1) _exit(EXIT_EXEC_FAILED);
             close(devnull);
         }
@@ -405,6 +408,9 @@ static int exec_cmd_stream(const char *const argv[], line_handler_t handler, voi
  * valid, usable output for every other root. Rejecting the whole result in
  * that case would turn "one typo logged" into "entire run aborted" --
  * worse than the unscoped call's behavior it's meant to optimize.
+ * Command-level failures are tolerated only when their stdout remains valid
+ * and parseable; malformed stdout is a protocol violation that causes the
+ * command to fail through its line handler.
  */
 static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t handler, void *data) {
     exec_result_t r = exec_cmd_stream_core(argv, handler, data);
@@ -924,7 +930,10 @@ static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t
     size_t total = std_b->count + rec_b->count;
     if (total == 0) return 0;
     root_list_t roots = { NULL, 0, 0 };
-    if (collect_due_roots(&roots, std_b, rec_b) != 0) return -1;
+    if (collect_due_roots(&roots, std_b, rec_b) != 0) {
+        root_list_free(&roots);
+        return -1;
+    }
     size_t roots_bytes = 0;
     for (size_t i = 0; i < roots.count; i++) roots_bytes += strlen(roots.roots[i]) + 1;
 
@@ -1044,7 +1053,12 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
         }
         if (batch->items[i].snap_failed) {
             if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
-            if (!inventory_contains(inventory, snap_name)) { log_msg("Error: %sSnapshot not created: %s", recursive ? "Recursive " : "", snap_name); continue; }
+            if (!inventory_contains(inventory, snap_name)) {
+                log_msg("Error: %sSnapshot not created: %s; pruning skipped for dataset '%s' with prefix '%s'",
+                        recursive ? "Recursive " : "", snap_name,
+                        batch->items[i].dataset, batch->items[i].prefix);
+                continue;
+            }
         }
         char h_bytes[STR_BUF_SMALL];
         format_bytes(batch->items[i].written, h_bytes, sizeof(h_bytes));
@@ -1121,7 +1135,7 @@ int main(int argc, char *argv[]) {
     while (getline(&line, &line_cap, conf) != -1) {
         trim_trailing_whitespace(line);
         if (line[0] == '\0' || line[0] == '#') continue;
-        if (strstr(line, ",,") != NULL) {
+        if (line[0] == ',' || strstr(line, ",,") != NULL) {
             log_msg("Error: Config error: adjacent comma delimiters");
             global_status = 1;
             continue;
