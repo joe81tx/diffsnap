@@ -160,9 +160,7 @@ static int date_stamp_like(const char *s) {
     for (size_t i = 0; i < sizeof(digit_pos) / sizeof(digit_pos[0]); i++) {
         if (!isdigit((unsigned char)s[digit_pos[i]])) return 0;
     }
-    /* Keep recognizing pre-offset names so upgrading diffsnap does not
-     * strand existing snapshots outside retention management. */
-    if (len == 24 && ((s[19] != '+' && s[19] != '-') ||
+    if (len == 24 && ((s[19] != 'p' && s[19] != '-') ||
                       !isdigit((unsigned char)s[20]) || !isdigit((unsigned char)s[21]) ||
                       !isdigit((unsigned char)s[22]) || !isdigit((unsigned char)s[23]))) return 0;
     return 1;
@@ -1245,6 +1243,9 @@ int main(int argc, char *argv[]) {
      * intervals that divide 60 evenly avoid additional hour-boundary skips
      * caused by the scheduler's interval arithmetic. */
     if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
+    /* ZFS snapshot names reject '+'. Preserve the offset's sign while
+     * encoding a positive one as 'p' (for example, p0500). */
+    if (snap_time[19] == '+') snap_time[19] = 'p';
     
     if (create_batch_snapshots(&std_b, snap_time, 0) != 0) global_status = 1;
     if (create_batch_snapshots(&rec_b, snap_time, 1) != 0) global_status = 1;

@@ -773,8 +773,12 @@ int main(void) {
         CHECK(valid_dataset("pool//child") == 0, "repeated separators are rejected");
         CHECK(valid_dataset("pool/child/") == 0, "a trailing separator is rejected");
         CHECK(valid_dataset("pool/child$") == 0, "characters outside the allowed set are rejected");
+        CHECK(date_stamp_like("2026-11-01_01:30:00p0500") == 1,
+              "the sanitized positive offset used in new snapshot names is accepted for pruning");
+        CHECK(date_stamp_like("2026-11-01_01:30:00+0500") == 0,
+              "an invalid plus-sign offset is rejected");
         CHECK(date_stamp_like("2026-11-01_01:30:00-0500") == 1,
-              "the offset-bearing timestamp used in new snapshot names is accepted for pruning");
+              "negative offsets remain accepted for pruning");
         CHECK(date_stamp_like("2026-11-01_01:30:00-05x0") == 0,
               "a malformed timezone offset is rejected");
 

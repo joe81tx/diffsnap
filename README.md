@@ -83,8 +83,11 @@ diffsnap
 ```text
 dataset,interval_minutes,retention,prefix,recursive,min_bytes
 ```
-Snapshots will be named `dataset@prefix_date_time±HHMM`, where the UTC offset
+Snapshots will be named `dataset@prefix_date_timepHHMM` or
+`dataset@prefix_date_time-HHMM`, where the UTC offset
 keeps repeated local times during the autumn DST transition distinct.
+Positive offsets use `p` in place of `+`, which ZFS does not permit in a
+snapshot name.
 
 Fields:
 
