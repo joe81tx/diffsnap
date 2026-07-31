@@ -99,7 +99,7 @@ static void print_help(const char *progname) {
         "  interval_minutes  Minutes between snapshots. Intervals carry over hour boundaries and reset at midnight\n"
         "  retention         Number of matching snapshots to keep\n"
         "  prefix            Snapshot prefix using letters, numbers, '_' or '-'. Unique values prevent pruning snapshots from outside diffsnap\n"
-        "  recursive         yes or no\n"
+        "  recursive         yes or no. Yes: written bytes = parent + children; parent overrides configured child with same prefix\n"
         "  min_bytes         Minimum written bytes before snapshotting. Try 1000000 to limit unwanted snapshots from small metadata changes\n"
         "\n"
         "Example intervals:\n"
