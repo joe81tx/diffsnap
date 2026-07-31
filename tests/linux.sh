@@ -103,6 +103,7 @@ echo "== 1. Crash regression: malformed lines must not segfault or die from any 
 #  rejected, not silently accepted with a leading-space prefix)
 cat > "$CONF" <<CONF
 badline
+,${DS}/a,1,2,t1,no,0
 $DS/a,notanumber,2,t1,no,0
 $DS/a,1,0,t1,no,0
 $DS/a,1,2,bad!prefix,no,0
@@ -114,7 +115,7 @@ CONF
 "$BIN"; rc=$?
 if [ $rc -ge 128 ]; then bad "process died from signal on malformed lines (exit $rc, signal $((rc-128)))"
 else ok "no fatal signal on malformed lines (exit $rc)"; fi
-grep -c "Config error" "$LOG" | grep -q "^8$" && ok "all 8 malformed lines logged" || bad "malformed line count mismatch: $(grep -c 'Config error' "$LOG")"
+grep -c "Config error" "$LOG" | grep -q "^9$" && ok "all 9 malformed lines logged" || bad "malformed line count mismatch: $(grep -c 'Config error' "$LOG")"
 archive_log "1 - crash regression"
 
 echo "== 2. Feature matrix: valid config =="
