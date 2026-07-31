@@ -108,6 +108,8 @@ tank/media,5,100,diffsnap,no,1000000
 rpool/USERDATA,1440,14,daily,yes,1
 ```
 
+Changing or removing configuration entries may leave existing snapshots behind, you should delete them manually if desired.
+
 ## Scheduling
 `diffsnap` does not run as a continuous background service. It relies on an external system scheduler such as a cron job on FreeBSD or a systemd timer on Linux. `diffsnap` only evaluates datasets when it is invoked. If the scheduler doesn't run `diffsnap` at the expected interval time, that evaluation is skipped. The system scheduler interval must divide evenly into your smallest dataset interval_minutes.
 
