@@ -98,7 +98,7 @@ Fields:
 - `recursive`: `yes` or `no`. If `yes` and the same `prefix` is used for a configured child the parent takes precedence. If recursive, written bytes = total of parent + children. 
 - `min_bytes`: minimum written bytes needed before snapshotting. 1000000 is a good starting point to avoid metadata changes creating unwanted snapshots. Using 1 instead captures any change.
 
-Blank lines and lines beginning with `#` are ignored.
+Blank lines and lines where the first character is `#` are ignored.
 
 Example config:  
 
