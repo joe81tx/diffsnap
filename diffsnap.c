@@ -885,7 +885,8 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
         if (seen_root) continue;
         /* A pass contains no duplicate target dataset and no recursive
          * ancestor/descendant overlap. ZFS rejects both combinations in one
-         * invocation, so splitting passes is what lets all valid entries run. */
+         * invocation 'cannot create snapshots : multiple snapshots of same
+         * fs not allowed' so multiple passes are required. */
         size_t pass_count = batch_root_pass_count(ctx, ctx->items[i].dataset);
         for (size_t pass = 0; pass < pass_count; pass++)
             if (zfs_snapshot_batch_root_pass(ctx, recursive, timestamp, ctx->items[i].dataset, pass) != 0) status = -1;
