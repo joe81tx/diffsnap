@@ -95,7 +95,7 @@ static void print_help(const char *progname) {
         "  dataset,interval_minutes,retention,prefix,recursive,min_bytes\n"
         "\n"
         "Field notes:\n"
-        "  dataset           ZFS dataset name\n"
+        "  dataset           ZFS dataset name (starts with a letter; no repeated/trailing '/')\n"
         "  interval_minutes  Minutes between snapshots. Intervals carry over hour boundaries and reset at midnight\n"
         "  retention         Number of matching snapshots to keep\n"
         "  prefix            Snapshot prefix using letters, numbers, '_' or '-'. Unique values prevent pruning snapshots from outside diffsnap\n"
@@ -127,11 +127,10 @@ static int copy_token(char *dst, size_t dst_size, const char *src) {
     return 0;
 }
 
-/* prefix is always non-empty here: its only caller copies a token that came
- * straight from strtok_r(), which never yields an empty token (it skips
- * runs of delimiters), and REQUIRE_TOKEN already goto'd away on a NULL
- * token before we ever reach this call. An explicit empty-string check
- * would therefore be dead code. */
+/* prefix is always non-empty here: config parsing rejects adjacent commas
+ * before strtok_r() can skip an empty field, and REQUIRE_TOKEN already
+ * goto'd away on a NULL token before we ever reach this call. An explicit
+ * empty-string check would therefore be dead code. */
 static int valid_prefix(const char *prefix) {
     for (size_t i = 0; prefix[i]; i++) {
         if (!isalnum((unsigned char)prefix[i]) && prefix[i] != '_' && prefix[i] != '-') return 0;
@@ -139,12 +138,33 @@ static int valid_prefix(const char *prefix) {
     return 1;
 }
 
+/* Dataset components may use the ZFS separator '/', but a name must begin
+ * with a letter and may not end in, or contain two consecutive, separators.
+ * Spaces are intentionally permitted because ZFS permits them in dataset
+ * names and the command paths pass names as separate argv entries. */
+static int valid_dataset(const char *dataset) {
+    if (!isalpha((unsigned char)dataset[0])) return 0;
+    for (size_t i = 0; dataset[i]; i++) {
+        unsigned char c = (unsigned char)dataset[i];
+        if (!isalnum(c) && c != '_' && c != '.' && c != ':' && c != ' ' && c != '-' && c != '/') return 0;
+        if (c == '/' && (dataset[i + 1] == '\0' || dataset[i + 1] == '/')) return 0;
+    }
+    return 1;
+}
+
 static int date_stamp_like(const char *s) {
     static const int digit_pos[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
-    if (strlen(s) != 19 || s[4] != '-' || s[7] != '-' || s[10] != '_' || s[13] != ':' || s[16] != ':') return 0;
+    size_t len = strlen(s);
+    if (len != 19 && len != 24) return 0;
+    if (s[4] != '-' || s[7] != '-' || s[10] != '_' || s[13] != ':' || s[16] != ':') return 0;
     for (size_t i = 0; i < sizeof(digit_pos) / sizeof(digit_pos[0]); i++) {
         if (!isdigit((unsigned char)s[digit_pos[i]])) return 0;
     }
+    /* Keep recognizing pre-offset names so upgrading diffsnap does not
+     * strand existing snapshots outside retention management. */
+    if (len == 24 && ((s[19] != '+' && s[19] != '-') ||
+                      !isdigit((unsigned char)s[20]) || !isdigit((unsigned char)s[21]) ||
+                      !isdigit((unsigned char)s[22]) || !isdigit((unsigned char)s[23]))) return 0;
     return 1;
 }
 
@@ -194,10 +214,10 @@ static void format_bytes(long long bytes, char *buf, size_t buf_size) {
         snprintf(buf, buf_size, "0");
         return;
     }
-    const char *units[] = {"", "K", "M", "G", "T", "P"};
+    const char *units[] = {"", "K", "M", "G", "T", "P", "E"};
     int i = 0;
     double d_bytes = (double)bytes;
-    while (d_bytes >= 1024.0 && i < 5) {
+    while (d_bytes >= 1024.0 && i < 6) {
         d_bytes /= 1024.0;
         i++;
     }
@@ -397,6 +417,8 @@ static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t hand
      * per-root lookup miss. Treating it as lenient-success would silently
      * accept zero metrics and make every due dataset get logged as
      * "Configured dataset not found" instead of one clear top-level error.
+     * If ZFS ever adopts exit status 127 itself, this convention would
+     * mistakenly classify that genuine ZFS failure as an execv failure.
      */
     if (r.child_status == EXIT_EXEC_FAILED) return -1;
     return 0;
@@ -857,6 +879,9 @@ static int zfs_snapshot_batch(batch_ctx_t *ctx, int recursive, const char *times
             }
         }
         if (seen_root) continue;
+        /* A pass contains no duplicate target dataset and no recursive
+         * ancestor/descendant overlap. ZFS rejects both combinations in one
+         * invocation, so splitting passes is what lets all valid entries run. */
         size_t pass_count = batch_root_pass_count(ctx, ctx->items[i].dataset);
         for (size_t pass = 0; pass < pass_count; pass++)
             if (zfs_snapshot_batch_root_pass(ctx, recursive, timestamp, ctx->items[i].dataset, pass) != 0) status = -1;
@@ -889,28 +914,6 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
     return 0;
 }
 
-static size_t distinct_roots_from_datasets(const char *const *datasets, size_t count, char *root_buf, size_t root_buf_size) {
-    size_t distinct = 0;
-    const char *first_root_dataset = NULL;
-    for (size_t i = 0; i < count; i++) {
-        int seen = 0;
-        for (size_t j = 0; j < i; j++) {
-            if (same_zfs_root(datasets[i], datasets[j])) { seen = 1; break; }
-        }
-        if (!seen) {
-            distinct++;
-            if (distinct == 1) first_root_dataset = datasets[i];
-        }
-    }
-    if (distinct == 1) {
-        size_t len = zfs_root_len(first_root_dataset);
-        if (len >= root_buf_size) return 0;
-        memcpy(root_buf, first_root_dataset, len);
-        root_buf[len] = '\0';
-    }
-    return distinct;
-}
-
 /*
  * Loads every snapshot relevant to this run exactly once, covering both the
  * standard and recursive batches together (items 5 and 6). Sorted newest-
@@ -922,24 +925,29 @@ static size_t distinct_roots_from_datasets(const char *const *datasets, size_t c
 static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t *std_b, const batch_ctx_t *rec_b) {
     size_t total = std_b->count + rec_b->count;
     if (total == 0) return 0;
-    const char **datasets = malloc(total * sizeof(char *));
-    if (!datasets) return -1;
+    root_list_t roots = { NULL, 0, 0 };
+    if (collect_due_roots(&roots, std_b, rec_b) != 0) return -1;
+    size_t roots_bytes = 0;
+    for (size_t i = 0; i < roots.count; i++) roots_bytes += strlen(roots.roots[i]) + 1;
+
+    /* Match the scoped `zfs get` strategy: list every relevant root in one
+     * command, unless the root arguments alone would exceed our argv budget.
+     * The fallback deliberately omits all roots and lists every pool. */
+    int use_scoped = (roots_bytes <= ARGV_BYTES_CAP);
+    size_t fixed_argc = use_scoped ? 10 : 9; /* "-r" only when roots are supplied */
+    size_t argc = fixed_argc + (use_scoped ? roots.count : 0) + 1;
+    const char **argv = malloc(argc * sizeof(*argv));
+    if (!argv) { root_list_free(&roots); return -1; }
     size_t idx = 0;
-    for (size_t i = 0; i < std_b->count; i++) datasets[idx++] = std_b->items[i].dataset;
-    for (size_t i = 0; i < rec_b->count; i++) datasets[idx++] = rec_b->items[i].dataset;
-
-    char root[STR_BUF_LARGE];
-    size_t distinct = distinct_roots_from_datasets(datasets, total, root, sizeof(root));
-    free(datasets);
-
-    int rc;
-    if (distinct == 1) {
-        const char *const argv[] = {ZFS_PATH, "list", "-H", "-r", "-t", "snapshot", "-o", "name", "-S", "creation", root, NULL};
-        rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
-    } else {
-        const char *const argv[] = {ZFS_PATH, "list", "-H", "-t", "snapshot", "-o", "name", "-S", "creation", NULL};
-        rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
-    }
+    argv[idx++] = ZFS_PATH; argv[idx++] = "list"; argv[idx++] = "-H";
+    if (use_scoped) argv[idx++] = "-r";
+    argv[idx++] = "-t"; argv[idx++] = "snapshot"; argv[idx++] = "-o";
+    argv[idx++] = "name"; argv[idx++] = "-S"; argv[idx++] = "creation";
+    if (use_scoped) for (size_t i = 0; i < roots.count; i++) argv[idx++] = roots.roots[i];
+    argv[idx] = NULL;
+    int rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
+    free(argv);
+    root_list_free(&roots);
     if (rc != 0) {
         name_list_free(list);
         return -1;
@@ -1115,11 +1123,17 @@ int main(int argc, char *argv[]) {
     while (getline(&line, &line_cap, conf) != -1) {
         trim_trailing_whitespace(line);
         if (line[0] == '\0' || line[0] == '#') continue;
+        if (strstr(line, ",,") != NULL) {
+            log_msg("Error: Config error: adjacent comma delimiters");
+            global_status = 1;
+            continue;
+        }
         char dataset[STR_BUF_LARGE] = {0}, prefix[STR_BUF_MED] = {0}, recursive_str[STR_BUF_SMALL] = {0};
         long long interval_mins = 0, retention_val = 0, min_bytes = 0;
         char *endptr, *saveptr = NULL, *token = strtok_r(line, ",", &saveptr);
         if (!token) continue;
         if (copy_token(dataset, sizeof(dataset), token) != 0) { log_msg("Error: Config error: dataset name too long"); global_status = 1; continue; }
+        if (!valid_dataset(dataset)) { log_msg("Error: Config error: invalid dataset name '%s'", dataset); global_status = 1; continue; }
         REQUIRE_TOKEN("missing interval field"); errno = 0; interval_mins = strtoll(token, &endptr, 10);
         if (errno == ERANGE || *endptr != '\0' || interval_mins <= 0) {
             log_msg("Error: Config error for %s: invalid interval '%s'", dataset, token); global_status = 1; continue;
@@ -1225,7 +1239,12 @@ int main(int argc, char *argv[]) {
     if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
     batch_assign_duplicate_passes(&std_b);
     char snap_time[STR_BUF_SMALL];
-    if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
+    /* Local wall-clock time repeats during the autumn DST change. The UTC
+     * offset makes those otherwise identical seconds produce distinct names.
+     * The spring transition can skip up to an hour of wall-clock intervals;
+     * intervals that divide 60 evenly avoid additional hour-boundary skips
+     * caused by the scheduler's interval arithmetic. */
+    if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
     
     if (create_batch_snapshots(&std_b, snap_time, 0) != 0) global_status = 1;
     if (create_batch_snapshots(&rec_b, snap_time, 1) != 0) global_status = 1;

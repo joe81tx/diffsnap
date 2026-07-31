@@ -83,11 +83,12 @@ diffsnap
 ```text
 dataset,interval_minutes,retention,prefix,recursive,min_bytes
 ```
-Snapshots will be named `dataset@prefix_date_time`
+Snapshots will be named `dataset@prefix_date_time±HHMM`, where the UTC offset
+keeps repeated local times during the autumn DST transition distinct.
 
 Fields:
 
-- `dataset`: ZFS dataset name.
+- `dataset`: ZFS dataset name. It must begin with a letter; allowed characters are letters, numbers, `_`, `.`, `:`, spaces, `-`, and `/`. A `/` cannot be repeated or trailing.
 - `interval_minutes`: Minutes between snapshots - intervals carry over hour boundaries and reset at midnight. 50 evaluates at 00:00 00:50 01:40... 23:20 00:00 (not 00:10). Values greater than 1439 only match at midnight.
 - `retention`: number of matching snapshots to keep.
 - `prefix`: snapshot prefix using letters, numbers, `_`, or `-`. To avoid pruning snapshots created outside of `diffsnap` make sure this is unique.

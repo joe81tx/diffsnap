@@ -730,6 +730,9 @@ int main(void) {
 
         format_bytes(1024LL * 1024 * 1024 * 1024 * 1024, buf, sizeof(buf));
         CHECK(strcmp(buf, "1.00P") == 0, "the largest unit (P) is used for petabyte-scale values, with no further division past it");
+
+        format_bytes(1024LL * 1024 * 1024 * 1024 * 1024 * 1024, buf, sizeof(buf));
+        CHECK(strcmp(buf, "1.00E") == 0, "exactly 1 EiB formats with the new exabyte unit");
         printf("\n");
     }
 
@@ -762,27 +765,60 @@ int main(void) {
         printf("\n");
     }
 
-    printf("== Test 29: distinct_roots_from_datasets counts distinct roots correctly and enforces its output buffer size ==\n");
+    printf("== Test 29: valid_dataset enforces the configured naming grammar ==\n");
     {
-        const char *multi_root[] = { "poolA/x", "poolB/y", "poolC/z" };
-        char root_buf[STR_BUF_LARGE];
-        size_t distinct = distinct_roots_from_datasets(multi_root, 3, root_buf, sizeof(root_buf));
-        CHECK(distinct == 3, "three datasets under three different pools are counted as three distinct roots");
+        CHECK(valid_dataset("pool/child-set.1:two three") == 1,
+              "letters, numbers, underscore, dot, colon, space, hyphen, and single separators are accepted");
+        CHECK(valid_dataset("1pool/child") == 0, "a dataset must start with a letter");
+        CHECK(valid_dataset("pool//child") == 0, "repeated separators are rejected");
+        CHECK(valid_dataset("pool/child/") == 0, "a trailing separator is rejected");
+        CHECK(valid_dataset("pool/child$") == 0, "characters outside the allowed set are rejected");
+        CHECK(date_stamp_like("2026-11-01_01:30:00-0500") == 1,
+              "the offset-bearing timestamp used in new snapshot names is accepted for pruning");
+        CHECK(date_stamp_like("2026-11-01_01:30:00-05x0") == 0,
+              "a malformed timezone offset is rejected");
 
-        const char *same_root[] = { "poolA/x", "poolA/y", "poolA/z/nested" };
-        distinct = distinct_roots_from_datasets(same_root, 3, root_buf, sizeof(root_buf));
-        CHECK(distinct == 1, "datasets that share a single top-level pool are counted as one distinct root regardless of nesting depth");
-        CHECK(strcmp(root_buf, "poolA") == 0, "the single distinct root's name is written into root_buf");
+        FILE *fzf = fopen(ZFS_PATH, "w");
+        CHECK(fzf != NULL, "fake zfs script created for inventory-root scoping tests");
+        if (fzf) {
+            fprintf(fzf, "#!/bin/sh\nprintf '%%s\\n' \"$@\" > /tmp/diffsnap_inventory_args\n");
+            fclose(fzf);
+            chmod(ZFS_PATH, 0755);
 
-        /* Buffer too small to hold the single distinct root's name: the
-         * function must fail closed (return 0) instead of silently
-         * truncating the root name it writes into the caller's buffer. */
-        const char *long_root[] = { "averyverylongpoolname/x", "averyverylongpoolname/y" };
-        char tiny_buf[4];
-        char sentinel = tiny_buf[0] = 'X';
-        distinct = distinct_roots_from_datasets(long_root, 2, tiny_buf, sizeof(tiny_buf));
-        CHECK(distinct == 0, "when the single distinct root's name does not fit in root_buf, the function reports 0 distinct roots instead of truncating it");
-        CHECK(tiny_buf[0] == sentinel, "root_buf is left completely untouched when the root name doesn't fit");
+            batch_ctx_t std_b = {0}, rec_b = {0};
+            batch_add(&std_b, "poolA/child", "p", 1, 0, 0);
+            batch_add(&rec_b, "poolB/child", "p", 1, 0, 0);
+            name_list_t inventory = {0};
+            CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
+                  "inventory loading succeeds for multiple roots through the fake zfs command");
+            FILE *args_fp = fopen("/tmp/diffsnap_inventory_args", "r");
+            char args[1024] = {0};
+            if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
+            CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA\n") != NULL && strstr(args, "poolB\n") != NULL,
+                  "multi-root inventory list is scoped recursively to every distinct root");
+            CHECK(strstr(args, "poolA/child") == NULL && strstr(args, "poolB/child") == NULL,
+                  "inventory list receives roots, not individual configured descendants");
+            name_list_free(&inventory);
+            batch_free(&std_b); batch_free(&rec_b);
+            std_b = (batch_ctx_t){0};
+            rec_b = (batch_ctx_t){0};
+
+            for (size_t i = 0; i < 600; i++) {
+                char root[STR_BUF_LARGE];
+                snprintf(root, sizeof(root), "p%03zu%.*s", i, 250, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+                batch_add(&std_b, root, "p", 1, 0, 0);
+            }
+            CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
+                  "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
+            args_fp = fopen("/tmp/diffsnap_inventory_args", "r");
+            memset(args, 0, sizeof(args));
+            if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
+            CHECK(strstr(args, "-r\n") == NULL && strstr(args, "p000") == NULL,
+                  "oversized multi-root inventory call falls back to unscoped zfs list");
+            name_list_free(&inventory);
+            batch_free(&std_b); batch_free(&rec_b);
+            unlink(ZFS_PATH);
+        }
         printf("\n");
     }
 
@@ -874,9 +910,9 @@ int main(void) {
         /*
          * The explicit `if (prefix[0] == '\0') return 0;` guard was
          * removed as unreachable: valid_prefix's only caller in main()
-         * copies a token straight from strtok_r(), which never yields an
-         * empty token (it skips runs of delimiters), and REQUIRE_TOKEN
-         * already goto's away on a NULL token before that call. Calling
+         * receives only lines whose adjacent commas were rejected before
+         * strtok_r() could skip an empty token, and REQUIRE_TOKEN already
+         * goto's away on a NULL token before that call. Calling
          * valid_prefix("") directly here (something the real program
          * never does) now returns 1, since guarding against an empty
          * prefix is entirely the caller's responsibility going forward.
