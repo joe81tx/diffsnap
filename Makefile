@@ -1,4 +1,5 @@
 PROG = diffsnap
+TEST_PROG = test-bin
 SRCS = diffsnap.c
 
 OS_NAME != uname -s
@@ -47,14 +48,14 @@ all: $(PROG)
 $(PROG): $(SRCS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 
-tests/test: tests/test.c diffsnap.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -o $@ tests/test.c
+$(TEST_PROG): test.c diffsnap.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -o $@ test.c
 
-test: tests/test
-	./tests/test
+test: $(TEST_PROG)
+	./$(TEST_PROG)
 
-chunktest: tests/test
-	./tests/test --chunk
+chunktest: $(TEST_PROG)
+	./$(TEST_PROG) --chunk
 
 install: $(PROG)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
@@ -89,4 +90,4 @@ uninstall:
 	fi
 
 clean:
-	rm -f $(PROG) *.o tests/test
+	rm -f $(PROG) $(TEST_PROG) *.o
