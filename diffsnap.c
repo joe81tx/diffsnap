@@ -130,10 +130,6 @@ static int copy_token(char *dst, size_t dst_size, const char *src) {
     return 0;
 }
 
-/* prefix is always non-empty here: config parsing rejects adjacent commas
- * before strtok_r() can skip an empty field, and REQUIRE_TOKEN already
- * goto'd away on a NULL token before we ever reach this call. An explicit
- * empty-string check would therefore be dead code. */
 static int valid_prefix(const char *prefix) {
     for (size_t i = 0; prefix[i]; i++) {
         if (!isalnum((unsigned char)prefix[i]) && prefix[i] != '_' && prefix[i] != '-') return 0;
@@ -183,20 +179,35 @@ static void log_msg(const char *fmt, ...) {
      * line -- not as a second, separate log_fp write -- so an operator
      * still sees it was localtime_r that broke without log_msg() ever
      * doubling its own output for one call. */
-    int localtime_failed = 0;
+    int localtime_failed = 0, strftime_failed = 0;
     if (localtime_r(&t, &tm_info) == NULL) {
         localtime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
+        strftime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
     if (fprintf(log_fp, "%s ", timestamp) < 0) log_io_failed = 1;
     if (localtime_failed) {
         if (fprintf(log_fp, "[localtime_r failed, using fallback timestamp] ") < 0) log_io_failed = 1;
+    } else if (strftime_failed) {
+        if (fprintf(log_fp, "[strftime failed, using fallback timestamp] ") < 0) log_io_failed = 1;
     }
     if (vfprintf(log_fp, fmt, args) < 0) log_io_failed = 1;
     if (fprintf(log_fp, "\n") < 0) log_io_failed = 1;
     va_end(args);
+}
+
+/* These formats are shared by all snapshot construction and recursive
+ * coverage lookups, respectively, so their separators stay synchronized. */
+static int format_snapshot_name(char *dst, size_t dst_size, const char *dataset,
+                                const char *prefix, const char *timestamp) {
+    return snprintf(dst, dst_size, "%s@%s_%s", dataset, prefix, timestamp);
+}
+
+static void format_dataset_prefix_key(char *dst, size_t dst_size,
+                                      const char *dataset, const char *prefix) {
+    (void)snprintf(dst, dst_size, "%s\x1f%s", dataset, prefix);
 }
 
 /* Whether any write to the log file has failed since it was opened. */
@@ -238,8 +249,7 @@ static void name_list_free(name_list_t *list) {
 
 static int seen_set_add(seen_set_t *set, const char *dataset, const char *prefix) {
     char key[STR_BUF_LARGE + STR_BUF_MED + 2];
-    int n = snprintf(key, sizeof(key), "%s\x1f%s", dataset, prefix);
-    if (n < 0 || (size_t)n >= sizeof(key)) return -1;
+    format_dataset_prefix_key(key, sizeof(key), dataset, prefix);
     for (size_t i = 0; i < set->count; i++) {
         if (strcmp(set->keys[i], key) == 0) return 1;
     }
@@ -431,7 +441,11 @@ static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t hand
 static int handle_metric_line(const char *line, void *data) {
     metric_ctx_t *ctx = (metric_ctx_t *)data;
     char line_copy[STR_BUF_XLARGE];
-    strcpy(line_copy, line);
+    int line_len = snprintf(line_copy, sizeof(line_copy), "%s", line);
+    if (line_len < 0 || (size_t)line_len >= sizeof(line_copy)) {
+        log_msg("Error: Skipping oversized metric line");
+        return -1;
+    }
     char *saveptr = NULL;
     char *name = strtok_r(line_copy, "\t", &saveptr);
     char *value = strtok_r(NULL, "\t", &saveptr);
@@ -474,9 +488,12 @@ static int is_strict_descendant(const char *child, const char *parent);
  *
  * Returns 0 and sets *out_sum on success; -1 if the root itself is
  * missing/invalid.
+ * `zfs get` cannot emit duplicate dataset names in one invocation, so the
+ * metrics array needs no deduplication before its binary searches.
  */
 static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset, long long *out_sum) {
     metric_item_t key = {0};
+    assert(strlen(dataset) < sizeof(key.name));
     memcpy(key.name, dataset, strlen(dataset) + 1);
     metric_item_t *root = metrics->count ?
         bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
@@ -528,6 +545,7 @@ static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metric
             ok = (sum_subtree_written(metrics, ctx->items[i].dataset, &written) == 0);
         } else {
             metric_item_t key = {0};
+            assert(strlen(ctx->items[i].dataset) < sizeof(key.name));
             memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
             metric_item_t *found = metrics->count ?
                 bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
@@ -803,7 +821,8 @@ static int zfs_snapshot_exec_chunk(batch_ctx_t *ctx, int recursive, const char *
     for (size_t k = 0; k < chunk_count; k++) {
         size_t i = indices[k];
         size_t remaining = chunk_bytes - (size_t)(offset - arena);
-        int written = snprintf(offset, remaining, "%s@%s_%s", ctx->items[i].dataset, ctx->items[i].prefix, timestamp);
+        int written = format_snapshot_name(offset, remaining, ctx->items[i].dataset,
+                                           ctx->items[i].prefix, timestamp);
         if (written < 0 || (size_t)written >= remaining) { free(arena); free(argv); batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
         argv[idx++] = offset; offset += written + 1;
     }
@@ -953,6 +972,8 @@ static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t
     argv[idx++] = "name"; argv[idx++] = "-S"; argv[idx++] = "creation";
     if (use_scoped) for (size_t i = 0; i < roots.count; i++) argv[idx++] = roots.roots[i];
     argv[idx] = NULL;
+    /* Unlike the pre-validation metrics fetch, this post-validation inventory
+     * is intentionally strict: every requested root must be listable. */
     int rc = exec_cmd_stream(argv, handle_snapshot_inventory_line, list);
     free(argv);
     root_list_free(&roots);
@@ -965,11 +986,10 @@ static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t
 
 static int is_recursively_covered(const char *dataset, const char *prefix, char **rec_keys, size_t rec_count) {
     char candidate[STR_BUF_LARGE];
-    if (copy_token(candidate, sizeof(candidate), dataset) != 0) return 0;
+    if (copy_token(candidate, sizeof(candidate), dataset) != 0) return -1;
     for (;;) {
         char key[STR_BUF_LARGE + STR_BUF_MED + 2];
-        int n = snprintf(key, sizeof(key), "%s\x1f%s", candidate, prefix);
-        if (n < 0 || (size_t)n >= sizeof(key)) return 0;
+        format_dataset_prefix_key(key, sizeof(key), candidate, prefix);
         if (name_index_contains(rec_keys, rec_count, key)) return 1;
         char *slash = strrchr(candidate, '/');
         if (!slash) return 0;
@@ -984,8 +1004,7 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     size_t built = 0;
     for (size_t i = 0; i < rec_b->count; i++) {
         char key[STR_BUF_LARGE + STR_BUF_MED + 2];
-        int n = snprintf(key, sizeof(key), "%s\x1f%s", rec_b->items[i].dataset, rec_b->items[i].prefix);
-        if (n < 0 || (size_t)n >= sizeof(key)) continue;
+        format_dataset_prefix_key(key, sizeof(key), rec_b->items[i].dataset, rec_b->items[i].prefix);
         if ((rec_keys[built] = strdup(key)) == NULL) {
             for (size_t j = 0; j < built; j++) free(rec_keys[j]);
             free(rec_keys);
@@ -996,7 +1015,13 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     qsort(rec_keys, built, sizeof(*rec_keys), compare_names);
     size_t write_idx = 0;
     for (size_t i = 0; i < std_b->count; i++) {
-        if (is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built)) {
+        int covered = is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built);
+        if (covered < 0) {
+            for (size_t j = 0; j < built; j++) free(rec_keys[j]);
+            free(rec_keys);
+            return -1;
+        }
+        if (covered) {
             log_msg("Skipping %s: covered by a recursive ancestor with prefix '%s'",
                      std_b->items[i].dataset, std_b->items[i].prefix);
             free(std_b->items[i].dataset);
@@ -1044,14 +1069,18 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
     int status = 0;
     for (size_t i = 0; i < batch->count; i++) {
         char snap_name[STR_BUF_XLARGE];
-        int sn_rc = snprintf(snap_name, sizeof(snap_name), "%s@%s_%s",
-                              batch->items[i].dataset, batch->items[i].prefix, snap_time);
+        int sn_rc = format_snapshot_name(snap_name, sizeof(snap_name),
+                                         batch->items[i].dataset, batch->items[i].prefix, snap_time);
         if (sn_rc < 0 || (size_t)sn_rc >= sizeof(snap_name)) {
             log_msg("Error: Failed to format %ssnapshot name for %s",
                      recursive ? "recursive " : "", batch->items[i].dataset);
             status = 1;
             continue;
         }
+        /* Pruning intentionally only considers configured batch items after
+         * this run confirms their target snapshot exists; unconfigured
+         * datasets and snapshot attempts we could not confirm must not prune
+         * existing snapshots. */
         if (batch->items[i].snap_failed) {
             if (!inventory_ok) { log_msg("Error: Unable to verify %ssnapshot exists: %s", recursive ? "recursive " : "", snap_name); continue; }
             if (!inventory_contains(inventory, snap_name)) {
@@ -1121,13 +1150,15 @@ int main(int argc, char *argv[]) {
         early_fail("%s: failed to open log file %s: %s", progname, LOG_PATH, strerror(saved_errno));
         ret_code = 1; goto cleanup;
     }
-    setvbuf(log_fp, NULL, _IOLBF, 0);
+    if (setvbuf(log_fp, NULL, _IOLBF, 0) != 0) {
+        fprintf(stderr, "%s: failed to enable line-buffered logging; continuing with fully-buffered logging\n", progname);
+    }
     conf = fopen(CONF_PATH, "re");
     if (!conf) {
         int saved_errno = errno;
         early_fail("%s: failed to open config file %s: %s", progname, CONF_PATH, strerror(saved_errno));
         log_msg("Error: failed to open config file %s: %s", CONF_PATH, strerror(saved_errno));
-        ret_code = 1; goto cleanup;
+        ret_code = global_status ? global_status : 1; goto cleanup;
     }
     time_t t = time(NULL); struct tm tm_info; 
     if (localtime_r(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
@@ -1182,7 +1213,7 @@ int main(int argc, char *argv[]) {
     int config_read_errno = errno;
     if (!feof(conf)) {
         log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(config_read_errno));
-        ret_code = 1; goto cleanup;
+        ret_code = global_status ? global_status : 1; goto cleanup;
     }
     if (std_b.count + rec_b.count > 0) {
         /* Only fetch metrics -- and only for the roots actually due this
@@ -1204,7 +1235,7 @@ int main(int argc, char *argv[]) {
         if (collect_due_roots(&due_roots, &std_b, &rec_b) != 0) {
             log_msg("Error: Failed to determine dataset roots for metrics fetch");
             root_list_free(&due_roots);
-            ret_code = 1; goto cleanup;
+            ret_code = global_status ? global_status : 1; goto cleanup;
         }
         size_t roots_bytes = 0;
         for (size_t i = 0; i < due_roots.count; i++) roots_bytes += strlen(due_roots.roots[i]) + 1;
@@ -1223,7 +1254,7 @@ int main(int argc, char *argv[]) {
         if (!m_argv) {
             log_msg("Error: Failed to allocate metrics command");
             root_list_free(&due_roots);
-            ret_code = 1; goto cleanup;
+            ret_code = global_status ? global_status : 1; goto cleanup;
         }
         size_t idx = 0;
         m_argv[idx++] = ZFS_PATH; m_argv[idx++] = "get"; m_argv[idx++] = "-H"; m_argv[idx++] = "-p";
@@ -1233,7 +1264,9 @@ int main(int argc, char *argv[]) {
         if (use_scoped) for (size_t i = 0; i < due_roots.count; i++) m_argv[idx++] = due_roots.roots[i];
         m_argv[idx] = NULL;
 
-        /* Scoped calls use the lenient exit-code handling: a single bad
+        /* Unlike the post-validation snapshot inventory (which is strict),
+         * this pre-validation metrics fetch is intentionally lenient.
+         * Scoped calls use the lenient exit-code handling: a single bad
          * root (typo, since-destroyed dataset) makes `zfs get` exit
          * nonzero even though it printed valid output for every other
          * root. The unscoped fallback never names a target that could be
@@ -1242,14 +1275,14 @@ int main(int argc, char *argv[]) {
                                    : exec_cmd_stream(m_argv, handle_metric_line, &metrics);
         free(m_argv);
         root_list_free(&due_roots);
-        if (fetch_rc != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = 1; goto cleanup; }
+        if (fetch_rc != 0) { log_msg("Error: Failed to read ZFS written metrics"); ret_code = global_status ? global_status : 1; goto cleanup; }
         if (metrics.count > 0) qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
 
         batch_filter_by_metrics(&std_b, &metrics, 0, &global_status);
         batch_filter_by_metrics(&rec_b, &metrics, 1, &global_status);
     }
-    if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = 1; goto cleanup; }
-    if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = 1; goto cleanup; }
+    if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { log_msg("Error: Failed to check recursive ancestor overlaps"); ret_code = global_status ? global_status : 1; goto cleanup; }
+    if (remove_recursive_overlaps(&std_b, &rec_b) != 0) { log_msg("Error: Failed to check recursive overlaps"); ret_code = global_status ? global_status : 1; goto cleanup; }
     batch_assign_duplicate_passes(&std_b);
     char snap_time[STR_BUF_SMALL];
     /* Local wall-clock time repeats during the autumn DST change. The UTC
@@ -1257,7 +1290,7 @@ int main(int argc, char *argv[]) {
      * The spring transition can skip up to an hour of wall-clock intervals;
      * intervals that divide 60 evenly avoid additional hour-boundary skips
      * caused by the scheduler's interval arithmetic. */
-    if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = 1; goto cleanup; }
+    if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = global_status ? global_status : 1; goto cleanup; }
     /* ZFS snapshot names reject '+'. Preserve the offset's sign while
      * encoding a positive one as 'p' (for example, p0500). */
     if (snap_time[19] == '+') snap_time[19] = 'p';
