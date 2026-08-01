@@ -925,7 +925,7 @@ int main(int argc, char **argv) {
                   "inventory loading succeeds for multiple roots through the fake zfs command");
             FILE *args_fp = fopen(g_inventory_args, "r");
             char args[1024] = {0};
-            if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
+            if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
             CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA\n") != NULL && strstr(args, "poolB\n") != NULL,
                   "multi-root inventory list is scoped recursively to every distinct root");
             CHECK(strstr(args, "poolA/child") == NULL && strstr(args, "poolB/child") == NULL,
@@ -944,7 +944,7 @@ int main(int argc, char **argv) {
                   "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
             args_fp = fopen(g_inventory_args, "r");
             memset(args, 0, sizeof(args));
-            if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
+            if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
             CHECK(strstr(args, "-r\n") == NULL && strstr(args, "p000") == NULL,
                   "oversized multi-root inventory call falls back to unscoped zfs list");
             name_list_free(&inventory);
