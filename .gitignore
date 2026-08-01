@@ -1,5 +1,6 @@
 diffsnap
 test
+test-bin
 *.o
 *.core
 core
