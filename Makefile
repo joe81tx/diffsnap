@@ -40,12 +40,21 @@ CPPFLAGS += -DLOCK_PATH='"$(LOCK_PATH)"'
 CPPFLAGS += -DZFS_PATH='"$(ZFS_PATH)"'
 CPPFLAGS += -DBUILD_SHA='"$(BUILD_SHA)"'
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall test chunktest
 
 all: $(PROG)
 
 $(PROG): $(SRCS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
+
+tests/test: tests/test.c diffsnap.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -o $@ tests/test.c
+
+test: tests/test
+	./tests/test
+
+chunktest: tests/test
+	./tests/test --chunk
 
 install: $(PROG)
 	$(INSTALL) -d $(DESTDIR)$(SBINDIR)
@@ -80,4 +89,4 @@ uninstall:
 	fi
 
 clean:
-	rm -f $(PROG) *.o
+	rm -f $(PROG) *.o tests/test

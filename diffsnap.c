@@ -64,6 +64,30 @@ static_assert(sizeof(void *) == 8, "diffsnap requires a 64-bit architecture");
     } while (0)
 
 static FILE *log_fp = NULL;
+/* These indirections keep production defaults unchanged while allowing the
+ * white-box suite to isolate time, allocation failures, and the ZFS command
+ * without altering the host system. */
+static const char *zfs_path = ZFS_PATH;
+static time_t (*time_now_fn)(time_t *) = time;
+static struct tm *(*localtime_now_fn)(const time_t *, struct tm *) = localtime_r;
+static void *(*realloc_now_fn)(void *, size_t) = realloc;
+static int time_override_active = 0;
+static time_t time_override_value;
+
+static time_t diffsnap_now(void) {
+    return time_override_active ? time_override_value : time_now_fn(NULL);
+}
+
+#ifdef DIFFSNAP_TESTING
+static void diffsnap_override_time(time_t value) {
+    time_override_active = 1;
+    time_override_value = value;
+}
+
+static void diffsnap_clear_time_override(void) { time_override_active = 0; }
+#endif
+
+static void *diffsnap_realloc(void *ptr, size_t size) { return realloc_now_fn(ptr, size); }
 /* Set when any fprintf/vfprintf to log_fp fails (e.g. disk full, EIO).
  * log_msg() has no return value for callers to check, so this is how a
  * mid-run logging failure gets surfaced to main()'s exit status instead of
@@ -169,7 +193,7 @@ static void log_msg(const char *fmt, ...) {
     if (!log_fp) return;
     va_list args;
     va_start(args, fmt);
-    time_t t = time(NULL);
+    time_t t = diffsnap_now();
     struct tm tm_info;
     char timestamp[STR_BUF_SMALL];
     
@@ -180,7 +204,7 @@ static void log_msg(const char *fmt, ...) {
      * still sees it was localtime_r that broke without log_msg() ever
      * doubling its own output for one call. */
     int localtime_failed = 0, strftime_failed = 0;
-    if (localtime_r(&t, &tm_info) == NULL) {
+    if (localtime_now_fn(&t, &tm_info) == NULL) {
         localtime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
@@ -255,7 +279,7 @@ static int seen_set_add(seen_set_t *set, const char *dataset, const char *prefix
     }
     if (set->count >= set->capacity) {
         size_t new_cap = set->capacity == 0 ? ALLOC_CHUNK_BATCH : set->capacity * 2;
-        char **tmp = realloc(set->keys, new_cap * sizeof(*set->keys));
+        char **tmp = diffsnap_realloc(set->keys, new_cap * sizeof(*set->keys));
         if (!tmp) return -1;
         set->keys = tmp; set->capacity = new_cap;
     }
@@ -456,7 +480,7 @@ static int handle_metric_line(const char *line, void *data) {
     }
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_METRIC : ctx->capacity * 2;
-        metric_item_t *tmp = realloc(ctx->items, new_cap * sizeof(metric_item_t));
+        metric_item_t *tmp = diffsnap_realloc(ctx->items, new_cap * sizeof(metric_item_t));
         if (!tmp) return -1;
         ctx->items = tmp; ctx->capacity = new_cap;
     }
@@ -575,10 +599,10 @@ static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metric
 }
 static int zfs_destroy(const char *snap_name, int recursive) {
     if (recursive) {
-        const char *const argv[] = {ZFS_PATH, "destroy", "-r", snap_name, NULL};
+        const char *const argv[] = {zfs_path, "destroy", "-r", snap_name, NULL};
         return exec_cmd_stream(argv, NULL, NULL);
     }
-    const char *const argv[] = {ZFS_PATH, "destroy", snap_name, NULL};
+    const char *const argv[] = {zfs_path, "destroy", snap_name, NULL};
     return exec_cmd_stream(argv, NULL, NULL);
 }
 
@@ -607,7 +631,7 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
         if (!date_stamp_like(at + 1 + match_len)) continue;
         if (match_count >= *matches_cap) {
             size_t new_cap = *matches_cap == 0 ? ALLOC_CHUNK_PRUNE : *matches_cap * 2;
-            char **tmp = realloc(*matches, new_cap * sizeof(char *));
+            char **tmp = diffsnap_realloc(*matches, new_cap * sizeof(char *));
             if (!tmp) {
                 log_msg("Error: Failed to allocate prune match list for %s", dataset);
                 return -1;
@@ -628,7 +652,7 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
 static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long written, long long min_bytes) {
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_BATCH : ctx->capacity * 2;
-        batch_item_t *tmp = realloc(ctx->items, new_cap * sizeof(batch_item_t));
+        batch_item_t *tmp = diffsnap_realloc(ctx->items, new_cap * sizeof(batch_item_t));
         if (!tmp) return -1;
         ctx->items = tmp; ctx->capacity = new_cap;
     }
@@ -672,7 +696,7 @@ static int root_list_add_unique(root_list_t *list, const char *dataset) {
     }
     if (list->count >= list->capacity) {
         size_t new_cap = list->capacity == 0 ? ALLOC_CHUNK_BATCH : list->capacity * 2;
-        char **tmp = realloc(list->roots, new_cap * sizeof(char *));
+        char **tmp = diffsnap_realloc(list->roots, new_cap * sizeof(char *));
         if (!tmp) return -1;
         list->roots = tmp; list->capacity = new_cap;
     }
@@ -814,7 +838,7 @@ static int zfs_snapshot_exec_chunk(batch_ctx_t *ctx, int recursive, const char *
     size_t total_args = (recursive ? 3 : 2) + chunk_count + 1;
     const char **argv = malloc(total_args * sizeof(char *));
     if (!argv) { batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
-    size_t idx = 0; argv[idx++] = ZFS_PATH; argv[idx++] = "snapshot";
+    size_t idx = 0; argv[idx++] = zfs_path; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
     char *arena = malloc(chunk_bytes), *offset = arena;
     if (!arena) { free(argv); batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
@@ -846,7 +870,7 @@ static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const c
         if (!batch_item_in_root_pass(ctx, i, root_dataset, pass)) continue;
         if (count >= capacity) {
             size_t new_cap = capacity == 0 ? ALLOC_CHUNK_BATCH : capacity * 2;
-            size_t *tmp = realloc(indices, new_cap * sizeof(size_t));
+            size_t *tmp = diffsnap_realloc(indices, new_cap * sizeof(size_t));
             if (!tmp) {
                 /* The whole root+pass attempt is abandoned here: items
                  * already collected in `indices` were never passed to
@@ -929,7 +953,7 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
     name_list_t *list = (name_list_t *)data;
     if (list->count >= list->capacity) {
         size_t new_cap = list->capacity == 0 ? ALLOC_CHUNK_PRUNE : list->capacity * 2;
-        char **tmp = realloc(list->names, new_cap * sizeof(*list->names));
+        char **tmp = diffsnap_realloc(list->names, new_cap * sizeof(*list->names));
         if (!tmp) return -1;
         list->names = tmp; list->capacity = new_cap;
     }
@@ -966,7 +990,7 @@ static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t
     const char **argv = malloc(argc * sizeof(*argv));
     if (!argv) { root_list_free(&roots); return -1; }
     size_t idx = 0;
-    argv[idx++] = ZFS_PATH; argv[idx++] = "list"; argv[idx++] = "-H";
+    argv[idx++] = zfs_path; argv[idx++] = "list"; argv[idx++] = "-H";
     if (use_scoped) argv[idx++] = "-r";
     argv[idx++] = "-t"; argv[idx++] = "snapshot"; argv[idx++] = "-o";
     argv[idx++] = "name"; argv[idx++] = "-S"; argv[idx++] = "creation";
@@ -1160,8 +1184,8 @@ int main(int argc, char *argv[]) {
         log_msg("Error: failed to open config file %s: %s", CONF_PATH, strerror(saved_errno));
         ret_code = global_status ? global_status : 1; goto cleanup;
     }
-    time_t t = time(NULL); struct tm tm_info; 
-    if (localtime_r(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
+    time_t t = diffsnap_now(); struct tm tm_info;
+    if (localtime_now_fn(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
     long long current_day_mins = (tm_info.tm_hour * 60) + tm_info.tm_min;
     while (getline(&line, &line_cap, conf) != -1) {
@@ -1257,7 +1281,7 @@ int main(int argc, char *argv[]) {
             ret_code = global_status ? global_status : 1; goto cleanup;
         }
         size_t idx = 0;
-        m_argv[idx++] = ZFS_PATH; m_argv[idx++] = "get"; m_argv[idx++] = "-H"; m_argv[idx++] = "-p";
+        m_argv[idx++] = zfs_path; m_argv[idx++] = "get"; m_argv[idx++] = "-H"; m_argv[idx++] = "-p";
         if (use_scoped) m_argv[idx++] = "-r";
         m_argv[idx++] = "-t"; m_argv[idx++] = "filesystem,volume";
         m_argv[idx++] = "-o"; m_argv[idx++] = "name,value"; m_argv[idx++] = "written";

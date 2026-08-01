@@ -20,27 +20,20 @@
  *   ./test_metrics_scoping
  */
 
-/*
- * Points diffsnap.c's own ZFS_PATH constant at a fake `zfs` script instead
- * of the real /sbin/zfs, so Tests 23-24 below can exercise real code paths
- * that shell out (prune_from_inventory -> zfs_destroy, and
- * zfs_snapshot_batch -> zfs_snapshot_exec_chunk) without any real ZFS pool.
- * The script itself is written to this exact path, by name, right before
- * Test 23 runs (see there), and removed again right after Test 24. It is a
- * fixed path (not mkstemp'd) because ZFS_PATH has to be a compile-time
- * string literal, not something chosen at runtime.
- */
-#define ZFS_PATH "/tmp/diffsnap_test_metrics_scoping_fake_zfs.sh"
-
+#define DIFFSNAP_TESTING 1
 #define main diffsnap_real_main
 #include "diffsnap.c"
 #undef main
 
 #include <assert.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 static int g_tests_run = 0;
 static int g_tests_failed = 0;
+static char g_fake_zfs_dir[] = "/tmp/diffsnap-test.XXXXXX";
+static char g_fake_zfs[PATH_MAX];
+static char g_inventory_args[PATH_MAX];
 
 #define CHECK(cond, msg) do { \
     g_tests_run++; \
@@ -51,6 +44,76 @@ static int g_tests_failed = 0;
         printf("    ok: %s\n", msg); \
     } \
 } while (0)
+
+static int setup_fake_zfs(void) {
+    if (!mkdtemp(g_fake_zfs_dir)) return -1;
+    if (snprintf(g_fake_zfs, sizeof(g_fake_zfs), "%s/zfs", g_fake_zfs_dir) >= (int)sizeof(g_fake_zfs)) return -1;
+    if (snprintf(g_inventory_args, sizeof(g_inventory_args), "%s/inventory-args", g_fake_zfs_dir) >= (int)sizeof(g_inventory_args)) return -1;
+    zfs_path = g_fake_zfs;
+    return 0;
+}
+
+static void cleanup_fake_zfs(void) {
+    (void)unlink(g_fake_zfs);
+    (void)unlink(g_inventory_args);
+    (void)rmdir(g_fake_zfs_dir);
+    zfs_path = ZFS_PATH;
+}
+
+static int write_fake_zfs(const char *script) {
+    FILE *fp = fopen(g_fake_zfs, "w");
+    if (!fp) return -1;
+    int failed = fputs(script, fp) == EOF;
+    if (fclose(fp) != 0) failed = 1;
+    if (failed) return -1;
+    return chmod(g_fake_zfs, 0700);
+}
+
+static void run_chunk_test(void) {
+    char trace_path[PATH_MAX];
+    CHECK(snprintf(trace_path, sizeof(trace_path), "%s/chunks", g_fake_zfs_dir) < (int)sizeof(trace_path),
+          "chunk trace path fits in the isolated test directory");
+    char script[PATH_MAX * 2 + 128];
+    CHECK(snprintf(script, sizeof(script),
+                   "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\n",
+                   trace_path, trace_path) < (int)sizeof(script),
+          "chunk fake-zfs script fits in its buffer");
+    CHECK(write_fake_zfs(script) == 0, "installed fake zfs for opt-in chunk test");
+
+    batch_ctx_t batch = {0};
+    const size_t item_count = 600;
+    char padding[236];
+    memset(padding, 'x', sizeof(padding) - 1);
+    padding[sizeof(padding) - 1] = '\0';
+    for (size_t i = 0; i < item_count; i++) {
+        char dataset[STR_BUF_LARGE];
+        snprintf(dataset, sizeof(dataset), "pool/%s%03zu", padding, i);
+        CHECK(batch_add(&batch, dataset, "chunk", 1, 0, 0) == 0, "chunk test batch item added");
+    }
+    CHECK(zfs_snapshot_batch(&batch, 0, "2026-01-01_00:00:00") == 0,
+          "large batch is accepted by the fake zfs command");
+
+    FILE *trace = fopen(trace_path, "r");
+    size_t calls = 0, seen = 0, current_bytes = 0, largest_bytes = 0;
+    char line[STR_BUF_XLARGE];
+    while (trace && fgets(line, sizeof(line), trace)) {
+        if ((unsigned char)line[0] == 036) {
+            calls++;
+            if (current_bytes > largest_bytes) largest_bytes = current_bytes;
+            current_bytes = 0;
+        } else {
+            seen++;
+            current_bytes += strlen(line);
+        }
+    }
+    if (trace) fclose(trace);
+    CHECK(calls > 1, "--chunk forces a snapshot batch to split into multiple zfs calls");
+    CHECK(seen == item_count, "--chunk accounts for every snapshot exactly once");
+    CHECK(largest_bytes <= ARGV_BYTES_CAP, "every chunk stays within ARGV_BYTES_CAP");
+    batch_free(&batch);
+    (void)unlink(trace_path);
+    printf("\n");
+}
 
 static const char *find_bin(const char *const candidates[]) {
     for (size_t i = 0; candidates[i]; i++) {
@@ -75,14 +138,85 @@ static int spy_line_handler(const char *line, void *data) {
     return 0;
 }
 
-int main(void) {
+static int g_localtime_fail;
+static int g_localtime_calls;
+static struct tm *test_localtime(const time_t *value, struct tm *result) {
+    g_localtime_calls++;
+    return g_localtime_fail ? NULL : localtime_r(value, result);
+}
+
+static long g_realloc_calls;
+static long g_realloc_fail_after = -1;
+static void *test_realloc(void *ptr, size_t size) {
+    g_realloc_calls++;
+    return (g_realloc_fail_after >= 0 && g_realloc_calls > g_realloc_fail_after) ? NULL : realloc(ptr, size);
+}
+
+static void run_fault_injection_tests(void) {
+    printf("== Fault injection: in-process time, localtime, and allocation hooks ==\n");
+    diffsnap_override_time((time_t)0);
+    CHECK(diffsnap_now() == (time_t)0, "the test overrides diffsnap's clock without changing the system clock");
+    diffsnap_clear_time_override();
+
+    char *buf = NULL;
+    size_t buf_len = 0;
+    log_fp = open_memstream(&buf, &buf_len);
+    CHECK(log_fp != NULL, "memory-backed log capture opened");
+    if (log_fp) {
+        g_localtime_calls = 0;
+        g_localtime_fail = 1;
+        localtime_now_fn = test_localtime;
+        log_msg("message during localtime failure");
+        localtime_now_fn = localtime_r;
+        g_localtime_fail = 0;
+        fflush(log_fp);
+        size_t newlines = 0;
+        for (size_t i = 0; i < buf_len; i++) if (buf[i] == '\n') newlines++;
+        CHECK(g_localtime_calls == 1, "localtime hook intercepted the logging call");
+        CHECK(buf && strstr(buf, "localtime_r failed") && strstr(buf, "message during localtime failure"),
+              "timestamp failure is described on the log message");
+        CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
+        fclose(log_fp); log_fp = NULL; free(buf);
+    }
+
+    batch_ctx_t ctx = {0};
+    const size_t count = ALLOC_CHUNK_BATCH + 8;
+    for (size_t i = 0; i < count; i++) {
+        char dataset[64];
+        snprintf(dataset, sizeof(dataset), "pool/ds%03zu", i);
+        CHECK(batch_add(&ctx, dataset, "p", 1, -1, 0) == 0, "OOM test batch setup succeeds");
+    }
+    g_realloc_calls = 0;
+    g_realloc_fail_after = 1;
+    realloc_now_fn = test_realloc;
+    int rc = zfs_snapshot_batch_root_pass(&ctx, 0, "2026-01-01_00:00:00", "pool", 0);
+    realloc_now_fn = realloc;
+    g_realloc_fail_after = -1;
+    size_t failed = 0;
+    for (size_t i = 0; i < ctx.count; i++) failed += ctx.items[i].snap_failed != 0;
+    CHECK(rc == -1 && g_realloc_calls == 2, "index collection reports the injected second realloc failure");
+    CHECK(failed == count, "an index allocation failure marks every affected root/pass item failed");
+    batch_free(&ctx);
+    printf("\n");
+}
+
+int main(int argc, char **argv) {
+    int run_chunk = argc == 2 && strcmp(argv[1], "--chunk") == 0;
+    if (argc != 1 && !run_chunk) {
+        fprintf(stderr, "Usage: %s [--chunk]\n", argv[0]);
+        return 2;
+    }
+    CHECK(setup_fake_zfs() == 0, "created an isolated fake-zfs directory");
+    if (zfs_path != g_fake_zfs) return 1;
+    run_fault_injection_tests();
+    if (run_chunk) run_chunk_test();
     printf("== Test 1: exec_cmd_stream (strict) vs exec_cmd_stream_lenient on a clean-success process ==\n");
     {
-        const char *const true_candidates[] = {"/bin/true", "/usr/bin/true", NULL};
-        const char *true_bin = find_bin(true_candidates);
-        CHECK(true_bin != NULL, "found a 'true' binary on this system");
-        if (true_bin) {
-            const char *const argv[] = {true_bin, NULL};
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a POSIX shell on this system");
+        if (sh_bin) {
+            const char *const argv[] = {sh_bin, "-c", "exit 0", NULL};
             CHECK(exec_cmd_stream(argv, NULL, NULL) == 0, "strict: clean success (exit 0) succeeds");
             CHECK(exec_cmd_stream_lenient(argv, NULL, NULL) == 0, "lenient: clean success (exit 0) succeeds");
         }
@@ -91,11 +225,11 @@ int main(void) {
 
     printf("== Test 2: exec_cmd_stream (strict) vs exec_cmd_stream_lenient on a nonzero-exit process ==\n");
     {
-        const char *const false_candidates[] = {"/bin/false", "/usr/bin/false", NULL};
-        const char *false_bin = find_bin(false_candidates);
-        CHECK(false_bin != NULL, "found a 'false' binary on this system");
-        if (false_bin) {
-            const char *const argv[] = {false_bin, NULL};
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a POSIX shell on this system");
+        if (sh_bin) {
+            const char *const argv[] = {sh_bin, "-c", "exit 1", NULL};
             CHECK(exec_cmd_stream(argv, NULL, NULL) != 0, "strict: nonzero exit is treated as failure (this is the existing, unchanged behavior)");
             CHECK(exec_cmd_stream_lenient(argv, NULL, NULL) == 0, "lenient: nonzero exit is NOT treated as failure (the new behavior for scoped zfs get)");
         }
@@ -120,12 +254,12 @@ int main(void) {
 
     printf("== Test 4: handler still receives real stdout output through both wrappers ==\n");
     {
-        const char *const echo_candidates[] = {"/bin/echo", "/usr/bin/echo", NULL};
-        const char *echo_bin = find_bin(echo_candidates);
-        CHECK(echo_bin != NULL, "found an echo binary");
-        if (echo_bin) {
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a POSIX shell");
+        if (sh_bin) {
             metric_ctx_t ctx = {0};
-            const char *const argv[] = {echo_bin, "pool/child\t12345", NULL};
+            const char *const argv[] = {sh_bin, "-c", "printf 'pool/child\\t12345\\n'", NULL};
             int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
             CHECK(rc == 0, "strict call with echo succeeds");
             CHECK(ctx.count == 1, "handler received exactly one parsed line");
@@ -499,12 +633,12 @@ int main(void) {
          * tab only (the actual column separator `zfs get -H` uses) is
          * required to parse these lines correctly.
          */
-        const char *const echo_candidates[] = {"/bin/echo", "/usr/bin/echo", NULL};
-        const char *echo_bin = find_bin(echo_candidates);
-        CHECK(echo_bin != NULL, "found an echo binary");
-        if (echo_bin) {
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a POSIX shell");
+        if (sh_bin) {
             metric_ctx_t ctx = {0};
-            const char *const argv[] = {echo_bin, "pool/my dataset\t54321", NULL};
+            const char *const argv[] = {sh_bin, "-c", "printf 'pool/my dataset\\t54321\\n'", NULL};
             int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
             CHECK(rc == 0, "strict call with echo succeeds");
             CHECK(ctx.count == 1, "handler received exactly one parsed line");
@@ -571,13 +705,8 @@ int main(void) {
          * fails any invocation whose argument list mentions "badroot" and
          * succeeds otherwise, so ordinary `zfs destroy` calls issued by
          * prune_from_inventory here succeed without touching real ZFS. */
-        FILE *fzf = fopen(ZFS_PATH, "w");
-        CHECK(fzf != NULL, "fake zfs script created at ZFS_PATH for Tests 23-24");
-        if (fzf) {
-            fprintf(fzf, "#!/bin/sh\ncase \"$*\" in\n  *badroot*) exit 1 ;;\n  *) exit 0 ;;\nesac\n");
-            fclose(fzf);
-            chmod(ZFS_PATH, 0755);
-        }
+        CHECK(write_fake_zfs("#!/bin/sh\ncase \"$*\" in\n  *badroot*) exit 1 ;;\n  *) exit 0 ;;\nesac\n") == 0,
+              "fake zfs script created outside the system ZFS path for Tests 23-24");
 
         /* Capture log_msg() output so we can see exactly what got pruned,
          * the same technique test_localtime_standalone.c uses. */
@@ -647,7 +776,7 @@ int main(void) {
               "the item under the OTHER, healthy root (goodroot) is NOT marked failed -- one root's failure does not leak onto a sibling root");
 
         batch_free(&ctx);
-        unlink(ZFS_PATH); /* done with the fake zfs script now */
+        unlink(g_fake_zfs); /* done with the fake zfs script now */
         printf("\n");
     }
 
@@ -782,12 +911,11 @@ int main(void) {
         CHECK(date_stamp_like("2026-11-01_01:30:00-05x0") == 0,
               "a malformed timezone offset is rejected");
 
-        FILE *fzf = fopen(ZFS_PATH, "w");
-        CHECK(fzf != NULL, "fake zfs script created for inventory-root scoping tests");
-        if (fzf) {
-            fprintf(fzf, "#!/bin/sh\nprintf '%%s\\n' \"$@\" > /tmp/diffsnap_inventory_args\n");
-            fclose(fzf);
-            chmod(ZFS_PATH, 0755);
+        char inventory_script[PATH_MAX + 64];
+        snprintf(inventory_script, sizeof(inventory_script),
+                 "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\n", g_inventory_args);
+        if (write_fake_zfs(inventory_script) == 0) {
+            CHECK(1, "fake zfs script created in the test directory for inventory-root scoping tests");
 
             batch_ctx_t std_b = {0}, rec_b = {0};
             batch_add(&std_b, "poolA/child", "p", 1, 0, 0);
@@ -795,7 +923,7 @@ int main(void) {
             name_list_t inventory = {0};
             CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
                   "inventory loading succeeds for multiple roots through the fake zfs command");
-            FILE *args_fp = fopen("/tmp/diffsnap_inventory_args", "r");
+            FILE *args_fp = fopen(g_inventory_args, "r");
             char args[1024] = {0};
             if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
             CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA\n") != NULL && strstr(args, "poolB\n") != NULL,
@@ -814,14 +942,14 @@ int main(void) {
             }
             CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
                   "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
-            args_fp = fopen("/tmp/diffsnap_inventory_args", "r");
+            args_fp = fopen(g_inventory_args, "r");
             memset(args, 0, sizeof(args));
             if (args_fp) { fread(args, 1, sizeof(args) - 1, args_fp); fclose(args_fp); }
             CHECK(strstr(args, "-r\n") == NULL && strstr(args, "p000") == NULL,
                   "oversized multi-root inventory call falls back to unscoped zfs list");
             name_list_free(&inventory);
             batch_free(&std_b); batch_free(&rec_b);
-            unlink(ZFS_PATH);
+            unlink(g_fake_zfs);
         }
         printf("\n");
     }
@@ -1047,6 +1175,7 @@ int main(void) {
         printf("\n");
     }
 
+    cleanup_fake_zfs();
     printf("================================\n");
     printf("RESULTS: %d checks run, %d failed\n", g_tests_run, g_tests_failed);
     printf("================================\n");
