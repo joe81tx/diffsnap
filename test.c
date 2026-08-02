@@ -10,9 +10,10 @@
  * risk of the test silently drifting from the implementation. main() is
  * renamed out of the way via a macro so this file can supply its own.
  *
- * Requires only a POSIX system with /bin/true and /bin/false (or
- * equivalents) -- no ZFS needed, since exec_cmd_stream/_lenient are
- * generic process-exec plumbing, not ZFS-specific.
+ * The default suite requires only a POSIX system with /bin/true and
+ * /bin/false (or equivalents).  --system additionally exercises the real
+ * ZFS command paths using an isolated child dataset below rpool on Linux
+ * and zroot on FreeBSD.
  *
  * Build:
  *   cc -Wall -Wextra -std=c11 -o test_metrics_scoping test_metrics_scoping_standalone.c
@@ -78,7 +79,7 @@ static void run_chunk_test(void) {
                    "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\n",
                    trace_path, trace_path) < (int)sizeof(script),
           "chunk fake-zfs script fits in its buffer");
-    CHECK(write_fake_zfs(script) == 0, "installed fake zfs for opt-in chunk test");
+    CHECK(write_fake_zfs(script) == 0, "installed fake zfs for chunking test");
 
     batch_ctx_t batch = {0};
     const size_t item_count = 600;
@@ -107,11 +108,125 @@ static void run_chunk_test(void) {
         }
     }
     if (trace) fclose(trace);
-    CHECK(calls > 1, "--chunk forces a snapshot batch to split into multiple zfs calls");
+    CHECK(calls > 1, "a large batch splits into multiple zfs calls");
     CHECK(seen == item_count, "--chunk accounts for every snapshot exactly once");
     CHECK(largest_bytes <= ARGV_BYTES_CAP, "every chunk stays within ARGV_BYTES_CAP");
     batch_free(&batch);
     (void)unlink(trace_path);
+    printf("\n");
+}
+
+static void run_system_tests(void) {
+#if defined(__FreeBSD__)
+    const char *pool = "zroot";
+#else
+    const char *pool = "rpool";
+#endif
+    char dataset[STR_BUF_LARGE];
+    char standard[STR_BUF_LARGE];
+    char tree[STR_BUF_LARGE];
+    char tree_child[STR_BUF_LARGE];
+    int created = 0;
+
+    printf("== System tests: real ZFS snapshot, inventory, recursive, and pruning paths ==\n");
+    zfs_path = ZFS_PATH;
+    CHECK(snprintf(dataset, sizeof(dataset), "%s/diffsnap-test-%ld", pool, (long)getpid()) < (int)sizeof(dataset),
+          "isolated real-ZFS test dataset name fits in the ZFS name buffer");
+    CHECK(snprintf(standard, sizeof(standard), "%s/standard", dataset) < (int)sizeof(standard) &&
+          snprintf(tree, sizeof(tree), "%s/tree", dataset) < (int)sizeof(tree) &&
+          snprintf(tree_child, sizeof(tree_child), "%s/child", tree) < (int)sizeof(tree_child),
+          "real-ZFS child dataset names fit in the ZFS name buffer");
+
+    const char *const check_pool[] = {zfs_path, "list", "-H", "-o", "name", pool, NULL};
+    if (exec_cmd_stream(check_pool, NULL, NULL) != 0) {
+        CHECK(0, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
+        zfs_path = g_fake_zfs;
+        printf("\n");
+        return;
+    }
+    CHECK(1, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
+
+    const char *const create_standard[] = {zfs_path, "create", standard, NULL};
+    if (exec_cmd_stream(create_standard, NULL, NULL) != 0) {
+        CHECK(0, "created an isolated real-ZFS standard dataset");
+        zfs_path = g_fake_zfs;
+        printf("\n");
+        return;
+    }
+    created = 1;
+    CHECK(1, "created an isolated real-ZFS standard dataset");
+    const char *const create_tree[] = {zfs_path, "create", "-p", tree_child, NULL};
+    CHECK(exec_cmd_stream(create_tree, NULL, NULL) == 0, "created an isolated nested real-ZFS dataset tree");
+
+    metric_ctx_t real_metrics = {0};
+    const char *const get_written[] = {
+        zfs_path, "get", "-H", "-p", "-r", "-t", "filesystem,volume",
+        "-o", "name,value", "written", dataset, NULL
+    };
+    CHECK(exec_cmd_stream_lenient(get_written, handle_metric_line, &real_metrics) == 0 && real_metrics.count >= 3,
+          "the real ZFS written-metrics command feeds the production metric parser");
+    free(real_metrics.items);
+
+    batch_ctx_t standard_batch = {0};
+    batch_ctx_t recursive_batch = {0};
+    name_list_t inventory = {0};
+    char **matches = NULL;
+    size_t matches_cap = 0;
+    const char *stamp = "2026-01-01_00:00:00";
+
+    CHECK(batch_add(&standard_batch, standard, "system", 1, 0, 0) == 0,
+          "assembled a real-ZFS standard snapshot batch");
+    CHECK(zfs_snapshot_batch(&standard_batch, 0, stamp) == 0,
+          "zfs_snapshot_batch creates a real non-recursive snapshot");
+    CHECK(batch_add(&recursive_batch, tree, "system-rec", 1, 0, 0) == 0,
+          "assembled a real-ZFS recursive snapshot batch");
+    CHECK(zfs_snapshot_batch(&recursive_batch, 1, stamp) == 0,
+          "zfs_snapshot_batch creates a real recursive snapshot");
+    CHECK(load_combined_snapshot_inventory(&inventory, &standard_batch, &recursive_batch) == 0,
+          "real ZFS snapshot inventory loads across standard and recursive roots");
+
+    char standard_snap[STR_BUF_XLARGE];
+    char tree_child_snap[STR_BUF_XLARGE];
+    CHECK(format_snapshot_name(standard_snap, sizeof(standard_snap), standard, "system", stamp) > 0 &&
+          inventory_contains(&inventory, standard_snap),
+          "the real inventory contains the standard snapshot created by the batch path");
+    CHECK(format_snapshot_name(tree_child_snap, sizeof(tree_child_snap), tree_child, "system-rec", stamp) > 0 &&
+          inventory_contains(&inventory, tree_child_snap),
+          "the real inventory contains the child snapshot created by the recursive batch path");
+    name_list_free(&inventory);
+
+    const char *old_snapshot[] = {zfs_path, "snapshot", NULL, NULL};
+    char old_name[STR_BUF_XLARGE];
+    char new_name[STR_BUF_XLARGE];
+    CHECK(format_snapshot_name(old_name, sizeof(old_name), standard, "system-prune", "2025-01-01_00:00:00") > 0 &&
+          format_snapshot_name(new_name, sizeof(new_name), standard, "system-prune", stamp) > 0,
+          "real-ZFS pruning snapshot names format safely");
+    old_snapshot[2] = old_name;
+    CHECK(exec_cmd_stream(old_snapshot, NULL, NULL) == 0, "created an older real-ZFS snapshot for pruning");
+    batch_ctx_t prune_batch = {0};
+    CHECK(batch_add(&prune_batch, standard, "system-prune", 1, 0, 0) == 0 &&
+          zfs_snapshot_batch(&prune_batch, 0, stamp) == 0,
+          "created the retained real-ZFS snapshot through the batch path");
+    CHECK(load_combined_snapshot_inventory(&inventory, &prune_batch, &recursive_batch) == 0,
+          "real-ZFS inventory reloads before pruning");
+    CHECK(prune_from_inventory(&inventory, standard, "system-prune", 1, 0, &matches, &matches_cap) == 0,
+          "prune_from_inventory destroys the older real-ZFS snapshot");
+    name_list_free(&inventory);
+    CHECK(load_combined_snapshot_inventory(&inventory, &prune_batch, &recursive_batch) == 0 &&
+          !inventory_contains(&inventory, old_name) && inventory_contains(&inventory, new_name),
+          "real-ZFS pruning leaves only the newest matching snapshot");
+
+    free(matches);
+    name_list_free(&inventory);
+    batch_free(&prune_batch);
+    batch_free(&recursive_batch);
+    batch_free(&standard_batch);
+    if (created) {
+        const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
+        CHECK(exec_cmd_stream(destroy_dataset, NULL, NULL) == 0,
+              "destroyed the isolated real-ZFS test dataset and its snapshots");
+    }
+    zfs_path = g_fake_zfs;
     printf("\n");
 }
 
@@ -201,15 +316,15 @@ static void run_fault_injection_tests(void) {
 }
 
 int main(int argc, char **argv) {
-    int run_chunk = argc == 2 && strcmp(argv[1], "--chunk") == 0;
-    if (argc != 1 && !run_chunk) {
-        fprintf(stderr, "Usage: %s [--chunk]\n", argv[0]);
+    int run_system = argc == 2 && strcmp(argv[1], "--system") == 0;
+    if (argc != 1 && !run_system) {
+        fprintf(stderr, "Usage: %s [--system]\n", argv[0]);
         return 2;
     }
     CHECK(setup_fake_zfs() == 0, "created an isolated fake-zfs directory");
     if (zfs_path != g_fake_zfs) return 1;
     run_fault_injection_tests();
-    if (run_chunk) run_chunk_test();
+    run_chunk_test();
     printf("== Test 1: exec_cmd_stream (strict) vs exec_cmd_stream_lenient on a clean-success process ==\n");
     {
         const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
@@ -1175,6 +1290,7 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    if (run_system) run_system_tests();
     cleanup_fake_zfs();
     printf("================================\n");
     printf("RESULTS: %d checks run, %d failed\n", g_tests_run, g_tests_failed);
