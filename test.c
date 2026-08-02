@@ -146,7 +146,7 @@ static void run_system_tests(void) {
     }
     CHECK(1, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
 
-    const char *const create_standard[] = {zfs_path, "create", standard, NULL};
+    const char *const create_standard[] = {zfs_path, "create", "-p", standard, NULL};
     if (exec_cmd_stream(create_standard, NULL, NULL) != 0) {
         CHECK(0, "created an isolated real-ZFS standard dataset");
         zfs_path = g_fake_zfs;
@@ -203,6 +203,7 @@ static void run_system_tests(void) {
           "real-ZFS pruning snapshot names format safely");
     old_snapshot[2] = old_name;
     CHECK(exec_cmd_stream(old_snapshot, NULL, NULL) == 0, "created an older real-ZFS snapshot for pruning");
+    sleep(1);
     batch_ctx_t prune_batch = {0};
     CHECK(batch_add(&prune_batch, standard, "system-prune", 1, 0, 0) == 0 &&
           zfs_snapshot_batch(&prune_batch, 0, stamp) == 0,
