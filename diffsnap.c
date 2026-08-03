@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <poll.h>
@@ -68,6 +69,11 @@ static FILE *log_fp = NULL;
  * white-box suite to isolate time, allocation failures, and the ZFS command
  * without altering the host system. */
 static const char *zfs_path = ZFS_PATH;
+/* Kept indirect so the white-box suite can run main() against isolated
+ * files; production starts with the compiled-in paths. */
+static const char *conf_path = CONF_PATH;
+static const char *log_path = LOG_PATH;
+static const char *lock_path = LOCK_PATH;
 static time_t (*time_now_fn)(time_t *) = time;
 static struct tm *(*localtime_now_fn)(const time_t *, struct tm *) = localtime_r;
 static void *(*realloc_now_fn)(void *, size_t) = realloc;
@@ -473,6 +479,10 @@ static int handle_metric_line(const char *line, void *data) {
     char *saveptr = NULL;
     char *name = strtok_r(line_copy, "\t", &saveptr);
     char *value = strtok_r(NULL, "\t", &saveptr);
+    /* Missing-tab and oversized-name lines are intentionally skipped rather
+     * than failing the command. This is narrower than the malformed-stdout
+     * contract near exec_cmd_stream_lenient, which applies when a handler
+     * reports a protocol violation. */
     if (!name || !value) return 0;
     if (strlen(name) >= sizeof(ctx->items[0].name)) {
         log_msg("Error: Skipping metric line with oversized dataset name: %s", name);
@@ -517,7 +527,7 @@ static int is_strict_descendant(const char *child, const char *parent);
  */
 static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset, long long *out_sum) {
     metric_item_t key = {0};
-    assert(strlen(dataset) < sizeof(key.name));
+    if (strlen(dataset) >= sizeof(key.name)) return -1;
     memcpy(key.name, dataset, strlen(dataset) + 1);
     metric_item_t *root = metrics->count ?
         bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
@@ -540,6 +550,10 @@ static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset,
             log_msg("Error: Invalid written metric for %s, excluding from recursive total for %s",
                      metrics->items[i].name, dataset);
             continue;
+        }
+        if (metrics->items[i].written > LLONG_MAX - sum) {
+            log_msg("Error: Recursive written metric total overflows for %s", dataset);
+            return -1;
         }
         sum += metrics->items[i].written;
     }
@@ -569,12 +583,15 @@ static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metric
             ok = (sum_subtree_written(metrics, ctx->items[i].dataset, &written) == 0);
         } else {
             metric_item_t key = {0};
-            assert(strlen(ctx->items[i].dataset) < sizeof(key.name));
-            memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
-            metric_item_t *found = metrics->count ?
-                bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
-            ok = found && found->written != -1;
-            if (ok) written = found->written;
+            if (strlen(ctx->items[i].dataset) >= sizeof(key.name)) {
+                ok = 0;
+            } else {
+                memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
+                metric_item_t *found = metrics->count ?
+                    bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
+                ok = found && found->written != -1;
+                if (ok) written = found->written;
+            }
         }
         int keep;
         if (!ok) {
@@ -667,15 +684,17 @@ static void batch_free(batch_ctx_t *ctx) {
     free(ctx->items);
 }
 
-static size_t zfs_root_len(const char *dataset) {
+static size_t zfs_pool_len(const char *dataset) {
     const char *slash = strchr(dataset, '/');
     return slash ? (size_t)(slash - dataset) : strlen(dataset);
 }
 
 static int same_zfs_root(const char *a, const char *b) {
-    size_t a_len = zfs_root_len(a), b_len = zfs_root_len(b);
+    size_t a_len = zfs_pool_len(a), b_len = zfs_pool_len(b);
     return a_len == b_len && strncmp(a, b, a_len) == 0;
 }
+
+static size_t zfs_root_len(const char *dataset) { return strlen(dataset); }
 
 static int same_zfs_dataset(const char *a, const char *b) {
     return strcmp(a, b) == 0;
@@ -691,8 +710,15 @@ static void root_list_free(root_list_t *list) {
 
 static int root_list_add_unique(root_list_t *list, const char *dataset) {
     size_t len = zfs_root_len(dataset);
-    for (size_t i = 0; i < list->count; i++) {
-        if (strlen(list->roots[i]) == len && strncmp(list->roots[i], dataset, len) == 0) return 0;
+    for (size_t i = 0; i < list->count; ) {
+        if (strcmp(list->roots[i], dataset) == 0 || is_strict_descendant(dataset, list->roots[i])) return 0;
+        if (is_strict_descendant(list->roots[i], dataset)) {
+            free(list->roots[i]);
+            memmove(&list->roots[i], &list->roots[i + 1], (list->count - i - 1) * sizeof(*list->roots));
+            list->count--;
+            continue;
+        }
+        i++;
     }
     if (list->count >= list->capacity) {
         size_t new_cap = list->capacity == 0 ? ALLOC_CHUNK_BATCH : list->capacity * 2;
@@ -708,9 +734,9 @@ static int root_list_add_unique(root_list_t *list, const char *dataset) {
     return 0;
 }
 
-/* Collects the distinct dataset roots referenced by both batches (i.e. the
- * roots that are actually due this run), for scoping the `zfs get written`
- * call to just what's needed instead of the whole pool. */
+/* Collects the minimal set of configured dataset roots referenced by both
+ * batches. An ancestor covers its descendants, but sibling datasets remain
+ * distinct so scoped `zfs get -r` walks only the due subtrees. */
 static int collect_due_roots(root_list_t *list, const batch_ctx_t *b1, const batch_ctx_t *b2) {
     for (size_t i = 0; i < b1->count; i++) if (root_list_add_unique(list, b1->items[i].dataset) != 0) return -1;
     for (size_t i = 0; i < b2->count; i++) if (root_list_add_unique(list, b2->items[i].dataset) != 0) return -1;
@@ -1041,6 +1067,7 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     for (size_t i = 0; i < std_b->count; i++) {
         int covered = is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built);
         if (covered < 0) {
+            std_b->count = write_idx;
             for (size_t j = 0; j < built; j++) free(rec_keys[j]);
             free(rec_keys);
             return -1;
@@ -1148,18 +1175,18 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    int lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lock_fd < 0) {
         int saved_errno = errno;
-        early_fail("%s: failed to open lock file %s: %s", progname, LOCK_PATH, strerror(saved_errno));
+        early_fail("%s: failed to open lock file %s: %s", progname, lock_path, strerror(saved_errno));
         return 1;
     }
     if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
         int saved_errno = errno;
         if (saved_errno == EWOULDBLOCK) {
-            early_fail("%s: another instance is already running (lock held on %s)", progname, LOCK_PATH);
+            early_fail("%s: another instance is already running (lock held on %s)", progname, lock_path);
         } else {
-            early_fail("%s: failed to acquire lock %s: %s", progname, LOCK_PATH, strerror(saved_errno));
+            early_fail("%s: failed to acquire lock %s: %s", progname, lock_path, strerror(saved_errno));
         }
         close(lock_fd);
         return 1;
@@ -1169,19 +1196,20 @@ int main(int argc, char *argv[]) {
     batch_ctx_t std_b = { NULL, 0, 0 }, rec_b = { NULL, 0, 0 };
     seen_set_t seen = { NULL, 0, 0 };
     char *line = NULL; FILE *conf = NULL;
-    if ((log_fp = fopen(LOG_PATH, "ae")) == NULL) {
+    log_io_failed = 0;
+    if ((log_fp = fopen(log_path, "ae")) == NULL) {
         int saved_errno = errno;
-        early_fail("%s: failed to open log file %s: %s", progname, LOG_PATH, strerror(saved_errno));
+        early_fail("%s: failed to open log file %s: %s", progname, log_path, strerror(saved_errno));
         ret_code = 1; goto cleanup;
     }
     if (setvbuf(log_fp, NULL, _IOLBF, 0) != 0) {
         fprintf(stderr, "%s: failed to enable line-buffered logging; continuing with fully-buffered logging\n", progname);
     }
-    conf = fopen(CONF_PATH, "re");
+    conf = fopen(conf_path, "re");
     if (!conf) {
         int saved_errno = errno;
-        early_fail("%s: failed to open config file %s: %s", progname, CONF_PATH, strerror(saved_errno));
-        log_msg("Error: failed to open config file %s: %s", CONF_PATH, strerror(saved_errno));
+        early_fail("%s: failed to open config file %s: %s", progname, conf_path, strerror(saved_errno));
+        log_msg("Error: failed to open config file %s: %s", conf_path, strerror(saved_errno));
         ret_code = global_status ? global_status : 1; goto cleanup;
     }
     time_t t = diffsnap_now(); struct tm tm_info;
@@ -1216,6 +1244,8 @@ int main(int argc, char *argv[]) {
         REQUIRE_TOKEN("missing recursive field");
         if (copy_token(recursive_str, sizeof(recursive_str), token) != 0) { log_msg("Error: Config error for %s: recursive field too long", dataset); global_status = 1; continue; }
         REQUIRE_TOKEN("missing min_bytes field"); errno = 0; min_bytes = strtoll(token, &endptr, 10);
+        /* strtok_r() suppresses a trailing delimiter, so a trailing comma
+         * after a complete final field is not currently rejected here. */
         if (errno == ERANGE || *endptr != '\0' || min_bytes < 0 || strtok_r(NULL, ",", &saveptr) != NULL) {
             log_msg("Error: Config error for %s: invalid byte threshold or trailing garbage", dataset); global_status = 1; continue;
         }
@@ -1236,7 +1266,7 @@ int main(int argc, char *argv[]) {
      * the only successful reason for the loop to end. */
     int config_read_errno = errno;
     if (!feof(conf)) {
-        log_msg("Error: Failed to read config file %s: %s", CONF_PATH, strerror(config_read_errno));
+        log_msg("Error: Failed to read config file %s: %s", conf_path, strerror(config_read_errno));
         ret_code = global_status ? global_status : 1; goto cleanup;
     }
     if (std_b.count + rec_b.count > 0) {
@@ -1355,12 +1385,12 @@ seen_set_free(&seen);
 if (log_fp) {
     if (log_had_io_failure()) {
         fprintf(stderr, "%s: one or more writes to log file %s failed; log is incomplete\n",
-                progname, LOG_PATH);
+                progname, log_path);
         ret_code = 1;
     }
     if (fclose(log_fp) != 0) {
         fprintf(stderr, "%s: failed to flush log file %s: %s\n",
-                progname, LOG_PATH, strerror(errno));
+                progname, log_path, strerror(errno));
         ret_code = 1;
     }
 }

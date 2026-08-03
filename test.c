@@ -163,7 +163,7 @@ static void run_system_tests(void) {
         zfs_path, "get", "-H", "-p", "-r", "-t", "filesystem,volume",
         "-o", "name,value", "written", dataset, NULL
     };
-    CHECK(exec_cmd_stream_lenient(get_written, handle_metric_line, &real_metrics) == 0 && real_metrics.count >= 3,
+    CHECK(exec_cmd_stream_lenient(get_written, handle_metric_line, &real_metrics) == 0 && real_metrics.count == 4,
           "the real ZFS written-metrics command feeds the production metric parser");
     free(real_metrics.items);
 
@@ -268,6 +268,106 @@ static void *test_realloc(void *ptr, size_t size) {
     return (g_realloc_fail_after >= 0 && g_realloc_calls > g_realloc_fail_after) ? NULL : realloc(ptr, size);
 }
 
+static struct tm *test_positive_offset_localtime(const time_t *value, struct tm *result) {
+    (void)value;
+    memset(result, 0, sizeof(*result));
+    result->tm_year = 126; result->tm_mon = 2; result->tm_mday = 8;
+    result->tm_hour = 0; result->tm_min = 0; result->tm_sec = 0;
+#if defined(__GLIBC__) || defined(__FreeBSD__)
+    result->tm_gmtoff = 5 * 60 * 60;
+#endif
+    return result;
+}
+
+static void run_main_pipeline_tests(void) {
+    char conf_file[PATH_MAX], log_file[PATH_MAX], lock_file[PATH_MAX], args_file[PATH_MAX];
+    CHECK(snprintf(conf_file, sizeof(conf_file), "%s/main.conf", g_fake_zfs_dir) < (int)sizeof(conf_file) &&
+          snprintf(log_file, sizeof(log_file), "%s/main.log", g_fake_zfs_dir) < (int)sizeof(log_file) &&
+          snprintf(lock_file, sizeof(lock_file), "%s/main.lock", g_fake_zfs_dir) < (int)sizeof(lock_file) &&
+          snprintf(args_file, sizeof(args_file), "%s/main-args", g_fake_zfs_dir) < (int)sizeof(args_file),
+          "isolated files for direct main() pipeline tests fit in the test directory");
+    conf_path = conf_file; log_path = log_file; lock_path = lock_file;
+
+    char script[PATH_MAX * 2 + 256];
+    CHECK(snprintf(script, sizeof(script),
+                   "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> '%s'\n"
+                   "if [ \"$1\" = get ]; then printf 'pool/due\\t100\\n'; fi\nexit 0\n", args_file) < (int)sizeof(script) &&
+          write_fake_zfs(script) == 0, "fake zfs for direct main() tests installed");
+
+    printf("== Main/config pipeline tests ==\n");
+    FILE *fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for per-field validation");
+    if (fp) {
+        fputs("1pool,1,1,p,no,0\n", fp);
+        fputs("pool/a,0,1,p,no,0\n", fp);
+        fputs("pool/a,1,0,p,no,0\n", fp);
+        fputs("pool/a,1,1,bad prefix,no,0\n", fp);
+        fputs("pool/a,1,1,p,maybe,0\n", fp);
+        fputs("pool/a,1,1,p,no,-1\n", fp);
+        fputs("pool/a,1,1,p,no,0,extra\n", fp);
+        fputs("pool/due,1,1,p,no,0\n", fp);
+        fclose(fp);
+        unlink(args_file);
+        char *argv[] = {"diffsnap-test", NULL};
+        CHECK(diffsnap_real_main(1, argv) == 1, "main() returns failure when every config field has an invalid example");
+        FILE *log = fopen(log_file, "r");
+        char contents[8192] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "invalid dataset") && strstr(contents, "invalid interval") &&
+              strstr(contents, "invalid retention") && strstr(contents, "invalid prefix") &&
+              strstr(contents, "invalid recursive") && strstr(contents, "invalid byte threshold"),
+              "main() validates each config field through the real parsing pipeline");
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,7,1,p,no,0\n", fp); fclose(fp);
+        unlink(args_file);
+        diffsnap_override_time((time_t)0);
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+              "the interval-scheduling gate permits a clean no-work run");
+        diffsnap_clear_time_override();
+        CHECK(access(args_file, F_OK) != 0, "a non-due entry does not invoke zfs through main()");
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        unlink(args_file);
+        localtime_now_fn = test_positive_offset_localtime;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+              "a due entry completes through main() with the fake zfs command");
+        localtime_now_fn = localtime_r;
+        FILE *args = fopen(args_file, "r");
+        char contents[8192] = {0};
+        if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+        CHECK(strstr(contents, "pool/due@p_2026-03-08_00:00:00p0500") != NULL,
+              "main() rewrites a positive DST offset's '+' to 'p' in snapshot names");
+    }
+
+    int held_lock = open(lock_file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    CHECK(held_lock >= 0 && flock(held_lock, LOCK_EX | LOCK_NB) == 0,
+          "test process acquired the isolated lock before invoking main()");
+    if (held_lock >= 0) {
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() exits unsuccessfully when flock reports an existing instance");
+        flock(held_lock, LOCK_UN); close(held_lock);
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("1pool,1,1,p,no,0\n", fp); fclose(fp);
+        log_path = "/dev/full";
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "a detected log_io_failed condition changes main()'s process exit code to failure");
+        log_path = log_file;
+    }
+    unlink(g_fake_zfs);
+    unlink(conf_file); unlink(log_file); unlink(lock_file); unlink(args_file);
+    conf_path = CONF_PATH; log_path = LOG_PATH; lock_path = LOCK_PATH;
+    printf("\n");
+}
+
 static void run_fault_injection_tests(void) {
     printf("== Fault injection: in-process time, localtime, and allocation hooks ==\n");
     diffsnap_override_time((time_t)0);
@@ -324,6 +424,7 @@ int main(int argc, char **argv) {
     }
     CHECK(setup_fake_zfs() == 0, "created an isolated fake-zfs directory");
     if (zfs_path != g_fake_zfs) return 1;
+    run_main_pipeline_tests();
     run_fault_injection_tests();
     run_chunk_test();
     printf("== Test 1: exec_cmd_stream (strict) vs exec_cmd_stream_lenient on a clean-success process ==\n");
@@ -388,17 +489,24 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 5: root_list_add_unique deduplicates by ROOT, not by full dataset name ==\n");
+    printf("== Test 5: root_list_add_unique preserves configured paths and coalesces only ancestor/descendant roots ==\n");
     {
         root_list_t list = {0};
         root_list_add_unique(&list, "pool/a");
         root_list_add_unique(&list, "pool/b");
-        CHECK(list.count == 1, "pool/a and pool/b share root 'pool' -> deduplicated to 1 entry");
-        CHECK(strcmp(list.roots[0], "pool") == 0, "the single root is 'pool'");
+        CHECK(list.count == 2, "sibling datasets remain distinct scoped roots");
+        CHECK(strcmp(list.roots[0], "pool/a") == 0 && strcmp(list.roots[1], "pool/b") == 0,
+              "full configured dataset paths are retained");
+        root_list_add_unique(&list, "pool/a/child");
+        CHECK(list.count == 2, "a descendant is covered by its existing ancestor root");
+        root_list_add_unique(&list, "pool");
+        CHECK(list.count == 1 && strcmp(list.roots[0], "pool") == 0,
+              "a newly seen ancestor replaces its descendant roots");
         root_list_add_unique(&list, "otherpool/x");
         CHECK(list.count == 2, "a genuinely different root is added");
         root_list_add_unique(&list, "otherpool");
-        CHECK(list.count == 2, "a bare root name matching an existing root is not duplicated");
+        CHECK(list.count == 2 && strcmp(list.roots[1], "otherpool") == 0,
+              "an ancestor is stored as its complete configured path");
         root_list_free(&list);
         printf("\n");
     }
@@ -407,23 +515,23 @@ int main(int argc, char **argv) {
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
         batch_add(&std_b, "pool/a", "p", 1, -1, 0);
-        batch_add(&std_b, "pool/b", "p", 1, -1, 0);       /* same root as pool/a */
+        batch_add(&std_b, "pool/b", "p", 1, -1, 0);       /* sibling: remains separately scoped */
         batch_add(&std_b, "otherpool/x", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool", "p", 1, -1, 0);          /* same root as pool/a, pool/b -- via rec_b this time */
+        batch_add(&rec_b, "pool", "p", 1, -1, 0);          /* ancestor covers pool/a and pool/b */
         batch_add(&rec_b, "thirdpool/y/z", "p", 1, -1, 0);
 
         root_list_t due_roots = {0};
         int rc = collect_due_roots(&due_roots, &std_b, &rec_b);
         CHECK(rc == 0, "collect_due_roots succeeds");
-        CHECK(due_roots.count == 3, "3 distinct roots across both batches (pool, otherpool, thirdpool), despite 5 items");
+        CHECK(due_roots.count == 3, "three ancestor-minimal configured paths remain across both batches");
 
         int has_pool = 0, has_other = 0, has_third = 0;
         for (size_t i = 0; i < due_roots.count; i++) {
             if (strcmp(due_roots.roots[i], "pool") == 0) has_pool = 1;
-            if (strcmp(due_roots.roots[i], "otherpool") == 0) has_other = 1;
-            if (strcmp(due_roots.roots[i], "thirdpool") == 0) has_third = 1;
+            if (strcmp(due_roots.roots[i], "otherpool/x") == 0) has_other = 1;
+            if (strcmp(due_roots.roots[i], "thirdpool/y/z") == 0) has_third = 1;
         }
-        CHECK(has_pool && has_other && has_third, "all three expected roots are present");
+        CHECK(has_pool && has_other && has_third, "all three full scoped dataset paths are present");
 
         root_list_free(&due_roots);
         batch_free(&std_b);
@@ -506,6 +614,13 @@ int main(int argc, char **argv) {
         CHECK(b.count == 0, "below-threshold item is removed");
         CHECK(global_status == 0, "global_status is NOT flagged (this is a normal skip, not an error)");
 
+        batch_add(&b, "pool/a", "p", 1, -1, 100);
+        global_status = 0;
+        batch_filter_by_metrics(&b, &metrics, 0, &global_status);
+        CHECK(b.count == 1 && b.items[0].written == 100,
+              "written == min_bytes is retained at the inclusive threshold boundary");
+        CHECK(global_status == 0, "an exactly-at-threshold item is not an error");
+
         free(metrics.items);
         batch_free(&b);
         printf("\n");
@@ -564,6 +679,21 @@ int main(int argc, char **argv) {
         CHECK(rc == 0, "sum_subtree_written succeeds for a subtree with nested descendants");
         CHECK(sum == 10000, "sum includes root + all descendants at every depth (1000+2000+3000+4000)");
 
+        free(metrics.items);
+        printf("\n");
+    }
+
+    printf("== Test 12a: sum_subtree_written rejects totals above LLONG_MAX ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(2, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/data");       metrics.items[0].written = LLONG_MAX;
+        strcpy(metrics.items[1].name, "pool/data/child"); metrics.items[1].written = 1;
+        metrics.count = 2;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+        long long sum = 0;
+        CHECK(sum_subtree_written(&metrics, "pool/data", &sum) == -1,
+              "recursive written-byte accumulation fails instead of overflowing LLONG_MAX");
         free(metrics.items);
         printf("\n");
     }
@@ -817,12 +947,10 @@ int main(int argc, char **argv) {
 
     printf("== Test 23: prune_from_inventory's date_stamp_like gate excludes prefix-matching but non-date-shaped snapshot names ==\n");
     {
-        /* Install the fake zfs script (shared with Test 24 below): it
-         * fails any invocation whose argument list mentions "badroot" and
-         * succeeds otherwise, so ordinary `zfs destroy` calls issued by
-         * prune_from_inventory here succeed without touching real ZFS. */
-        CHECK(write_fake_zfs("#!/bin/sh\ncase \"$*\" in\n  *badroot*) exit 1 ;;\n  *) exit 0 ;;\nesac\n") == 0,
-              "fake zfs script created outside the system ZFS path for Tests 23-24");
+        /* This test owns its fake command: ordinary destroy calls succeed
+         * without touching real ZFS. */
+        CHECK(write_fake_zfs("#!/bin/sh\nexit 0\n") == 0,
+              "fake zfs script created outside the system ZFS path for Test 23");
 
         /* Capture log_msg() output so we can see exactly what got pruned,
          * the same technique test_localtime_standalone.c uses. */
@@ -866,32 +994,45 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "myprefix_2026-01-01_00:00:00") != NULL,
               "the oldest genuinely date-stamped entry is the one that was pruned, leaving the newest one retained");
 
-        fclose(log_fp);
+        if (log_fp) fclose(log_fp);
         log_fp = NULL;
         free(buf);
         free(matches); /* matches holds borrowed pointers into inventory -- only the array itself is ours to free */
         name_list_free(&inventory);
+        unlink(g_fake_zfs);
         printf("\n");
     }
 
     printf("== Test 24: zfs_snapshot_batch isolates failure to the failing root -- one root's failure does not block or falsely fail a sibling root ==\n");
     {
-        /* Reuses the fake zfs script installed for Test 23 above (still in
-         * place at ZFS_PATH): it fails any call mentioning "badroot",
-         * succeeds otherwise. */
+        /* Install our own fake command so this test has no ordering
+         * dependency on Test 23. Its genuine nonzero failure also emits
+         * stderr, which exec_cmd_stream must drain and route to log_msg. */
+        CHECK(write_fake_zfs("#!/bin/sh\ncase \"$*\" in\n  *badroot*) echo 'badroot diagnostic' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n") == 0,
+              "fake zfs script created outside the system ZFS path for Test 24");
         batch_ctx_t ctx = {0};
         int rc1 = batch_add(&ctx, "badroot/x", "p", 1, -1, 0);
         int rc2 = batch_add(&ctx, "goodroot/y", "p", 1, -1, 0);
         CHECK(rc1 == 0 && rc2 == 0, "batch_add succeeded for both items during setup");
 
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 24 stderr capture");
         int rc = zfs_snapshot_batch(&ctx, 0, "2026-01-01_00:00:00");
+        if (log_fp) fflush(log_fp);
 
         CHECK(rc == -1, "zfs_snapshot_batch reports overall failure because one root's snapshot call failed");
         CHECK(ctx.items[0].snap_failed == 1, "the item under the failing root (badroot) is marked snap_failed");
         CHECK(ctx.items[1].snap_failed == 0,
               "the item under the OTHER, healthy root (goodroot) is NOT marked failed -- one root's failure does not leak onto a sibling root");
+        CHECK(buf != NULL && strstr(buf, "badroot diagnostic") != NULL,
+              "stderr from the genuine nonzero fake-zfs failure is drained and logged");
 
         batch_free(&ctx);
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
         unlink(g_fake_zfs); /* done with the fake zfs script now */
         printf("\n");
     }
@@ -1042,10 +1183,10 @@ int main(int argc, char **argv) {
             FILE *args_fp = fopen(g_inventory_args, "r");
             char args[1024] = {0};
             if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
-            CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA\n") != NULL && strstr(args, "poolB\n") != NULL,
-                  "multi-root inventory list is scoped recursively to every distinct root");
-            CHECK(strstr(args, "poolA/child") == NULL && strstr(args, "poolB/child") == NULL,
-                  "inventory list receives roots, not individual configured descendants");
+            CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA/child\n") != NULL && strstr(args, "poolB/child\n") != NULL,
+                  "multi-root inventory list is scoped recursively to every distinct configured subtree");
+            CHECK(strstr(args, "poolA\n") == NULL && strstr(args, "poolB\n") == NULL,
+                  "inventory list preserves configured descendants instead of truncating them to pool names");
             name_list_free(&inventory);
             batch_free(&std_b); batch_free(&rec_b);
             std_b = (batch_ctx_t){0};
@@ -1107,7 +1248,7 @@ int main(int argc, char **argv) {
             CHECK(buf != NULL && strstr(buf, "stderr-1") != NULL && strstr(buf, "stderr-40") != NULL,
                   "stderr output interleaved with stdout was also fully drained and logged, not starved by the stdout side of poll()");
 
-            fclose(log_fp);
+            if (log_fp) fclose(log_fp);
             log_fp = NULL;
             free(buf);
             free(ctx.items);
@@ -1145,7 +1286,7 @@ int main(int argc, char **argv) {
             CHECK(buf != NULL && strstr(buf, "late-stderr-1") != NULL && strstr(buf, "late-stderr-10") != NULL,
                   "all stderr lines emitted AFTER stdout's fd closed were still drained to completion, not cut off early");
 
-            fclose(log_fp);
+            if (log_fp) fclose(log_fp);
             log_fp = NULL;
             free(buf);
             free(ctx.items);
@@ -1250,7 +1391,7 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "Created=") == NULL,
               "no false 'Created=' line is emitted for a name that couldn't be safely formatted");
 
-        fclose(log_fp);
+        if (log_fp) fclose(log_fp);
         log_fp = NULL;
         free(buf);
         free(matches);
@@ -1282,12 +1423,31 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "Created=pool/normal@p_2026-01-01_00:00:00") != NULL,
               "the Created= line uses the correctly-formatted, non-truncated snapshot name");
 
-        fclose(log_fp);
+        if (log_fp) fclose(log_fp);
         log_fp = NULL;
         free(buf);
         free(matches);
         name_list_free(&inventory);
         batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 37: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
+    {
+        batch_ctx_t std_b = {0}, rec_b = {0};
+        char oversized[STR_BUF_LARGE + 32];
+        memset(oversized, 'a', sizeof(oversized) - 1);
+        oversized[sizeof(oversized) - 1] = '\0';
+        CHECK(batch_add(&std_b, "pool/keep", "standard", 1, -1, 0) == 0 &&
+              batch_add(&std_b, oversized, "standard", 1, -1, 0) == 0 &&
+              batch_add(&rec_b, "pool/recursive", "recursive", 1, -1, 0) == 0,
+              "overlap error-path setup succeeds");
+        CHECK(remove_recursive_overlaps(&std_b, &rec_b) == -1,
+              "an oversized standard dataset reaches the overlap-check error path");
+        CHECK(std_b.count == 1 && strcmp(std_b.items[0].dataset, "pool/keep") == 0,
+              "already-compacted entries remain the only owned entries after the error");
+        batch_free(&std_b); /* would double-free pool/keep without the count repair */
+        batch_free(&rec_b);
         printf("\n");
     }
 
