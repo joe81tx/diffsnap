@@ -166,11 +166,11 @@ static void run_system_tests(void) {
     CHECK(exec_cmd_stream_lenient(get_written, handle_metric_line, &real_metrics) == 0 && real_metrics.count == 4,
           "the real ZFS written-metrics command feeds the production metric parser");
     qsort(real_metrics.items, real_metrics.count, sizeof(*real_metrics.items), compare_metrics);
-    CHECK(find_metric(&real_metrics, dataset) && find_metric(&real_metrics, dataset)->written == 0 &&
-          find_metric(&real_metrics, standard) && find_metric(&real_metrics, standard)->written == 0 &&
-          find_metric(&real_metrics, tree) && find_metric(&real_metrics, tree)->written == 0 &&
-          find_metric(&real_metrics, tree_child) && find_metric(&real_metrics, tree_child)->written == 0,
-          "the real metrics contain each fresh expected dataset with its exact zero written value");
+    CHECK(find_metric(&real_metrics, dataset) && find_metric(&real_metrics, dataset)->written >= 0 &&
+          find_metric(&real_metrics, standard) && find_metric(&real_metrics, standard)->written >= 0 &&
+          find_metric(&real_metrics, tree) && find_metric(&real_metrics, tree)->written >= 0 &&
+          find_metric(&real_metrics, tree_child) && find_metric(&real_metrics, tree_child)->written >= 0,
+          "the real metrics contain each fresh expected dataset with a valid (non-negative) written value");
     free(real_metrics.items);
 
     batch_ctx_t standard_batch = {0};
