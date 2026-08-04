@@ -47,6 +47,7 @@
 #define STR_BUF_SMALL 32
 #define STR_BUF_MED 64
 #define ZFS_NAME_MAX 256
+#define SNAPSHOT_TIMESTAMP_MAX 24 /* YYYY-MM-DD_HH:MM:SS plus UTC offset */
 #define STR_BUF_LARGE (ZFS_NAME_MAX + 1)
 #define STR_BUF_XLARGE 512
 
@@ -76,6 +77,7 @@ static const char *log_path = LOG_PATH;
 static const char *lock_path = LOCK_PATH;
 static time_t (*time_now_fn)(time_t *) = time;
 static struct tm *(*localtime_now_fn)(const time_t *, struct tm *) = localtime_r;
+static ssize_t (*getline_now_fn)(char **, size_t *, FILE *) = getline;
 static void *(*realloc_now_fn)(void *, size_t) = realloc;
 static int time_override_active = 0;
 static time_t time_override_value;
@@ -476,14 +478,18 @@ static int handle_metric_line(const char *line, void *data) {
         log_msg("Error: Skipping oversized metric line");
         return -1;
     }
-    char *saveptr = NULL;
-    char *name = strtok_r(line_copy, "\t", &saveptr);
-    char *value = strtok_r(NULL, "\t", &saveptr);
-    /* Missing-tab and oversized-name lines are intentionally skipped rather
-     * than failing the command. This is narrower than the malformed-stdout
-     * contract near exec_cmd_stream_lenient, which applies when a handler
-     * reports a protocol violation. */
-    if (!name || !value) return 0;
+    char *name = line_copy;
+    char *tab = strchr(name, '\t');
+    if (!tab) {
+        log_msg("Error: Skipping metric line missing tab delimiter: %s", line);
+        return 0;
+    }
+    *tab++ = '\0';
+    if (strchr(tab, '\t')) {
+        log_msg("Error: Skipping metric line with unexpected fields: %s", line);
+        return 0;
+    }
+    char *value = tab;
     if (strlen(name) >= sizeof(ctx->items[0].name)) {
         log_msg("Error: Skipping metric line with oversized dataset name: %s", name);
         return 0;
@@ -502,6 +508,14 @@ static int handle_metric_line(const char *line, void *data) {
 }
 
 static int compare_metrics(const void *a, const void *b) { return strcmp(((metric_item_t *)a)->name, ((metric_item_t *)b)->name); }
+
+static metric_item_t *find_metric(const metric_ctx_t *metrics, const char *dataset) {
+    metric_item_t key = {0};
+    size_t len = strlen(dataset);
+    if (len >= sizeof(key.name) || metrics->count == 0) return NULL;
+    memcpy(key.name, dataset, len + 1);
+    return bsearch(&key, metrics->items, metrics->count, sizeof(*metrics->items), compare_metrics);
+}
 
 /* Forward declaration: defined later in the file, needed here by
  * sum_subtree_written(). */
@@ -526,11 +540,7 @@ static int is_strict_descendant(const char *child, const char *parent);
  * metrics array needs no deduplication before its binary searches.
  */
 static int sum_subtree_written(const metric_ctx_t *metrics, const char *dataset, long long *out_sum) {
-    metric_item_t key = {0};
-    if (strlen(dataset) >= sizeof(key.name)) return -1;
-    memcpy(key.name, dataset, strlen(dataset) + 1);
-    metric_item_t *root = metrics->count ?
-        bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
+    metric_item_t *root = find_metric(metrics, dataset);
     if (!root || root->written == -1) return -1;
     long long sum = root->written;
 
@@ -582,16 +592,9 @@ static void batch_filter_by_metrics(batch_ctx_t *ctx, const metric_ctx_t *metric
         if (recursive) {
             ok = (sum_subtree_written(metrics, ctx->items[i].dataset, &written) == 0);
         } else {
-            metric_item_t key = {0};
-            if (strlen(ctx->items[i].dataset) >= sizeof(key.name)) {
-                ok = 0;
-            } else {
-                memcpy(key.name, ctx->items[i].dataset, strlen(ctx->items[i].dataset) + 1);
-                metric_item_t *found = metrics->count ?
-                    bsearch(&key, metrics->items, metrics->count, sizeof(metric_item_t), compare_metrics) : NULL;
-                ok = found && found->written != -1;
-                if (ok) written = found->written;
-            }
+            metric_item_t *found = find_metric(metrics, ctx->items[i].dataset);
+            ok = found && found->written != -1;
+            if (ok) written = found->written;
         }
         int keep;
         if (!ok) {
@@ -694,12 +697,6 @@ static int same_zfs_root(const char *a, const char *b) {
     return a_len == b_len && strncmp(a, b, a_len) == 0;
 }
 
-static size_t zfs_root_len(const char *dataset) { return strlen(dataset); }
-
-static int same_zfs_dataset(const char *a, const char *b) {
-    return strcmp(a, b) == 0;
-}
-
 typedef struct { char **roots; size_t count; size_t capacity; } root_list_t;
 
 static void root_list_free(root_list_t *list) {
@@ -709,7 +706,7 @@ static void root_list_free(root_list_t *list) {
 }
 
 static int root_list_add_unique(root_list_t *list, const char *dataset) {
-    size_t len = zfs_root_len(dataset);
+    size_t len = strlen(dataset);
     for (size_t i = 0; i < list->count; ) {
         if (strcmp(list->roots[i], dataset) == 0 || is_strict_descendant(dataset, list->roots[i])) return 0;
         if (is_strict_descendant(list->roots[i], dataset)) {
@@ -747,7 +744,7 @@ static void batch_assign_duplicate_passes(batch_ctx_t *ctx) {
     for (size_t i = 0; i < ctx->count; i++) {
         size_t pass = 0;
         for (size_t k = 0; k < i; k++) {
-            if (same_zfs_dataset(ctx->items[k].dataset, ctx->items[i].dataset)) pass++;
+            if (strcmp(ctx->items[k].dataset, ctx->items[i].dataset) == 0) pass++;
         }
         ctx->items[i].pass = pass;
     }
@@ -1067,6 +1064,10 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     for (size_t i = 0; i < std_b->count; i++) {
         int covered = is_recursively_covered(std_b->items[i].dataset, std_b->items[i].prefix, rec_keys, built);
         if (covered < 0) {
+            for (size_t j = i; j < std_b->count; j++) {
+                free(std_b->items[j].dataset);
+                free(std_b->items[j].prefix);
+            }
             std_b->count = write_idx;
             for (size_t j = 0; j < built; j++) free(rec_keys[j]);
             free(rec_keys);
@@ -1216,7 +1217,7 @@ int main(int argc, char *argv[]) {
     if (localtime_now_fn(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
     long long current_day_mins = (tm_info.tm_hour * 60) + tm_info.tm_min;
-    while (getline(&line, &line_cap, conf) != -1) {
+    while (getline_now_fn(&line, &line_cap, conf) != -1) {
         trim_trailing_whitespace(line);
         if (line[0] == '\0' || line[0] == '#') continue;
         if (line[0] == ',' || strstr(line, ",,") != NULL) {
@@ -1241,6 +1242,10 @@ int main(int argc, char *argv[]) {
         REQUIRE_TOKEN("missing prefix field");
         if (copy_token(prefix, sizeof(prefix), token) != 0) { log_msg("Error: Config error for %s: prefix too long", dataset); global_status = 1; continue; }
         if (!valid_prefix(prefix)) { log_msg("Error: Config error for %s: invalid prefix '%s'", dataset, prefix); global_status = 1; continue; }
+        if (strlen(dataset) + 1 + strlen(prefix) + 1 + SNAPSHOT_TIMESTAMP_MAX > ZFS_NAME_MAX) {
+            log_msg("Error: Config error for %s: dataset/prefix timestamp name exceeds ZFS limit", dataset);
+            global_status = 1; continue;
+        }
         REQUIRE_TOKEN("missing recursive field");
         if (copy_token(recursive_str, sizeof(recursive_str), token) != 0) { log_msg("Error: Config error for %s: recursive field too long", dataset); global_status = 1; continue; }
         REQUIRE_TOKEN("missing min_bytes field"); errno = 0; min_bytes = strtoll(token, &endptr, 10);

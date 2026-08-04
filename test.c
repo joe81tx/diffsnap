@@ -165,6 +165,12 @@ static void run_system_tests(void) {
     };
     CHECK(exec_cmd_stream_lenient(get_written, handle_metric_line, &real_metrics) == 0 && real_metrics.count == 4,
           "the real ZFS written-metrics command feeds the production metric parser");
+    qsort(real_metrics.items, real_metrics.count, sizeof(*real_metrics.items), compare_metrics);
+    CHECK(find_metric(&real_metrics, dataset) && find_metric(&real_metrics, dataset)->written == 0 &&
+          find_metric(&real_metrics, standard) && find_metric(&real_metrics, standard)->written == 0 &&
+          find_metric(&real_metrics, tree) && find_metric(&real_metrics, tree)->written == 0 &&
+          find_metric(&real_metrics, tree_child) && find_metric(&real_metrics, tree_child)->written == 0,
+          "the real metrics contain each fresh expected dataset with its exact zero written value");
     free(real_metrics.items);
 
     batch_ctx_t standard_batch = {0};
@@ -279,6 +285,39 @@ static struct tm *test_positive_offset_localtime(const time_t *value, struct tm 
     return result;
 }
 
+static struct tm *test_non_due_localtime(const time_t *value, struct tm *result) {
+    (void)value;
+    memset(result, 0, sizeof(*result));
+    result->tm_year = 126; result->tm_mon = 0; result->tm_mday = 1;
+    result->tm_min = 1; /* 1 minute after midnight is not divisible by 7. */
+    return result;
+}
+
+static ssize_t test_getline_failure(char **lineptr, size_t *n, FILE *stream) {
+    (void)lineptr; (void)n; (void)stream;
+    errno = EIO;
+    return -1;
+}
+
+static int run_main_capture_stderr(int argc, char **argv, char *buf, size_t buf_size) {
+    int saved = dup(STDERR_FILENO);
+    FILE *capture = tmpfile();
+    if (saved < 0 || !capture) { if (saved >= 0) close(saved); if (capture) fclose(capture); return -1; }
+    fflush(stderr);
+    if (dup2(fileno(capture), STDERR_FILENO) < 0) { close(saved); fclose(capture); return -1; }
+    int rc = diffsnap_real_main(argc, argv);
+    fflush(stderr);
+    rewind(capture);
+    if (buf_size) {
+        size_t got = fread(buf, 1, buf_size - 1, capture);
+        buf[got] = '\0';
+    }
+    (void)dup2(saved, STDERR_FILENO);
+    close(saved);
+    fclose(capture);
+    return rc;
+}
+
 static void run_main_pipeline_tests(void) {
     char conf_file[PATH_MAX], log_file[PATH_MAX], lock_file[PATH_MAX], args_file[PATH_MAX];
     CHECK(snprintf(conf_file, sizeof(conf_file), "%s/main.conf", g_fake_zfs_dir) < (int)sizeof(conf_file) &&
@@ -305,6 +344,8 @@ static void run_main_pipeline_tests(void) {
         fputs("pool/a,1,1,p,maybe,0\n", fp);
         fputs("pool/a,1,1,p,no,-1\n", fp);
         fputs("pool/a,1,1,p,no,0,extra\n", fp);
+        fputs(",1,1,p,no,0\n", fp);
+        fputs("pool/a,1,,p,no,0\n", fp);
         fputs("pool/due,1,1,p,no,0\n", fp);
         fclose(fp);
         unlink(args_file);
@@ -315,7 +356,8 @@ static void run_main_pipeline_tests(void) {
         if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
         CHECK(strstr(contents, "invalid dataset") && strstr(contents, "invalid interval") &&
               strstr(contents, "invalid retention") && strstr(contents, "invalid prefix") &&
-              strstr(contents, "invalid recursive") && strstr(contents, "invalid byte threshold"),
+              strstr(contents, "invalid recursive") && strstr(contents, "invalid byte threshold") &&
+              strstr(contents, "adjacent comma delimiters"),
               "main() validates each config field through the real parsing pipeline");
     }
 
@@ -324,8 +366,10 @@ static void run_main_pipeline_tests(void) {
         fputs("pool/due,7,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
         diffsnap_override_time((time_t)0);
+        localtime_now_fn = test_non_due_localtime;
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
               "the interval-scheduling gate permits a clean no-work run");
+        localtime_now_fn = localtime_r;
         diffsnap_clear_time_override();
         CHECK(access(args_file, F_OK) != 0, "a non-due entry does not invoke zfs through main()");
     }
@@ -356,12 +400,53 @@ static void run_main_pipeline_tests(void) {
 
     fp = fopen(conf_file, "w");
     if (fp) {
-        fputs("1pool,1,1,p,no,0\n", fp); fclose(fp);
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         log_path = "/dev/full";
-        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+        char stderr_contents[1024] = {0};
+        CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_contents, sizeof(stderr_contents)) == 1,
               "a detected log_io_failed condition changes main()'s process exit code to failure");
+        CHECK(strstr(stderr_contents, "writes to log file /dev/full failed") != NULL,
+              "a log write failure reports the incomplete-log diagnostic on stderr");
         log_path = log_file;
     }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        char long_dataset[240], long_prefix[32];
+        memset(long_dataset, 'a', sizeof(long_dataset) - 1); long_dataset[sizeof(long_dataset) - 1] = '\0';
+        memset(long_prefix, 'p', sizeof(long_prefix) - 1); long_prefix[sizeof(long_prefix) - 1] = '\0';
+        fprintf(fp, "%s,1,1,%s,no,0\n", long_dataset, long_prefix);
+        fclose(fp);
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() rejects a dataset/prefix/timestamp name longer than ZFS permits");
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        getline_now_fn = test_getline_failure;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when getline reports a config read error before EOF");
+        getline_now_fn = getline;
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        g_localtime_fail = 1; localtime_now_fn = test_localtime;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when its top-level localtime_r call fails");
+        localtime_now_fn = localtime_r; g_localtime_fail = 0;
+    }
+
+    CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
+          "main() accepts --help");
+    CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--version", NULL}) == 0,
+          "main() accepts --version");
+    CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--unknown", NULL}) == 2,
+          "main() rejects an unknown option");
+    CHECK(diffsnap_real_main(3, (char *[]){"diffsnap-test", "--help", "extra", NULL}) == 2,
+          "main() rejects more than one command-line option");
     unlink(g_fake_zfs);
     unlink(conf_file); unlink(log_file); unlink(lock_file); unlink(args_file);
     conf_path = CONF_PATH; log_path = LOG_PATH; lock_path = LOCK_PATH;
@@ -413,6 +498,48 @@ static void run_fault_injection_tests(void) {
     CHECK(rc == -1 && g_realloc_calls == 2, "index collection reports the injected second realloc failure");
     CHECK(failed == count, "an index allocation failure marks every affected root/pass item failed");
     batch_free(&ctx);
+
+    /* Exercise every other dynamic-growth site through the same realloc
+     * hook. Each starts empty, so failing its first growth is deterministic. */
+    g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
+    batch_ctx_t batch = {0};
+    CHECK(batch_add(&batch, "pool/a", "p", 1, 0, 0) == -1,
+          "batch_add reports an injected growth allocation failure");
+    batch_free(&batch);
+
+    seen_set_t seen = {0};
+    CHECK(seen_set_add(&seen, "pool/a", "p") == -1,
+          "seen_set_add reports an injected growth allocation failure");
+    seen_set_free(&seen);
+
+    root_list_t roots = {0};
+    CHECK(root_list_add_unique(&roots, "pool/a") == -1,
+          "root_list_add_unique reports an injected growth allocation failure");
+    root_list_free(&roots);
+
+    metric_ctx_t metrics = {0};
+    CHECK(handle_metric_line("pool/a\t1", &metrics) == -1,
+          "handle_metric_line reports an injected growth allocation failure");
+    free(metrics.items);
+
+    name_list_t names = {0};
+    CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names) == -1,
+          "handle_snapshot_inventory_line reports an injected growth allocation failure");
+    name_list_free(&names);
+
+    name_list_t inventory = {0};
+    inventory.names = calloc(1, sizeof(*inventory.names));
+    if (inventory.names) {
+        inventory.names[0] = strdup("pool/a@p_2026-01-01_00:00:00"); inventory.count = 1; inventory.capacity = 1;
+        char **matches = NULL; size_t matches_cap = 0;
+        CHECK(prune_from_inventory(&inventory, "pool/a", "p", 1, 0, &matches, &matches_cap) == -1,
+              "prune_from_inventory reports an injected match-list growth allocation failure");
+        free(matches);
+    } else {
+        CHECK(0, "allocated setup inventory for prune allocation-failure test");
+    }
+    name_list_free(&inventory);
+    realloc_now_fn = realloc; g_realloc_fail_after = -1;
     printf("\n");
 }
 
@@ -894,6 +1021,26 @@ int main(int argc, char **argv) {
             }
             free(ctx.items);
         }
+        printf("\n");
+    }
+
+    printf("== Test 21a: malformed metric rows are skipped and logged ==\n");
+    {
+        metric_ctx_t metrics = {0};
+        char *log_buf = NULL; size_t log_len = 0;
+        log_fp = open_memstream(&log_buf, &log_len);
+        CHECK(log_fp != NULL, "opened a log capture for malformed metric rows");
+        if (log_fp) {
+            CHECK(handle_metric_line("pool/no-tab", &metrics) == 0 &&
+                  handle_metric_line("pool/extra\t1\textra", &metrics) == 0,
+                  "malformed metric rows are skipped without failing the command stream");
+            fflush(log_fp);
+            CHECK(metrics.count == 0 && strstr(log_buf, "missing tab delimiter") &&
+                  strstr(log_buf, "unexpected fields"),
+                  "missing and extra metric fields each produce a diagnostic log entry");
+            fclose(log_fp); log_fp = NULL;
+        }
+        free(log_buf); free(metrics.items);
         printf("\n");
     }
 
@@ -1432,7 +1579,23 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 37: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
+    printf("== Test 37: remove_recursive_overlaps removes only matching recursive coverage ==\n");
+    {
+        batch_ctx_t std_b = {0}, rec_b = {0};
+        batch_add(&std_b, "pool/a/child", "p", 1, -1, 0);
+        batch_add(&std_b, "pool/a/other", "other", 1, -1, 0);
+        batch_add(&std_b, "pool/b/child", "p", 1, -1, 0);
+        batch_add(&rec_b, "pool/a", "p", 1, -1, 0);
+        CHECK(remove_recursive_overlaps(&std_b, &rec_b) == 0,
+              "recursive-overlap filtering succeeds for matching and nonmatching entries");
+        CHECK(std_b.count == 2 && strcmp(std_b.items[0].dataset, "pool/a/other") == 0 &&
+              strcmp(std_b.items[1].dataset, "pool/b/child") == 0,
+              "only a standard entry under the matching recursive dataset and prefix is dropped");
+        batch_free(&std_b); batch_free(&rec_b);
+        printf("\n");
+    }
+
+    printf("== Test 38: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
         char oversized[STR_BUF_LARGE + 32];
