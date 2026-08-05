@@ -147,8 +147,13 @@ static void run_system_tests(void) {
     CHECK(1, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
 
     const char *const create_standard[] = {zfs_path, "create", "-p", standard, NULL};
+    int create_issued = 1;
     if (exec_cmd_stream(create_standard, NULL, NULL) != 0) {
         CHECK(0, "created an isolated real-ZFS standard dataset");
+        if (create_issued) {
+            const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
+            (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
+        }
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
@@ -347,6 +352,7 @@ static void run_main_pipeline_tests(void) {
         fputs(",1,1,p,no,0\n", fp);
         fputs("pool/a,1,,p,no,0\n", fp);
         fputs("pool/due,1,1,p,no,0\n", fp);
+        fputs("pool/due,1,1,p,no,0\n", fp);
         fclose(fp);
         unlink(args_file);
         char *argv[] = {"diffsnap-test", NULL};
@@ -357,7 +363,7 @@ static void run_main_pipeline_tests(void) {
         CHECK(strstr(contents, "invalid dataset") && strstr(contents, "invalid interval") &&
               strstr(contents, "invalid retention") && strstr(contents, "invalid prefix") &&
               strstr(contents, "invalid recursive") && strstr(contents, "invalid byte threshold") &&
-              strstr(contents, "adjacent comma delimiters"),
+              strstr(contents, "adjacent comma delimiters") && strstr(contents, "duplicate dataset/prefix"),
               "main() validates each config field through the real parsing pipeline");
     }
 
@@ -419,6 +425,11 @@ static void run_main_pipeline_tests(void) {
         fclose(fp);
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() rejects a dataset/prefix/timestamp name longer than ZFS permits");
+        FILE *log = fopen(log_file, "r");
+        char contents[8192] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "dataset/prefix timestamp name exceeds ZFS limit") != NULL,
+              "the overlong snapshot-name validation, rather than an unrelated metrics failure, is logged");
     }
 
     fp = fopen(conf_file, "w");
@@ -526,6 +537,37 @@ static void run_fault_injection_tests(void) {
     CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names) == -1,
           "handle_snapshot_inventory_line reports an injected growth allocation failure");
     name_list_free(&names);
+
+    batch_ctx_t recursive = {0};
+    realloc_now_fn = realloc;
+    int recursive_setup = batch_add(&recursive, "pool/a", "p", 1, -1, 0);
+    g_realloc_calls = 0; realloc_now_fn = test_realloc;
+    CHECK(recursive_setup == 0 && resolve_recursive_ancestor_overlaps(&recursive) == -1,
+          "resolve_recursive_ancestor_overlaps reports an injected allocation failure");
+    batch_free(&recursive);
+
+    batch_ctx_t recursive_compacted = {0};
+    realloc_now_fn = realloc;
+    int compacted_setup = batch_add(&recursive_compacted, "pool/a", "p", 1, -1, 0) == 0 &&
+                          batch_add(&recursive_compacted, "pool/a/child", "p", 1, -1, 0) == 0;
+    g_realloc_calls = 0; g_realloc_fail_after = 1; realloc_now_fn = test_realloc;
+    CHECK(compacted_setup && resolve_recursive_ancestor_overlaps(&recursive_compacted) == -1,
+          "resolve_recursive_ancestor_overlaps cleans up when its post-compaction ordering allocation fails");
+    CHECK(recursive_compacted.count == 1 && strcmp(recursive_compacted.items[0].dataset, "pool/a") == 0,
+          "the surviving recursive ancestor remains safely owned after ordering-allocation failure");
+    batch_free(&recursive_compacted);
+    g_realloc_fail_after = 0;
+
+    batch_ctx_t standard = {0}, recursive_cover = {0};
+    realloc_now_fn = realloc;
+    int overlap_setup = batch_add(&standard, "pool/a/child", "p", 1, -1, 0) == 0 &&
+                        batch_add(&recursive_cover, "pool/a", "p", 1, -1, 0) == 0;
+    g_realloc_calls = 0; realloc_now_fn = test_realloc;
+    CHECK(overlap_setup && remove_recursive_overlaps(&standard, &recursive_cover) == -1,
+          "remove_recursive_overlaps reports an injected allocation failure");
+    CHECK(standard.count == 1 && recursive_cover.count == 1,
+          "recursive-overlap allocation failure leaves both batches owned by their callers");
+    batch_free(&standard); batch_free(&recursive_cover);
 
     name_list_t inventory = {0};
     inventory.names = calloc(1, sizeof(*inventory.names));
@@ -1032,12 +1074,14 @@ int main(int argc, char **argv) {
         CHECK(log_fp != NULL, "opened a log capture for malformed metric rows");
         if (log_fp) {
             CHECK(handle_metric_line("pool/no-tab", &metrics) == 0 &&
-                  handle_metric_line("pool/extra\t1\textra", &metrics) == 0,
+                  handle_metric_line("pool/extra\t1\textra", &metrics) == 0 &&
+                  handle_metric_line("\t1", &metrics) == 0 &&
+                  handle_metric_line("pool/empty\t", &metrics) == 0,
                   "malformed metric rows are skipped without failing the command stream");
             fflush(log_fp);
             CHECK(metrics.count == 0 && strstr(log_buf, "missing tab delimiter") &&
-                  strstr(log_buf, "unexpected fields"),
-                  "missing and extra metric fields each produce a diagnostic log entry");
+                  strstr(log_buf, "unexpected fields") && strstr(log_buf, "empty dataset or written value"),
+                  "missing, extra, and empty metric fields each produce a diagnostic log entry");
             fclose(log_fp); log_fp = NULL;
         }
         free(log_buf); free(metrics.items);
@@ -1089,6 +1133,48 @@ int main(int argc, char **argv) {
         CHECK(g_spy_calls == 1, "handler() IS invoked normally for a well-formed, in-bounds line");
         CHECK(strcmp(g_spy_last_line, "pool/child\t12345") == 0, "handler() receives the complete, untruncated line content");
 
+        printf("\n");
+    }
+
+    printf("== Test 22a: snapshot inventory accepts exactly one complete snapshot name per line ==\n");
+    {
+        name_list_t inventory = {0};
+        char *log_buf = NULL; size_t log_len = 0;
+        log_fp = open_memstream(&log_buf, &log_len);
+        CHECK(log_fp != NULL, "opened a log capture for invalid snapshot inventory rows");
+        if (log_fp) {
+            CHECK(handle_snapshot_inventory_line("pool/ds@snap", &inventory) == 0 &&
+                      handle_snapshot_inventory_line("pool/ds", &inventory) == -1 &&
+                      handle_snapshot_inventory_line("pool/ds@snap\textra", &inventory) == -1 &&
+                      handle_snapshot_inventory_line("pool/ds@snap@extra", &inventory) == -1,
+                  "an inventory row must contain exactly one complete snapshot name");
+            fflush(log_fp);
+            CHECK(inventory.count == 1 && strstr(log_buf, "Invalid snapshot inventory line"),
+                  "invalid inventory rows are logged and rejected before they enter pruning");
+            fclose(log_fp); log_fp = NULL;
+        }
+        free(log_buf);
+        name_list_free(&inventory);
+        printf("\n");
+    }
+
+    printf("== Test 22b: zfs_destroy passes -r for recursive destruction ==\n");
+    {
+        char trace_path[PATH_MAX];
+        CHECK(snprintf(trace_path, sizeof(trace_path), "%s/destroy-args", g_fake_zfs_dir) < (int)sizeof(trace_path),
+              "recursive-destroy argv trace path fits in the isolated test directory");
+        char script[PATH_MAX + 128];
+        CHECK(snprintf(script, sizeof(script), "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> '%s'\n", trace_path) < (int)sizeof(script) &&
+                  write_fake_zfs(script) == 0,
+              "installed fake zfs that records recursive destroy argv");
+        CHECK(zfs_destroy("pool/ds@snap", 1) == 0, "recursive zfs_destroy succeeds through the fake zfs command");
+        FILE *trace = fopen(trace_path, "r");
+        char contents[256] = {0};
+        if (trace) { size_t rd = fread(contents, 1, sizeof(contents) - 1, trace); (void)rd; fclose(trace); }
+        CHECK(strstr(contents, "destroy\n") && strstr(contents, "-r\n") && strstr(contents, "pool/ds@snap\n"),
+              "recursive zfs_destroy passes the -r argument to zfs");
+        unlink(trace_path);
+        unlink(g_fake_zfs);
         printf("\n");
     }
 

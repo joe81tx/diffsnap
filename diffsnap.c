@@ -500,6 +500,10 @@ static int handle_metric_line(const char *line, void *data) {
         return 0;
     }
     char *value = tab;
+    if (*name == '\0' || *value == '\0') {
+        log_msg("Error: Skipping metric line with empty dataset or written value: %s", line);
+        return 0;
+    }
     if (strlen(name) >= sizeof(ctx->items[0].name)) {
         log_msg("Error: Skipping metric line with oversized dataset name: %s", name);
         return 0;
@@ -775,8 +779,9 @@ static int compare_order_entry(const void *a, const void *b) {
 
 static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
     if (rec_b->count == 0) return 0;
-    int *covered = calloc(rec_b->count, sizeof(int));
+    int *covered = diffsnap_realloc(NULL, rec_b->count * sizeof(*covered));
     if (!covered) return -1;
+    memset(covered, 0, rec_b->count * sizeof(*covered));
     for (size_t j = 0; j < rec_b->count; j++) {
         for (size_t i = 0; i < rec_b->count; i++) {
             if (i == j) continue;
@@ -813,7 +818,7 @@ static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
     rec_b->count = write_idx;
     free(covered);
     batch_assign_duplicate_passes(rec_b);
-    order_entry_t *order = malloc(rec_b->count * sizeof(order_entry_t));
+    order_entry_t *order = diffsnap_realloc(NULL, rec_b->count * sizeof(*order));
     if (!order) return -1;
     for (size_t i = 0; i < rec_b->count; i++) {
         order[i].idx = i;
@@ -984,6 +989,11 @@ static int name_index_contains(char **names, size_t count, const char *name) {
 
 static int handle_snapshot_inventory_line(const char *line, void *data) {
     name_list_t *list = (name_list_t *)data;
+    const char *at = strchr(line, '@');
+    if (!at || at == line || at[1] == '\0' || strchr(at + 1, '@') || strpbrk(line, "\t\r\n")) {
+        log_msg("Error: Invalid snapshot inventory line: %s", line);
+        return -1;
+    }
     if (list->count >= list->capacity) {
         size_t new_cap = list->capacity == 0 ? ALLOC_CHUNK_PRUNE : list->capacity * 2;
         char **tmp = diffsnap_realloc(list->names, new_cap * sizeof(*list->names));
@@ -1056,7 +1066,7 @@ static int is_recursively_covered(const char *dataset, const char *prefix, char 
 
 static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_b) {
     if (std_b->count == 0 || rec_b->count == 0) return 0;
-    char **rec_keys = malloc(rec_b->count * sizeof(*rec_keys));
+    char **rec_keys = diffsnap_realloc(NULL, rec_b->count * sizeof(*rec_keys));
     if (!rec_keys) return -1;
     size_t built = 0;
     for (size_t i = 0; i < rec_b->count; i++) {
