@@ -252,15 +252,42 @@ static void format_dataset_prefix_key(char *dst, size_t dst_size,
     (void)snprintf(dst, dst_size, "%s\x1f%s", dataset, prefix);
 }
 
-/* Whether any write to the log file has failed since it was opened. */
-static int log_had_io_failure(void) { return log_io_failed; }
-
 static void early_fail(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     vfprintf(stderr, fmt, args);
     va_end(args);
     fprintf(stderr, "\n");
+}
+
+/*
+ * Cron and other minimal launchers may start this process with fd 0, 1,
+ * and/or 2 already closed. If so, the first low-numbered descriptors this
+ * process opens (lock file, log file, and later the pipes
+ * exec_cmd_stream_core() creates for each `zfs` call) land in those slots
+ * instead of their intended ones. That's benign on its own, but
+ * exec_cmd_stream_core()'s child dup2()s a pipe end onto STDOUT_FILENO/
+ * STDERR_FILENO and then closes both original pipe fds: if one of those
+ * pipe fds already equals 1 or 2, the dup2() (or the "close both ends"
+ * cleanup immediately after it) closes the wrong descriptor and severs the
+ * pipe before the child ever execs `zfs`, silently breaking that command's
+ * I/O. Filling any closed 0/1/2 with /dev/null here, before this process
+ * opens anything else, keeps 0/1/2 permanently reserved for real stdio so
+ * no descriptor opened later -- by us or by a forked child -- can ever
+ * collide with them.
+ */
+static int ensure_std_fds(void) {
+    for (int fd = 0; fd <= 2; fd++) {
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull == -1) return -1;
+        if (devnull != fd) {
+            int dup_rc = dup2(devnull, fd);
+            close(devnull);
+            if (dup_rc == -1) return -1;
+        }
+    }
+    return 0;
 }
 
 static void format_bytes(long long bytes, char *buf, size_t buf_size) {
@@ -1178,6 +1205,10 @@ static int finalize_batch(batch_ctx_t *batch, const name_list_t *inventory, int 
 
 int main(int argc, char *argv[]) {
     const char *progname = (argc > 0 && argv[0]) ? argv[0] : "diffsnap";
+    if (ensure_std_fds() != 0) {
+        early_fail("%s: failed to establish standard file descriptors", progname);
+        return 1;
+    }
     if (argc > 2) {
         fprintf(stderr, "Usage: %s [--help] [--version]\n", progname);
         return 2;
@@ -1408,7 +1439,7 @@ batch_free(&rec_b);
 seen_set_free(&seen);
 
 if (log_fp) {
-    if (log_had_io_failure()) {
+    if (log_io_failed) {
         fprintf(stderr, "%s: one or more writes to log file %s failed; log is incomplete\n",
                 progname, log_path);
         ret_code = 1;
