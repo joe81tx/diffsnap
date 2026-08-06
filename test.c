@@ -113,6 +113,7 @@ static void run_chunk_test(void) {
     CHECK(largest_bytes <= ARGV_BYTES_CAP, "every chunk stays within ARGV_BYTES_CAP");
     batch_free(&batch);
     (void)unlink(trace_path);
+    (void)unlink(g_fake_zfs);
     printf("\n");
 }
 
@@ -368,6 +369,38 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for REQUIRE_TOKEN missing-field validation");
+    if (fp) {
+        /* Each line is truncated one field earlier than the last, so every
+         * one of REQUIRE_TOKEN's five "missing field" error paths (interval,
+         * retention, prefix, recursive, min_bytes) is driven by a line that
+         * has every field up to that point valid, but simply ends before
+         * strtok_r() has another token to hand back. */
+        fputs("pool/a\n", fp);
+        fputs("pool/a,1\n", fp);
+        fputs("pool/a,1,1\n", fp);
+        fputs("pool/a,1,1,p\n", fp);
+        fputs("pool/a,1,1,p,no\n", fp);
+        fclose(fp);
+        unlink(args_file);
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() returns failure when every config line is missing a required trailing field");
+        FILE *log = fopen(log_file, "r");
+        char contents[4096] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "missing interval field") != NULL,
+              "REQUIRE_TOKEN reports a missing interval field when a line ends after the dataset");
+        CHECK(strstr(contents, "missing retention field") != NULL,
+              "REQUIRE_TOKEN reports a missing retention field when a line ends after the interval");
+        CHECK(strstr(contents, "missing prefix field") != NULL,
+              "REQUIRE_TOKEN reports a missing prefix field when a line ends after the retention");
+        CHECK(strstr(contents, "missing recursive field") != NULL,
+              "REQUIRE_TOKEN reports a missing recursive field when a line ends after the prefix");
+        CHECK(strstr(contents, "missing min_bytes field") != NULL,
+              "REQUIRE_TOKEN reports a missing min_bytes field when a line ends after the recursive flag");
+    }
+
+    fp = fopen(conf_file, "w");
     if (fp) {
         fputs("pool/due,7,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
@@ -448,6 +481,70 @@ static void run_main_pipeline_tests(void) {
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() fails when its top-level localtime_r call fails");
         localtime_now_fn = localtime_r; g_localtime_fail = 0;
+    }
+
+    /*
+     * main()'s own metrics-fetch scoped/unscoped fallback is a separate,
+     * independently-implemented use_scoped/roots_bytes > ARGV_BYTES_CAP
+     * check from the structurally similar one in
+     * load_combined_snapshot_inventory (covered directly by Test 29). It --
+     * and, with it, main()'s choice between exec_cmd_stream_lenient
+     * (scoped) and exec_cmd_stream (unscoped) for this call site -- can
+     * only be driven by real due roots gathered from parsed config
+     * entries, so these two blocks go through diffsnap_real_main() itself
+     * rather than unit-testing either helper in isolation.
+     */
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        unlink(args_file);
+        char get_script[PATH_MAX + 128];
+        CHECK(snprintf(get_script, sizeof(get_script),
+                       "#!/bin/sh\nif [ \"$1\" = get ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n"
+                       " printf 'pool/due\\t100\\n'\n exit 5\nfi\nexit 0\n",
+                       args_file) < (int)sizeof(get_script) &&
+              write_fake_zfs(get_script) == 0,
+              "fake zfs for main()'s scoped metrics-fetch test installed");
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+              "main() tolerates a nonzero exit from its own scoped `zfs get` when valid metrics were still printed for the one due root (exec_cmd_stream_lenient)");
+        FILE *args = fopen(args_file, "r");
+        char contents[1024] = {0};
+        if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+        CHECK(strstr(contents, "-r\n") != NULL && strstr(contents, "pool/due\n") != NULL,
+              "main()'s own metrics fetch scopes the `zfs get` call to the due root when the root bytes fit ARGV_BYTES_CAP");
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        /* Enough due roots, each long but still within the per-line ZFS
+         * name limit main() enforces during parsing, to push their combined
+         * bytes past ARGV_BYTES_CAP and force main()'s own fallback to an
+         * unscoped `zfs get`. */
+        char padding[190];
+        memset(padding, 'x', sizeof(padding) - 1);
+        padding[sizeof(padding) - 1] = '\0';
+        for (size_t i = 0; i < 700; i++) fprintf(fp, "pool/%s%03zu,1,1,p,no,0\n", padding, i);
+        fclose(fp);
+        unlink(args_file);
+        unlink(log_file);
+        char get_script[PATH_MAX + 128];
+        CHECK(snprintf(get_script, sizeof(get_script),
+                       "#!/bin/sh\nif [ \"$1\" = get ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n exit 3\nfi\nexit 0\n",
+                       args_file) < (int)sizeof(get_script) &&
+              write_fake_zfs(get_script) == 0,
+              "fake zfs for main()'s unscoped metrics-fetch fallback test installed");
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when its own unscoped `zfs get` fallback exits nonzero (exec_cmd_stream, strict)");
+        FILE *args = fopen(args_file, "r");
+        char contents[1024] = {0};
+        if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+        CHECK(strstr(contents, "-r\n") == NULL,
+              "main()'s own metrics fetch falls back to an unscoped `zfs get` when the due roots' combined bytes exceed ARGV_BYTES_CAP");
+        FILE *log = fopen(log_file, "r");
+        char log_contents[4096] = {0};
+        if (log) { size_t rd = fread(log_contents, 1, sizeof(log_contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(log_contents, "Failed to read ZFS written metrics") != NULL,
+              "the strict unscoped fallback's nonzero exit surfaces through main()'s top-level metrics-fetch error");
     }
 
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
