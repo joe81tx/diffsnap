@@ -859,7 +859,9 @@ static int resolve_recursive_ancestor_overlaps(batch_ctx_t *rec_b) {
             collision = 0;
             for (size_t oa = 0; oa < oi; oa++) {
                 size_t i = order[oa].idx;
-                if (is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset) &&
+                int same_dataset = strcmp(rec_b->items[j].dataset, rec_b->items[i].dataset) == 0;
+                if ((same_dataset ||
+                     is_strict_descendant(rec_b->items[j].dataset, rec_b->items[i].dataset)) &&
                     rec_b->items[i].pass == rec_b->items[j].pass) {
                     rec_b->items[j].pass++;
                     collision = 1;
