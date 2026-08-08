@@ -106,6 +106,17 @@ static void diffsnap_clear_time_override(void) { time_override_active = 0; }
 #endif
 
 static void *diffsnap_realloc(void *ptr, size_t size) { return realloc_now_fn(ptr, size); }
+
+/* strdup()-equivalent that funnels through the same indirection as every
+ * other allocation, so realloc_now_fn (and its test-time failure injection)
+ * covers it too. Never call strdup()/malloc() directly for heap memory that
+ * production error paths are expected to handle failure for. */
+static char *diffsnap_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *r = diffsnap_realloc(NULL, n);
+    if (r) memcpy(r, s, n);
+    return r;
+}
 /* Set when any fprintf/vfprintf to log_fp fails (e.g. disk full, EIO).
  * log_msg() has no return value for callers to check, so this is how a
  * mid-run logging failure gets surfaced to main()'s exit status instead of
@@ -328,7 +339,7 @@ static int seen_set_add(seen_set_t *set, const char *dataset, const char *prefix
         if (!tmp) return -1;
         set->keys = tmp; set->capacity = new_cap;
     }
-    char *k = strdup(key);
+    char *k = diffsnap_strdup(key);
     if (!k) return -1;
     set->keys[set->count++] = k;
     return 0;
@@ -717,7 +728,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
         if (!tmp) return -1;
         ctx->items = tmp; ctx->capacity = new_cap;
     }
-    char *d = strdup(dataset), *p = strdup(prefix);
+    char *d = diffsnap_strdup(dataset), *p = diffsnap_strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
     ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = written, .min_bytes = min_bytes };
     return 0;
@@ -747,7 +758,6 @@ static void root_list_free(root_list_t *list) {
 }
 
 static int root_list_add_unique(root_list_t *list, const char *dataset) {
-    size_t len = strlen(dataset);
     for (size_t i = 0; i < list->count; ) {
         if (strcmp(list->roots[i], dataset) == 0 || is_strict_descendant(dataset, list->roots[i])) return 0;
         if (is_strict_descendant(list->roots[i], dataset)) {
@@ -764,10 +774,8 @@ static int root_list_add_unique(root_list_t *list, const char *dataset) {
         if (!tmp) return -1;
         list->roots = tmp; list->capacity = new_cap;
     }
-    char *r = malloc(len + 1);
+    char *r = diffsnap_strdup(dataset);
     if (!r) return -1;
-    memcpy(r, dataset, len);
-    r[len] = '\0';
     list->roots[list->count++] = r;
     return 0;
 }
@@ -903,11 +911,11 @@ static void batch_mark_indices_failed(batch_ctx_t *ctx, const size_t *indices, s
 static int zfs_snapshot_exec_chunk(batch_ctx_t *ctx, int recursive, const char *timestamp,
                                     const size_t *indices, size_t chunk_count, size_t chunk_bytes) {
     size_t total_args = (recursive ? 3 : 2) + chunk_count + 1;
-    const char **argv = malloc(total_args * sizeof(char *));
+    const char **argv = diffsnap_realloc(NULL, total_args * sizeof(char *));
     if (!argv) { batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
     size_t idx = 0; argv[idx++] = zfs_path; argv[idx++] = "snapshot";
     if (recursive) argv[idx++] = "-r";
-    char *arena = malloc(chunk_bytes), *offset = arena;
+    char *arena = diffsnap_realloc(NULL, chunk_bytes), *offset = arena;
     if (!arena) { free(argv); batch_mark_indices_failed(ctx, indices, chunk_count); return -1; }
     for (size_t k = 0; k < chunk_count; k++) {
         size_t i = indices[k];
@@ -1029,7 +1037,7 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
         if (!tmp) return -1;
         list->names = tmp; list->capacity = new_cap;
     }
-    if ((list->names[list->count] = strdup(line)) == NULL) return -1;
+    if ((list->names[list->count] = diffsnap_strdup(line)) == NULL) return -1;
     list->count++;
     return 0;
 }
@@ -1059,7 +1067,7 @@ static int load_combined_snapshot_inventory(name_list_t *list, const batch_ctx_t
     int use_scoped = (roots_bytes <= ARGV_BYTES_CAP);
     size_t fixed_argc = use_scoped ? 10 : 9; /* "-r" only when roots are supplied */
     size_t argc = fixed_argc + (use_scoped ? roots.count : 0) + 1;
-    const char **argv = malloc(argc * sizeof(*argv));
+    const char **argv = diffsnap_realloc(NULL, argc * sizeof(*argv));
     if (!argv) { root_list_free(&roots); return -1; }
     size_t idx = 0;
     argv[idx++] = zfs_path; argv[idx++] = "list"; argv[idx++] = "-H";
@@ -1101,7 +1109,7 @@ static int remove_recursive_overlaps(batch_ctx_t *std_b, const batch_ctx_t *rec_
     for (size_t i = 0; i < rec_b->count; i++) {
         char key[STR_BUF_LARGE + STR_BUF_MED + 2];
         format_dataset_prefix_key(key, sizeof(key), rec_b->items[i].dataset, rec_b->items[i].prefix);
-        if ((rec_keys[built] = strdup(key)) == NULL) {
+        if ((rec_keys[built] = diffsnap_strdup(key)) == NULL) {
             for (size_t j = 0; j < built; j++) free(rec_keys[j]);
             free(rec_keys);
             return -1;
@@ -1362,7 +1370,7 @@ int main(int argc, char *argv[]) {
 
         size_t fixed_argc = use_scoped ? 10 : 9; /* "-r" only present when scoped */
         size_t m_argc = fixed_argc + (use_scoped ? due_roots.count : 0) + 1; /* +1 for NULL */
-        const char **m_argv = malloc(m_argc * sizeof(char *));
+        const char **m_argv = diffsnap_realloc(NULL, m_argc * sizeof(char *));
         if (!m_argv) {
             log_msg("Error: Failed to allocate metrics command");
             root_list_free(&due_roots);
@@ -1451,6 +1459,7 @@ if (log_fp) {
                 progname, log_path, strerror(errno));
         ret_code = 1;
     }
+    log_fp = NULL;
 }
 
 close(lock_fd);

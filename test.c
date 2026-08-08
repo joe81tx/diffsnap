@@ -70,6 +70,48 @@ static int write_fake_zfs(const char *script) {
     return chmod(g_fake_zfs, 0700);
 }
 
+/*
+ * ensure_std_fds() only does anything observable when fd 0, 1, or 2 starts
+ * closed, which is never true for this test binary's own stdio -- so it
+ * has to be driven directly: close one of the low-numbered slots (stderr,
+ * saved aside first so real error output still works everywhere else),
+ * call the function, and confirm it specifically refilled that slot with
+ * /dev/null rather than merely leaving it closed or opening something
+ * else. The real stderr is restored immediately afterward regardless of
+ * outcome.
+ */
+static void run_ensure_std_fds_test(void) {
+    printf("== ensure_std_fds: refills a closed low-numbered stdio slot with /dev/null ==\n");
+    int saved = dup(STDERR_FILENO);
+    if (saved < 0) {
+        CHECK(0, "dup'd the real stderr aside before closing it for the ensure_std_fds test");
+        printf("\n");
+        return;
+    }
+    fflush(stderr);
+    CHECK(close(STDERR_FILENO) == 0, "closed fd 2 to simulate a launcher that starts diffsnap with stderr already closed");
+
+    int rc = ensure_std_fds();
+    CHECK(rc == 0, "ensure_std_fds succeeds when fd 2 starts closed");
+    CHECK(fcntl(STDERR_FILENO, F_GETFD) != -1, "ensure_std_fds leaves fd 2 open afterward");
+
+    int null_fd = open("/dev/null", O_RDONLY);
+    struct stat fd2_st, null_st;
+    CHECK(null_fd >= 0 && fstat(STDERR_FILENO, &fd2_st) == 0 && fstat(null_fd, &null_st) == 0 &&
+          fd2_st.st_dev == null_st.st_dev && fd2_st.st_rdev == null_st.st_rdev,
+          "ensure_std_fds refills the closed slot specifically with /dev/null, not just any open file");
+    if (null_fd >= 0) close(null_fd);
+
+    CHECK(dup2(saved, STDERR_FILENO) != -1, "restored the real stderr after the ensure_std_fds test");
+    close(saved);
+
+    /* All three fds are open now (real ones, restored above), so a second
+     * call is a documented no-op: it must report success without touching
+     * anything. */
+    CHECK(ensure_std_fds() == 0, "ensure_std_fds is a successful no-op when fd 0/1/2 are all already open");
+    printf("\n");
+}
+
 static void run_chunk_test(void) {
     char trace_path[PATH_MAX];
     CHECK(snprintf(trace_path, sizeof(trace_path), "%s/chunks", g_fake_zfs_dir) < (int)sizeof(trace_path),
@@ -162,7 +204,15 @@ static void run_system_tests(void) {
     created = 1;
     CHECK(1, "created an isolated real-ZFS standard dataset");
     const char *const create_tree[] = {zfs_path, "create", "-p", tree_child, NULL};
-    CHECK(exec_cmd_stream(create_tree, NULL, NULL) == 0, "created an isolated nested real-ZFS dataset tree");
+    if (exec_cmd_stream(create_tree, NULL, NULL) != 0) {
+        CHECK(0, "created an isolated nested real-ZFS dataset tree");
+        const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
+        (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
+        zfs_path = g_fake_zfs;
+        printf("\n");
+        return;
+    }
+    CHECK(1, "created an isolated nested real-ZFS dataset tree");
 
     metric_ctx_t real_metrics = {0};
     const char *const get_written[] = {
@@ -358,6 +408,8 @@ static void run_main_pipeline_tests(void) {
         unlink(args_file);
         char *argv[] = {"diffsnap-test", NULL};
         CHECK(diffsnap_real_main(1, argv) == 1, "main() returns failure when every config field has an invalid example");
+        CHECK(log_fp == NULL,
+              "main() nulls the global log_fp after closing it, so no dangling FILE* survives into the next diffsnap_real_main() call in this in-process suite");
         FILE *log = fopen(log_file, "r");
         char contents[8192] = {0};
         if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
@@ -547,6 +599,27 @@ static void run_main_pipeline_tests(void) {
               "the strict unscoped fallback's nonzero exit surfaces through main()'s top-level metrics-fetch error");
     }
 
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        unlink(log_file);
+        /* Preceding this run's own m_argv allocation are: seen_set_add's
+         * growth + key copy (2 calls), batch_add's growth + dataset copy +
+         * prefix copy (3 calls), and collect_due_roots' single
+         * root_list_add_unique growth + string copy (2 calls) -- 7 calls
+         * total, so failing call 8 targets exactly the metrics-fetch argv
+         * allocation itself. */
+        g_realloc_calls = 0; g_realloc_fail_after = 7; realloc_now_fn = test_realloc;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when its own metrics-fetch argv allocation fails");
+        realloc_now_fn = realloc; g_realloc_fail_after = -1;
+        FILE *log = fopen(log_file, "r");
+        char contents[1024] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "Failed to allocate metrics command") != NULL,
+              "the metrics-fetch argv allocation failure is logged with its own diagnostic");
+    }
+
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
           "main() accepts --help");
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--version", NULL}) == 0,
@@ -607,6 +680,26 @@ static void run_fault_injection_tests(void) {
     CHECK(failed == count, "an index allocation failure marks every affected root/pass item failed");
     batch_free(&ctx);
 
+    batch_ctx_t chunk_ctx = {0};
+    realloc_now_fn = realloc;
+    int chunk_setup = batch_add(&chunk_ctx, "pool/chunk", "p", 1, -1, 0) == 0;
+    size_t chunk_indices[1] = {0};
+
+    g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
+    CHECK(chunk_setup && zfs_snapshot_exec_chunk(&chunk_ctx, 0, "2026-01-01_00:00:00", chunk_indices, 1, 256) == -1,
+          "zfs_snapshot_exec_chunk reports an injected argv allocation failure");
+    CHECK(chunk_ctx.count == 1 && chunk_ctx.items[0].snap_failed == 1,
+          "an argv allocation failure marks the chunk's items snap_failed");
+    chunk_ctx.items[0].snap_failed = 0;
+
+    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    CHECK(zfs_snapshot_exec_chunk(&chunk_ctx, 0, "2026-01-01_00:00:00", chunk_indices, 1, 256) == -1,
+          "zfs_snapshot_exec_chunk reports an injected arena allocation failure after a successful argv allocation");
+    CHECK(chunk_ctx.items[0].snap_failed == 1,
+          "an arena allocation failure also marks the chunk's items snap_failed");
+    realloc_now_fn = realloc; g_realloc_fail_after = -1;
+    batch_free(&chunk_ctx);
+
     /* Exercise every other dynamic-growth site through the same realloc
      * hook. Each starts empty, so failing its first growth is deterministic. */
     g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
@@ -615,15 +708,39 @@ static void run_fault_injection_tests(void) {
           "batch_add reports an injected growth allocation failure");
     batch_free(&batch);
 
+    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    batch_ctx_t batch_dup = {0};
+    CHECK(batch_add(&batch_dup, "pool/a", "p", 1, 0, 0) == -1,
+          "batch_add reports an injected dataset/prefix string-copy allocation failure after a successful growth");
+    CHECK(batch_dup.count == 0, "batch_add leaves the batch empty when the string copy fails");
+    batch_free(&batch_dup);
+    g_realloc_fail_after = 0;
+
     seen_set_t seen = {0};
     CHECK(seen_set_add(&seen, "pool/a", "p") == -1,
           "seen_set_add reports an injected growth allocation failure");
     seen_set_free(&seen);
 
+    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    seen_set_t seen_dup = {0};
+    CHECK(seen_set_add(&seen_dup, "pool/a", "p") == -1,
+          "seen_set_add reports an injected key-copy allocation failure after a successful growth");
+    CHECK(seen_dup.count == 0, "seen_set_add leaves the set empty when the key copy fails");
+    seen_set_free(&seen_dup);
+    g_realloc_fail_after = 0;
+
     root_list_t roots = {0};
     CHECK(root_list_add_unique(&roots, "pool/a") == -1,
           "root_list_add_unique reports an injected growth allocation failure");
     root_list_free(&roots);
+
+    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    root_list_t roots_dup = {0};
+    CHECK(root_list_add_unique(&roots_dup, "pool/a") == -1,
+          "root_list_add_unique reports an injected string-copy allocation failure after a successful growth");
+    CHECK(roots_dup.count == 0, "root_list_add_unique leaves the list empty when the string copy fails");
+    root_list_free(&roots_dup);
+    g_realloc_fail_after = 0;
 
     metric_ctx_t metrics = {0};
     CHECK(handle_metric_line("pool/a\t1", &metrics) == -1,
@@ -634,6 +751,14 @@ static void run_fault_injection_tests(void) {
     CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names) == -1,
           "handle_snapshot_inventory_line reports an injected growth allocation failure");
     name_list_free(&names);
+
+    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    name_list_t names_dup = {0};
+    CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names_dup) == -1,
+          "handle_snapshot_inventory_line reports an injected string-copy allocation failure after a successful growth");
+    CHECK(names_dup.count == 0, "handle_snapshot_inventory_line leaves the list empty when the string copy fails");
+    name_list_free(&names_dup);
+    g_realloc_fail_after = 0;
 
     batch_ctx_t recursive = {0};
     realloc_now_fn = realloc;
@@ -666,11 +791,39 @@ static void run_fault_injection_tests(void) {
           "recursive-overlap allocation failure leaves both batches owned by their callers");
     batch_free(&standard); batch_free(&recursive_cover);
 
+    batch_ctx_t standard2 = {0}, recursive_cover2 = {0};
+    realloc_now_fn = realloc;
+    int overlap_setup2 = batch_add(&standard2, "pool/a/child", "p", 1, -1, 0) == 0 &&
+                         batch_add(&recursive_cover2, "pool/a", "p", 1, -1, 0) == 0;
+    g_realloc_calls = 0; g_realloc_fail_after = 1; realloc_now_fn = test_realloc;
+    CHECK(overlap_setup2 && remove_recursive_overlaps(&standard2, &recursive_cover2) == -1,
+          "remove_recursive_overlaps reports an injected key-copy allocation failure after a successful rec_keys growth");
+    CHECK(standard2.count == 1 && recursive_cover2.count == 1,
+          "the per-item key-copy allocation failure also leaves both batches owned by their callers");
+    realloc_now_fn = realloc; g_realloc_fail_after = -1;
+    batch_free(&standard2); batch_free(&recursive_cover2);
+    g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
+
+    batch_ctx_t inv_std = {0}, inv_rec = {0};
+    realloc_now_fn = realloc;
+    int inv_setup = batch_add(&inv_std, "pool/inv", "p", 1, -1, 0) == 0;
+    name_list_t inv_list = {0};
+    g_realloc_calls = 0; g_realloc_fail_after = 2; realloc_now_fn = test_realloc;
+    CHECK(inv_setup && load_combined_snapshot_inventory(&inv_list, &inv_std, &inv_rec) == -1,
+          "load_combined_snapshot_inventory reports an injected argv allocation failure after collecting due roots");
+    CHECK(inv_list.count == 0,
+          "load_combined_snapshot_inventory leaves its output list empty when the argv allocation fails");
+    realloc_now_fn = realloc; g_realloc_fail_after = -1;
+    name_list_free(&inv_list);
+    batch_free(&inv_std); batch_free(&inv_rec);
+    g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
+
     name_list_t inventory = {0};
     inventory.names = calloc(1, sizeof(*inventory.names));
     if (inventory.names) {
         inventory.names[0] = strdup("pool/a@p_2026-01-01_00:00:00"); inventory.count = 1; inventory.capacity = 1;
         char **matches = NULL; size_t matches_cap = 0;
+        g_realloc_calls = 0; realloc_now_fn = test_realloc;
         CHECK(prune_from_inventory(&inventory, "pool/a", "p", 1, 0, &matches, &matches_cap) == -1,
               "prune_from_inventory reports an injected match-list growth allocation failure");
         free(matches);
@@ -690,6 +843,7 @@ int main(int argc, char **argv) {
     }
     CHECK(setup_fake_zfs() == 0, "created an isolated fake-zfs directory");
     if (zfs_path != g_fake_zfs) return 1;
+    run_ensure_std_fds_test();
     run_main_pipeline_tests();
     run_fault_injection_tests();
     run_chunk_test();
@@ -1685,7 +1839,45 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 35: finalize_batch fails safely, not silently, when a snapshot name would not fit its buffer ==\n");
+    printf("== Test 35: resolve_recursive_ancestor_overlaps assigns different passes to ancestrally-overlapping items that survive because their prefixes differ ==\n");
+    {
+        /*
+         * "pool/a" and "pool/a/b" have DIFFERENT prefixes, so the
+         * same-prefix coverage check above never drops either one -- both
+         * survive into the pass-assignment step below. batch_assign_
+         * duplicate_passes() only bumps pass on an EXACT dataset-string
+         * repeat, so it assigns both of these pass 0. Without the
+         * collision-avoidance loop that follows, they'd stay in the same
+         * pass despite "pool/a/b" being a descendant of "pool/a" -- and
+         * zfs_snapshot_batch_root_pass() groups same-root/same-pass items
+         * into ONE chunked `zfs snapshot -r ...` command, so both would be
+         * named in a single recursive-snapshot invocation where one
+         * dataset's `-r` coverage already includes the other. The
+         * collision loop exists specifically to bump the descendant to a
+         * separate pass so the two recursive snapshots run as separate
+         * `zfs snapshot -r` invocations instead.
+         */
+        batch_ctx_t rec_b = {0};
+        CHECK(batch_add(&rec_b, "pool/a", "p1", 1, -1, 0) == 0 &&
+              batch_add(&rec_b, "pool/a/b", "p2", 1, -1, 0) == 0,
+              "pass-collision test batch setup succeeds");
+
+        int rc = resolve_recursive_ancestor_overlaps(&rec_b);
+
+        CHECK(rc == 0, "resolve_recursive_ancestor_overlaps succeeds for ancestrally-overlapping items with different prefixes");
+        CHECK(rec_b.count == 2,
+              "different prefixes mean neither item is covered/dropped, unlike the same-prefix cases in Tests 33-34");
+        CHECK(rec_b.count == 2 && strcmp(rec_b.items[0].dataset, "pool/a") == 0 &&
+              strcmp(rec_b.items[1].dataset, "pool/a/b") == 0,
+              "both items keep their original relative order (neither was covered, so nothing was compacted)");
+        CHECK(rec_b.count == 2 && rec_b.items[0].pass != rec_b.items[1].pass,
+              "the descendant (pool/a/b) is bumped to a pass distinct from its ancestor's (pool/a), avoiding a same-pass collision between two overlapping `zfs snapshot -r` calls");
+
+        batch_free(&rec_b);
+        printf("\n");
+    }
+
+    printf("== Test 36: finalize_batch fails safely, not silently, when a snapshot name would not fit its buffer ==\n");
     {
         /*
          * Reachable only by handing finalize_batch a batch_ctx_t built
@@ -1730,9 +1922,9 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 36: finalize_batch's snap_name formatting still succeeds normally for an ordinary, well-sized dataset ==\n");
+    printf("== Test 37: finalize_batch's snap_name formatting still succeeds normally for an ordinary, well-sized dataset ==\n");
     {
-        /* Baseline contrast to Test 35: proves the new truncation check
+        /* Baseline contrast to Test 36: proves the new truncation check
          * doesn't disturb the ordinary, overwhelmingly common case. */
         batch_ctx_t b = {0};
         int rc = batch_add(&b, "pool/normal", "p", 1, 4096, -1);
@@ -1762,23 +1954,44 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 37: remove_recursive_overlaps removes only matching recursive coverage ==\n");
+    printf("== Test 38: remove_recursive_overlaps removes only matching recursive coverage ==\n");
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
         batch_add(&std_b, "pool/a/child", "p", 1, -1, 0);
         batch_add(&std_b, "pool/a/other", "other", 1, -1, 0);
         batch_add(&std_b, "pool/b/child", "p", 1, -1, 0);
+        /* "pool/a/child" is covered after is_recursively_covered's for(;;)
+         * walk strips just ONE path segment ("pool/a/child" -> "pool/a").
+         * "pool/a/b/c" needs the walk to strip TWO segments in succession
+         * ("pool/a/b/c" -> "pool/a/b" -> "pool/a") before it finds the
+         * match, exercising the loop beyond its first iteration. */
+        batch_add(&std_b, "pool/a/b/c", "p", 1, -1, 0);
         batch_add(&rec_b, "pool/a", "p", 1, -1, 0);
+
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "opened a log capture for Test 38's coverage messages");
+
         CHECK(remove_recursive_overlaps(&std_b, &rec_b) == 0,
               "recursive-overlap filtering succeeds for matching and nonmatching entries");
+        if (log_fp) fflush(log_fp);
         CHECK(std_b.count == 2 && strcmp(std_b.items[0].dataset, "pool/a/other") == 0 &&
               strcmp(std_b.items[1].dataset, "pool/b/child") == 0,
-              "only a standard entry under the matching recursive dataset and prefix is dropped");
+              "only the standard entries under the matching recursive dataset and prefix are dropped");
+        CHECK(buf != NULL && strstr(buf, "Skipping pool/a/child") != NULL,
+              "the one-level-gap descendant is recognized as covered");
+        CHECK(buf != NULL && strstr(buf, "Skipping pool/a/b/c") != NULL,
+              "a two-level-gap descendant is also recognized as covered, exercising is_recursively_covered's ancestor walk past its first iteration");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
         batch_free(&std_b); batch_free(&rec_b);
         printf("\n");
     }
 
-    printf("== Test 38: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
+    printf("== Test 39: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
         char oversized[STR_BUF_LARGE + 32];
@@ -1792,7 +2005,13 @@ int main(int argc, char **argv) {
               "an oversized standard dataset reaches the overlap-check error path");
         CHECK(std_b.count == 1 && strcmp(std_b.items[0].dataset, "pool/keep") == 0,
               "already-compacted entries remain the only owned entries after the error");
-        batch_free(&std_b); /* would double-free pool/keep without the count repair */
+        batch_free(&std_b); /* the count repair matters for the OVERSIZED entry, not pool/keep:
+                              * the error path already freed items[1..count-1] (just the oversized
+                              * entry here) and shrank std_b->count to exclude them, so batch_free
+                              * only iterates surviving items. pool/keep at items[0] was never
+                              * touched by the error path and would be safe to free either way --
+                              * without the repair, it's the already-freed oversized entry that
+                              * batch_free would double-free by walking past the reduced count. */
         batch_free(&rec_b);
         printf("\n");
     }
