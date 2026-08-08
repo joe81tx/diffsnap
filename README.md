@@ -100,6 +100,8 @@ Fields:
 
 Blank lines and lines where the first character is `#` are ignored.
 
+If the same dataset and prefix combination are configured more than once, the first entry is accepted and the rest will not and generate a log entry.
+
 Example config:  
 
 ```text
@@ -115,7 +117,7 @@ Changing or removing configuration entries may leave existing snapshots behind, 
 
 For example, if `diffsnap` is scheduled every 20 minutes (0, 20, 40), datasets configured for 15-minute intervals (0, 15, 30, 45) will only overlap at 0 and the other 3 intervals will be skipped. Running `diffsnap` every minute avoids these unintential skips.
 
-If the number of datasets, snapshots, or configuration entries is large enough, `diffsnap` may not finish before the next scheduled run. If that happens, the new instance will exit with a standard error message indicating that another instance is already running. Any snapshots that would have been created during that scheduled run will be skipped. If this occurs in your environment, increase the interval between scheduled runs from the default once-per-minute schedule.
+If the number of datasets, snapshots, or configuration entries is large enough, `diffsnap` may not finish before the next scheduled run. If that happens, the new run will exit with a standard error message indicating that another instance is already running. Any snapshots that would have been created during that scheduled run will be skipped. If this occurs in your environment, increase the interval between runs from the default once-per-minute schedule.
 
 The examples below schedule `diffsnap` to run as root. You can authorize an unprivileged user to execute zfs snapshot and zfs destroy commands using `zfs allow`. This permits the use of a user crontab or a non-root systemd timer, but it also requires manually adjusting filesystem permissions for the configuration and log files. These implementation steps are outside the scope of this document.
 
