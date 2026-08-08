@@ -876,8 +876,8 @@ int main(int argc, char **argv) {
     printf("== Test 3: abnormal termination (signal) is still fatal in BOTH modes ==\n");
     {
         /* /bin/sh -c 'kill -9 $$' makes the child kill itself with SIGKILL --
-         * WIFEXITED will be false, exercising the wait_failed/child_exited
-         * path rather than the exit-status path. */
+         * WIFEXITED will be false, exercising the child_exited==false path
+         * rather than the exit-status path. */
         const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
         const char *sh_bin = find_bin(sh_candidates);
         CHECK(sh_bin != NULL, "found a shell to use for the self-signal test");

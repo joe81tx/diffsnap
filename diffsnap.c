@@ -441,7 +441,7 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
     return ((out_reader && out_reader->failed) || (err_reader && err_reader->failed)) ? -1 : 0;
 }
 
-typedef struct { int processing_rc; int child_exited; int child_status; int wait_failed; } exec_result_t;
+typedef struct { int processing_rc; int child_exited; int child_status; } exec_result_t;
 
 static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler_t handler, void *data) {
     exec_result_t result = {0};
@@ -478,7 +478,6 @@ static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler
     result.processing_rc = drain_command_streams(handler ? &out_reader : NULL, &err_reader);
     int status; pid_t wpid;
     do { wpid = waitpid(pid, &status, 0); } while (wpid == -1 && errno == EINTR);
-    result.wait_failed = (wpid == -1);
     result.child_exited = (wpid != -1) && WIFEXITED(status);
     result.child_status = result.child_exited ? WEXITSTATUS(status) : -1;
     return result;
@@ -486,7 +485,7 @@ static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler
 
 static int exec_cmd_stream(const char *const argv[], line_handler_t handler, void *data) {
     exec_result_t r = exec_cmd_stream_core(argv, handler, data);
-    return (!r.wait_failed && r.processing_rc == 0 && r.child_exited && r.child_status == 0) ? 0 : -1;
+    return (r.processing_rc == 0 && r.child_exited && r.child_status == 0) ? 0 : -1;
 }
 
 /*
@@ -504,7 +503,7 @@ static int exec_cmd_stream(const char *const argv[], line_handler_t handler, voi
  */
 static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t handler, void *data) {
     exec_result_t r = exec_cmd_stream_core(argv, handler, data);
-    if (r.wait_failed || r.processing_rc != 0 || !r.child_exited) return -1;
+    if (r.processing_rc != 0 || !r.child_exited) return -1;
     /*
      * EXIT_EXEC_FAILED is our own sentinel for "execv never ran the target
      * at all" (bad ZFS_PATH, permissions, etc.) -- a total failure, not a
