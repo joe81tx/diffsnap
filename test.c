@@ -131,7 +131,7 @@ static void run_chunk_test(void) {
     for (size_t i = 0; i < item_count; i++) {
         char dataset[STR_BUF_LARGE];
         snprintf(dataset, sizeof(dataset), "pool/%s%03zu", padding, i);
-        CHECK(batch_add(&batch, dataset, "chunk", 1, 0, 0) == 0, "chunk test batch item added");
+        CHECK(batch_add(&batch, dataset, "chunk", 1, 0) == 0, "chunk test batch item added");
     }
     CHECK(zfs_snapshot_batch(&batch, 0, "2026-01-01_00:00:00") == 0,
           "large batch is accepted by the fake zfs command");
@@ -236,11 +236,11 @@ static void run_system_tests(void) {
     size_t matches_cap = 0;
     const char *stamp = "2026-01-01_00:00:00";
 
-    CHECK(batch_add(&standard_batch, standard, "system", 1, 0, 0) == 0,
+    CHECK(batch_add(&standard_batch, standard, "system", 1, 0) == 0,
           "assembled a real-ZFS standard snapshot batch");
     CHECK(zfs_snapshot_batch(&standard_batch, 0, stamp) == 0,
           "zfs_snapshot_batch creates a real non-recursive snapshot");
-    CHECK(batch_add(&recursive_batch, tree, "system-rec", 1, 0, 0) == 0,
+    CHECK(batch_add(&recursive_batch, tree, "system-rec", 1, 0) == 0,
           "assembled a real-ZFS recursive snapshot batch");
     CHECK(zfs_snapshot_batch(&recursive_batch, 1, stamp) == 0,
           "zfs_snapshot_batch creates a real recursive snapshot");
@@ -267,7 +267,7 @@ static void run_system_tests(void) {
     CHECK(exec_cmd_stream(old_snapshot, NULL, NULL) == 0, "created an older real-ZFS snapshot for pruning");
     sleep(1);
     batch_ctx_t prune_batch = {0};
-    CHECK(batch_add(&prune_batch, standard, "system-prune", 1, 0, 0) == 0 &&
+    CHECK(batch_add(&prune_batch, standard, "system-prune", 1, 0) == 0 &&
           zfs_snapshot_batch(&prune_batch, 0, stamp) == 0,
           "created the retained real-ZFS snapshot through the batch path");
     CHECK(load_combined_snapshot_inventory(&inventory, &prune_batch, &recursive_batch) == 0,
@@ -693,7 +693,7 @@ static void run_fault_injection_tests(void) {
     for (size_t i = 0; i < count; i++) {
         char dataset[64];
         snprintf(dataset, sizeof(dataset), "pool/ds%03zu", i);
-        CHECK(batch_add(&ctx, dataset, "p", 1, -1, 0) == 0, "OOM test batch setup succeeds");
+        CHECK(batch_add(&ctx, dataset, "p", 1, 0) == 0, "OOM test batch setup succeeds");
     }
     g_realloc_calls = 0;
     g_realloc_fail_after = 1;
@@ -709,7 +709,7 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t chunk_ctx = {0};
     realloc_now_fn = realloc;
-    int chunk_setup = batch_add(&chunk_ctx, "pool/chunk", "p", 1, -1, 0) == 0;
+    int chunk_setup = batch_add(&chunk_ctx, "pool/chunk", "p", 1, 0) == 0;
     size_t chunk_indices[1] = {0};
 
     g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
@@ -731,13 +731,13 @@ static void run_fault_injection_tests(void) {
      * hook. Each starts empty, so failing its first growth is deterministic. */
     g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
     batch_ctx_t batch = {0};
-    CHECK(batch_add(&batch, "pool/a", "p", 1, 0, 0) == -1,
+    CHECK(batch_add(&batch, "pool/a", "p", 1, 0) == -1,
           "batch_add reports an injected growth allocation failure");
     batch_free(&batch);
 
     g_realloc_calls = 0; g_realloc_fail_after = 1;
     batch_ctx_t batch_dup = {0};
-    CHECK(batch_add(&batch_dup, "pool/a", "p", 1, 0, 0) == -1,
+    CHECK(batch_add(&batch_dup, "pool/a", "p", 1, 0) == -1,
           "batch_add reports an injected dataset/prefix string-copy allocation failure after a successful growth");
     CHECK(batch_dup.count == 0, "batch_add leaves the batch empty when the string copy fails");
     batch_free(&batch_dup);
@@ -800,7 +800,7 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t recursive = {0};
     realloc_now_fn = realloc;
-    int recursive_setup = batch_add(&recursive, "pool/a", "p", 1, -1, 0);
+    int recursive_setup = batch_add(&recursive, "pool/a", "p", 1, 0);
     g_realloc_calls = 0; realloc_now_fn = test_realloc;
     CHECK(recursive_setup == 0 && resolve_recursive_ancestor_overlaps(&recursive) == -1,
           "resolve_recursive_ancestor_overlaps reports an injected allocation failure");
@@ -808,8 +808,8 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t recursive_compacted = {0};
     realloc_now_fn = realloc;
-    int compacted_setup = batch_add(&recursive_compacted, "pool/a", "p", 1, -1, 0) == 0 &&
-                          batch_add(&recursive_compacted, "pool/a/child", "p", 1, -1, 0) == 0;
+    int compacted_setup = batch_add(&recursive_compacted, "pool/a", "p", 1, 0) == 0 &&
+                          batch_add(&recursive_compacted, "pool/a/child", "p", 1, 0) == 0;
     g_realloc_calls = 0; g_realloc_fail_after = 1; realloc_now_fn = test_realloc;
     CHECK(compacted_setup && resolve_recursive_ancestor_overlaps(&recursive_compacted) == -1,
           "resolve_recursive_ancestor_overlaps cleans up when its post-compaction ordering allocation fails");
@@ -820,8 +820,8 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t standard = {0}, recursive_cover = {0};
     realloc_now_fn = realloc;
-    int overlap_setup = batch_add(&standard, "pool/a/child", "p", 1, -1, 0) == 0 &&
-                        batch_add(&recursive_cover, "pool/a", "p", 1, -1, 0) == 0;
+    int overlap_setup = batch_add(&standard, "pool/a/child", "p", 1, 0) == 0 &&
+                        batch_add(&recursive_cover, "pool/a", "p", 1, 0) == 0;
     g_realloc_calls = 0; realloc_now_fn = test_realloc;
     CHECK(overlap_setup && remove_recursive_overlaps(&standard, &recursive_cover) == -1,
           "remove_recursive_overlaps reports an injected allocation failure");
@@ -831,8 +831,8 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t standard2 = {0}, recursive_cover2 = {0};
     realloc_now_fn = realloc;
-    int overlap_setup2 = batch_add(&standard2, "pool/a/child", "p", 1, -1, 0) == 0 &&
-                         batch_add(&recursive_cover2, "pool/a", "p", 1, -1, 0) == 0;
+    int overlap_setup2 = batch_add(&standard2, "pool/a/child", "p", 1, 0) == 0 &&
+                         batch_add(&recursive_cover2, "pool/a", "p", 1, 0) == 0;
     g_realloc_calls = 0; g_realloc_fail_after = 1; realloc_now_fn = test_realloc;
     CHECK(overlap_setup2 && remove_recursive_overlaps(&standard2, &recursive_cover2) == -1,
           "remove_recursive_overlaps reports an injected key-copy allocation failure after a successful rec_keys growth");
@@ -844,7 +844,7 @@ static void run_fault_injection_tests(void) {
 
     batch_ctx_t inv_std = {0}, inv_rec = {0};
     realloc_now_fn = realloc;
-    int inv_setup = batch_add(&inv_std, "pool/inv", "p", 1, -1, 0) == 0;
+    int inv_setup = batch_add(&inv_std, "pool/inv", "p", 1, 0) == 0;
     name_list_t inv_list = {0};
     g_realloc_calls = 0; g_realloc_fail_after = 2; realloc_now_fn = test_realloc;
     CHECK(inv_setup && load_combined_snapshot_inventory(&inv_list, &inv_std, &inv_rec) == -1,
@@ -972,11 +972,11 @@ int main(int argc, char **argv) {
     printf("== Test 6: collect_due_roots across both batches, with duplicates and cross-batch overlap ==\n");
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
-        batch_add(&std_b, "pool/a", "p", 1, -1, 0);
-        batch_add(&std_b, "pool/b", "p", 1, -1, 0);       /* sibling: remains separately scoped */
-        batch_add(&std_b, "otherpool/x", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool", "p", 1, -1, 0);          /* ancestor covers pool/a and pool/b */
-        batch_add(&rec_b, "thirdpool/y/z", "p", 1, -1, 0);
+        batch_add(&std_b, "pool/a", "p", 1, 0);
+        batch_add(&std_b, "pool/b", "p", 1, 0);       /* sibling: remains separately scoped */
+        batch_add(&std_b, "otherpool/x", "p", 1, 0);
+        batch_add(&rec_b, "pool", "p", 1, 0);          /* ancestor covers pool/a and pool/b */
+        batch_add(&rec_b, "thirdpool/y/z", "p", 1, 0);
 
         root_list_t due_roots = {0};
         int rc = collect_due_roots(&due_roots, &std_b, &rec_b);
@@ -1000,7 +1000,7 @@ int main(int argc, char **argv) {
     printf("== Test 7: batch_filter_by_metrics -- found/valid/above-threshold items are kept with .written cached ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/a", "p", 1, -1, 100);   /* min_bytes=100 */
+        batch_add(&b, "pool/a", "p", 1, 100);   /* min_bytes=100 */
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(1, sizeof(metric_item_t));
@@ -1023,7 +1023,7 @@ int main(int argc, char **argv) {
     printf("== Test 8: batch_filter_by_metrics -- dataset not found is removed and flagged ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/missing", "p", 1, -1, 0);
+        batch_add(&b, "pool/missing", "p", 1, 0);
 
         metric_ctx_t metrics = {0}; /* empty: nothing matches */
         int global_status = 0;
@@ -1038,7 +1038,7 @@ int main(int argc, char **argv) {
     printf("== Test 9: batch_filter_by_metrics -- invalid (-1) written metric is removed and flagged ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/a", "p", 1, -1, 0);
+        batch_add(&b, "pool/a", "p", 1, 0);
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(1, sizeof(metric_item_t));
@@ -1059,7 +1059,7 @@ int main(int argc, char **argv) {
     printf("== Test 10: batch_filter_by_metrics -- below min_bytes is removed SILENTLY (no error flag) ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/a", "p", 1, -1, 999999); /* high min_bytes threshold */
+        batch_add(&b, "pool/a", "p", 1, 999999); /* high min_bytes threshold */
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(1, sizeof(metric_item_t));
@@ -1072,7 +1072,7 @@ int main(int argc, char **argv) {
         CHECK(b.count == 0, "below-threshold item is removed");
         CHECK(global_status == 0, "global_status is NOT flagged (this is a normal skip, not an error)");
 
-        batch_add(&b, "pool/a", "p", 1, -1, 100);
+        batch_add(&b, "pool/a", "p", 1, 100);
         global_status = 0;
         batch_filter_by_metrics(&b, &metrics, 0, &global_status);
         CHECK(b.count == 1 && b.items[0].written == 100,
@@ -1087,11 +1087,11 @@ int main(int argc, char **argv) {
     printf("== Test 11: batch_filter_by_metrics -- mixed batch, compaction preserves surviving items correctly ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/keep1", "p", 1, -1, 0);
-        batch_add(&b, "pool/notfound", "p", 1, -1, 0);
-        batch_add(&b, "pool/keep2", "p", 1, -1, 0);
-        batch_add(&b, "pool/belowthresh", "p", 1, -1, 999999);
-        batch_add(&b, "pool/keep3", "p", 1, -1, 0);
+        batch_add(&b, "pool/keep1", "p", 1, 0);
+        batch_add(&b, "pool/notfound", "p", 1, 0);
+        batch_add(&b, "pool/keep2", "p", 1, 0);
+        batch_add(&b, "pool/belowthresh", "p", 1, 999999);
+        batch_add(&b, "pool/keep3", "p", 1, 0);
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(4, sizeof(metric_item_t));
@@ -1259,7 +1259,7 @@ int main(int argc, char **argv) {
          * whole tree.
          */
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/parent", "p", 1, -1, 5000); /* min_bytes=5000 */
+        batch_add(&b, "pool/parent", "p", 1, 5000); /* min_bytes=5000 */
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(2, sizeof(metric_item_t));
@@ -1282,7 +1282,7 @@ int main(int argc, char **argv) {
     printf("== Test 19: batch_filter_by_metrics(recursive=1) -- whole subtree quiescent is still skipped silently ==\n");
     {
         batch_ctx_t b = {0};
-        batch_add(&b, "pool/parent", "p", 1, -1, 5000);
+        batch_add(&b, "pool/parent", "p", 1, 5000);
 
         metric_ctx_t metrics = {0};
         metrics.items = calloc(2, sizeof(metric_item_t));
@@ -1533,8 +1533,8 @@ int main(int argc, char **argv) {
         CHECK(write_fake_zfs("#!/bin/sh\ncase \"$*\" in\n  *badroot*) echo 'badroot diagnostic' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n") == 0,
               "fake zfs script created outside the system ZFS path for Test 24");
         batch_ctx_t ctx = {0};
-        int rc1 = batch_add(&ctx, "badroot/x", "p", 1, -1, 0);
-        int rc2 = batch_add(&ctx, "goodroot/y", "p", 1, -1, 0);
+        int rc1 = batch_add(&ctx, "badroot/x", "p", 1, 0);
+        int rc2 = batch_add(&ctx, "goodroot/y", "p", 1, 0);
         CHECK(rc1 == 0 && rc2 == 0, "batch_add succeeded for both items during setup");
 
         char *buf = NULL;
@@ -1709,8 +1709,8 @@ int main(int argc, char **argv) {
               "installed fake zfs script for inventory-root scoping tests");
 
         batch_ctx_t std_b = {0}, rec_b = {0};
-        batch_add(&std_b, "poolA/child", "p", 1, 0, 0);
-        batch_add(&rec_b, "poolB/child", "p", 1, 0, 0);
+        batch_add(&std_b, "poolA/child", "p", 1, 0);
+        batch_add(&rec_b, "poolB/child", "p", 1, 0);
         name_list_t inventory = {0};
         CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
               "inventory loading succeeds for multiple roots through the fake zfs command");
@@ -1729,7 +1729,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < 600; i++) {
             char root[STR_BUF_LARGE];
             snprintf(root, sizeof(root), "p%03zu%.*s", i, 250, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-            batch_add(&std_b, root, "p", 1, 0, 0);
+            batch_add(&std_b, root, "p", 1, 0);
         }
         CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
               "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
@@ -1858,9 +1858,9 @@ int main(int argc, char **argv) {
          * can get to 0, and must neither crash nor mis-handle that.
          */
         batch_ctx_t rec_b = {0};
-        batch_add(&rec_b, "pool/a", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool/a/b", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool/a/b/c", "p", 1, -1, 0);
+        batch_add(&rec_b, "pool/a", "p", 1, 0);
+        batch_add(&rec_b, "pool/a/b", "p", 1, 0);
+        batch_add(&rec_b, "pool/a/b/c", "p", 1, 0);
 
         int rc = resolve_recursive_ancestor_overlaps(&rec_b);
 
@@ -1876,8 +1876,8 @@ int main(int argc, char **argv) {
     printf("== Test 34: resolve_recursive_ancestor_overlaps -- equal-length siblings with the same prefix cover neither one ==\n");
     {
         batch_ctx_t rec_b = {0};
-        batch_add(&rec_b, "pool/aaa", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool/bbb", "p", 1, -1, 0); /* same length as pool/aaa, same prefix, NOT an ancestor/descendant of it */
+        batch_add(&rec_b, "pool/aaa", "p", 1, 0);
+        batch_add(&rec_b, "pool/bbb", "p", 1, 0); /* same length as pool/aaa, same prefix, NOT an ancestor/descendant of it */
 
         int rc = resolve_recursive_ancestor_overlaps(&rec_b);
 
@@ -1907,8 +1907,8 @@ int main(int argc, char **argv) {
          * `zfs snapshot -r` invocations instead.
          */
         batch_ctx_t rec_b = {0};
-        CHECK(batch_add(&rec_b, "pool/a", "p1", 1, -1, 0) == 0 &&
-              batch_add(&rec_b, "pool/a/b", "p2", 1, -1, 0) == 0,
+        CHECK(batch_add(&rec_b, "pool/a", "p1", 1, 0) == 0 &&
+              batch_add(&rec_b, "pool/a/b", "p2", 1, 0) == 0,
               "pass-collision test batch setup succeeds");
 
         int rc = resolve_recursive_ancestor_overlaps(&rec_b);
@@ -1942,7 +1942,7 @@ int main(int argc, char **argv) {
         long_ds[sizeof(long_ds) - 1] = '\0';
         /* dataset(499) + '@'(1) + prefix(1) + '_'(1) + timestamp(19) + NUL(1)
          * = 522 bytes, safely over STR_BUF_XLARGE (512). */
-        int rc = batch_add(&b, long_ds, "p", 1, 123, -1);
+        int rc = batch_add(&b, long_ds, "p", 1, -1);
         CHECK(rc == 0, "batch_add succeeded during setup with a deliberately oversized dataset name");
 
         name_list_t inventory = {0};
@@ -1976,7 +1976,7 @@ int main(int argc, char **argv) {
         /* Baseline contrast to Test 36: proves the new truncation check
          * doesn't disturb the ordinary, overwhelmingly common case. */
         batch_ctx_t b = {0};
-        int rc = batch_add(&b, "pool/normal", "p", 1, 4096, -1);
+        int rc = batch_add(&b, "pool/normal", "p", 1, -1);
         CHECK(rc == 0, "batch_add succeeded during setup");
 
         name_list_t inventory = {0};
@@ -2006,16 +2006,16 @@ int main(int argc, char **argv) {
     printf("== Test 38: remove_recursive_overlaps removes only matching recursive coverage ==\n");
     {
         batch_ctx_t std_b = {0}, rec_b = {0};
-        batch_add(&std_b, "pool/a/child", "p", 1, -1, 0);
-        batch_add(&std_b, "pool/a/other", "other", 1, -1, 0);
-        batch_add(&std_b, "pool/b/child", "p", 1, -1, 0);
+        batch_add(&std_b, "pool/a/child", "p", 1, 0);
+        batch_add(&std_b, "pool/a/other", "other", 1, 0);
+        batch_add(&std_b, "pool/b/child", "p", 1, 0);
         /* "pool/a/child" is covered after is_recursively_covered's for(;;)
          * walk strips just ONE path segment ("pool/a/child" -> "pool/a").
          * "pool/a/b/c" needs the walk to strip TWO segments in succession
          * ("pool/a/b/c" -> "pool/a/b" -> "pool/a") before it finds the
          * match, exercising the loop beyond its first iteration. */
-        batch_add(&std_b, "pool/a/b/c", "p", 1, -1, 0);
-        batch_add(&rec_b, "pool/a", "p", 1, -1, 0);
+        batch_add(&std_b, "pool/a/b/c", "p", 1, 0);
+        batch_add(&rec_b, "pool/a", "p", 1, 0);
 
         char *buf = NULL;
         size_t buf_len = 0;
@@ -2046,9 +2046,9 @@ int main(int argc, char **argv) {
         char oversized[STR_BUF_LARGE + 32];
         memset(oversized, 'a', sizeof(oversized) - 1);
         oversized[sizeof(oversized) - 1] = '\0';
-        CHECK(batch_add(&std_b, "pool/keep", "standard", 1, -1, 0) == 0 &&
-              batch_add(&std_b, oversized, "standard", 1, -1, 0) == 0 &&
-              batch_add(&rec_b, "pool/recursive", "recursive", 1, -1, 0) == 0,
+        CHECK(batch_add(&std_b, "pool/keep", "standard", 1, 0) == 0 &&
+              batch_add(&std_b, oversized, "standard", 1, 0) == 0 &&
+              batch_add(&rec_b, "pool/recursive", "recursive", 1, 0) == 0,
               "overlap error-path setup succeeds");
         CHECK(remove_recursive_overlaps(&std_b, &rec_b) == -1,
               "an oversized standard dataset reaches the overlap-check error path");
@@ -2079,7 +2079,7 @@ int main(int argc, char **argv) {
          * about what happened next.
          */
         batch_ctx_t b = {0};
-        CHECK(batch_add(&b, "pool/unverified", "p", 1, 0, -1) == 0,
+        CHECK(batch_add(&b, "pool/unverified", "p", 1, -1) == 0,
               "batch_add succeeded during Test 40 setup");
         b.items[0].snap_failed = 1;
 
@@ -2114,7 +2114,7 @@ int main(int argc, char **argv) {
     printf("== Test 41: finalize_batch on a snap_failed item confirmed ABSENT from a usable inventory skips pruning for that dataset ==\n");
     {
         batch_ctx_t b = {0};
-        CHECK(batch_add(&b, "pool/absent", "p", 1, 0, -1) == 0,
+        CHECK(batch_add(&b, "pool/absent", "p", 1, -1) == 0,
               "batch_add succeeded during Test 41 setup");
         b.items[0].snap_failed = 1;
 
@@ -2157,7 +2157,7 @@ int main(int argc, char **argv) {
          * pessimistic.
          */
         batch_ctx_t b = {0};
-        CHECK(batch_add(&b, "pool/actually-there", "p", 1, 4096, -1) == 0,
+        CHECK(batch_add(&b, "pool/actually-there", "p", 1, -1) == 0,
               "batch_add succeeded during Test 42 setup");
         b.items[0].snap_failed = 1;
 
@@ -2193,7 +2193,7 @@ int main(int argc, char **argv) {
     printf("== Test 43: finalize_batch on a genuinely successful snapshot still reports failure to prune when the inventory is unavailable ==\n");
     {
         batch_ctx_t b = {0};
-        CHECK(batch_add(&b, "pool/created-ok", "p", 1, 2048, -1) == 0,
+        CHECK(batch_add(&b, "pool/created-ok", "p", 1, -1) == 0,
               "batch_add succeeded during Test 43 setup");
         /* snap_failed stays 0: the snapshot creation itself succeeded. */
 
@@ -2250,8 +2250,8 @@ int main(int argc, char **argv) {
         CHECK(write_fake_zfs(script) == 0, "installed fake zfs for the multi-pass test");
 
         batch_ctx_t b = {0};
-        CHECK(batch_add(&b, "pool/dup", "first", 1, -1, 0) == 0 &&
-              batch_add(&b, "pool/dup", "second", 1, -1, 0) == 0,
+        CHECK(batch_add(&b, "pool/dup", "first", 1, 0) == 0 &&
+              batch_add(&b, "pool/dup", "second", 1, 0) == 0,
               "the same dataset was added twice with different prefixes (legitimate per seen_set_add)");
         batch_assign_duplicate_passes(&b);
         CHECK(b.items[0].pass == 0 && b.items[1].pass == 1,
@@ -2308,7 +2308,7 @@ int main(int argc, char **argv) {
             int n = snprintf(root, sizeof(root), "p%04d", i);
             for (int p = n; p < ROOT_LEN; p++) root[p] = 'x';
             root[ROOT_LEN] = '\0';
-            if (batch_add(&std_b, root, "p", 1, 0, 0) != 0) add_ok = 0;
+            if (batch_add(&std_b, root, "p", 1, 0) != 0) add_ok = 0;
         }
         CHECK(add_ok, "assembled 1024 distinct, exactly-127-byte root datasets");
 

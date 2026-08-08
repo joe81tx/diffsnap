@@ -717,7 +717,11 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
     return (prune_errors == 0) ? 0 : -1;
 }
 
-static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long written, long long min_bytes) {
+/* .written starts at -1, a documented "not yet computed" sentinel: no
+ * metrics fetch has run for this item yet. batch_filter_by_metrics() (or
+ * the recursive equivalent) fills in the real value once `zfs get written`
+ * has been read; until then -1 distinguishes "unknown" from "measured 0". */
+static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long min_bytes) {
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_BATCH : ctx->capacity * 2;
         batch_item_t *tmp = diffsnap_realloc(ctx->items, new_cap * sizeof(batch_item_t));
@@ -726,7 +730,7 @@ static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, 
     }
     char *d = diffsnap_strdup(dataset), *p = diffsnap_strdup(prefix);
     if (!d || !p) { free(d); free(p); return -1; }
-    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = written, .min_bytes = min_bytes };
+    ctx->items[ctx->count++] = (batch_item_t){ .dataset = d, .prefix = p, .retention = retention, .pass = 0, .snap_failed = 0, .written = -1, .min_bytes = min_bytes };
     return 0;
 }
 
@@ -1255,6 +1259,7 @@ int main(int argc, char *argv[]) {
     seen_set_t seen = { NULL, 0, 0 };
     char *line = NULL; FILE *conf = NULL;
     log_io_failed = 0;
+    time_override_active = 0;
     if ((log_fp = fopen(log_path, "ae")) == NULL) {
         int saved_errno = errno;
         early_fail("%s: failed to open log file %s: %s", progname, log_path, strerror(saved_errno));
@@ -1319,8 +1324,8 @@ int main(int argc, char *argv[]) {
         if (seen_rc == -1) { log_msg("Error: Failed to track config entry for %s", dataset); global_status = 1; continue; }
         if (seen_rc == 1) { log_msg("Error: Config error for %s: duplicate dataset/prefix '%s' in config, skipping", dataset, prefix); global_status = 1; continue; }
         if (current_day_mins % interval_mins != 0) continue;
-        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val, -1, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
-        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, -1, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        if (is_recursive) { if (batch_add(&rec_b, dataset, prefix, (size_t)retention_val, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
+        else { if (batch_add(&std_b, dataset, prefix, (size_t)retention_val, min_bytes) != 0) { log_msg("Error: Failed to allocate batch entry for %s", dataset); global_status = 1; } }
     next_line: ;
     }
     /* getline() may fail before it performs a stream read (for example,
