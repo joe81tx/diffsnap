@@ -163,10 +163,7 @@ static void print_help(const char *progname) {
         "  Intervals greater than 1439 only match at midnight.\n"
         "\n"
         "Example config line:\n"
-        "  zroot/home,60,24,hourly,no,1000000\n"
-        "\n"
-        "Example cron line:\n"
-        "  * * * * * root /usr/local/sbin/diffsnap\n",
+        "  zroot/home,60,24,diffsnap,no,1000000\n",
         progname, CONF_PATH, LOG_PATH, LOCK_PATH
     );
 }
