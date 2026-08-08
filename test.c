@@ -492,13 +492,26 @@ static void run_main_pipeline_tests(void) {
     fp = fopen(conf_file, "w");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
-        log_path = "/dev/full";
-        char stderr_contents[1024] = {0};
-        CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_contents, sizeof(stderr_contents)) == 1,
-              "a detected log_io_failed condition changes main()'s process exit code to failure");
-        CHECK(strstr(stderr_contents, "writes to log file /dev/full failed") != NULL,
-              "a log write failure reports the incomplete-log diagnostic on stderr");
-        log_path = log_file;
+        /*
+         * /dev/full is Linux-specific. On a platform without it,
+         * fopen(log_path, "ae") itself would fail (a different code
+         * path entirely -- "failed to open log file", not "writes to
+         * log file ... failed"), so asserting the writes-failed message
+         * unconditionally would fail this test for a reason unrelated
+         * to the log_io_failed logic it's meant to cover. Skip visibly
+         * instead of asserting blindly.
+         */
+        if (access("/dev/full", W_OK) == 0) {
+            log_path = "/dev/full";
+            char stderr_contents[1024] = {0};
+            CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_contents, sizeof(stderr_contents)) == 1,
+                  "a detected log_io_failed condition changes main()'s process exit code to failure");
+            CHECK(strstr(stderr_contents, "writes to log file /dev/full failed") != NULL,
+                  "a log write failure reports the incomplete-log diagnostic on stderr");
+            log_path = log_file;
+        } else {
+            printf("    SKIP: /dev/full not available on this platform; log_io_failed exit-code test skipped\n");
+        }
     }
 
     fp = fopen(conf_file, "w");
@@ -612,6 +625,20 @@ static void run_main_pipeline_tests(void) {
         g_realloc_calls = 0; g_realloc_fail_after = 7; realloc_now_fn = test_realloc;
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() fails when its own metrics-fetch argv allocation fails");
+        /*
+         * This test's call count (7 successful calls before the
+         * injected failure) is derived by manually counting every
+         * diffsnap_realloc call made upstream of the metrics-fetch
+         * m_argv allocation for this exact config (see comment above).
+         * That derivation is fragile: if diffsnap.c's internal
+         * allocation order or count ever changes, this could silently
+         * start injecting the failure into a *different* allocation
+         * than m_argv while still returning rc==1 for an unrelated
+         * reason. Asserting the exact call count directly turns that
+         * silent retargeting into a loud, explicit failure instead.
+         */
+        CHECK(g_realloc_calls == 8,
+              "the injected failure landed on exactly the 8th realloc call -- the metrics-fetch argv allocation itself, not an earlier or later one");
         realloc_now_fn = realloc; g_realloc_fail_after = -1;
         FILE *log = fopen(log_file, "r");
         char contents[1024] = {0};
@@ -742,17 +769,28 @@ static void run_fault_injection_tests(void) {
     root_list_free(&roots_dup);
     g_realloc_fail_after = 0;
 
+    /*
+     * These two blocks now set up realloc_now_fn/g_realloc_fail_after
+     * explicitly rather than relying on the state left over from the
+     * root_list_add_unique block above: relying on carried-over state
+     * makes a test's target allocation depend on the exact order of the
+     * blocks around it, so a harmless reordering elsewhere in this
+     * function could silently point the injected failure at a different
+     * allocation than the one the CHECK message claims to cover.
+     */
+    g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
     metric_ctx_t metrics = {0};
     CHECK(handle_metric_line("pool/a\t1", &metrics) == -1,
           "handle_metric_line reports an injected growth allocation failure");
     free(metrics.items);
 
+    g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
     name_list_t names = {0};
     CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names) == -1,
           "handle_snapshot_inventory_line reports an injected growth allocation failure");
     name_list_free(&names);
 
-    g_realloc_calls = 0; g_realloc_fail_after = 1;
+    g_realloc_calls = 0; g_realloc_fail_after = 1; realloc_now_fn = test_realloc;
     name_list_t names_dup = {0};
     CHECK(handle_snapshot_inventory_line("pool/a@s_2026-01-01_00:00:00", &names_dup) == -1,
           "handle_snapshot_inventory_line reports an injected string-copy allocation failure after a successful growth");
@@ -1652,46 +1690,57 @@ int main(int argc, char **argv) {
         CHECK(date_stamp_like("2026-11-01_01:30:00-05x0") == 0,
               "a malformed timezone offset is rejected");
 
+        /*
+         * Previously this whole sub-test was wrapped in
+         * `if (write_fake_zfs(...) == 0) { CHECK(1, "..."); ... }`: the
+         * CHECK(1,...) could never fail (it's only reached once the `if`
+         * already proved the condition true), and if write_fake_zfs DID
+         * fail, every assertion below was silently skipped with no
+         * CHECK(0,...) ever recorded. Asserting the setup directly --
+         * the same idiom used elsewhere in this file (e.g. Test 22b) --
+         * makes a setup failure a loud, counted failure instead of a
+         * silent drop in coverage, and lets the rest of the block run
+         * unconditionally so any knock-on failures are visible too.
+         */
         char inventory_script[PATH_MAX + 64];
-        snprintf(inventory_script, sizeof(inventory_script),
-                 "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\n", g_inventory_args);
-        if (write_fake_zfs(inventory_script) == 0) {
-            CHECK(1, "fake zfs script created in the test directory for inventory-root scoping tests");
+        CHECK(snprintf(inventory_script, sizeof(inventory_script),
+                       "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\n", g_inventory_args) < (int)sizeof(inventory_script) &&
+              write_fake_zfs(inventory_script) == 0,
+              "installed fake zfs script for inventory-root scoping tests");
 
-            batch_ctx_t std_b = {0}, rec_b = {0};
-            batch_add(&std_b, "poolA/child", "p", 1, 0, 0);
-            batch_add(&rec_b, "poolB/child", "p", 1, 0, 0);
-            name_list_t inventory = {0};
-            CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
-                  "inventory loading succeeds for multiple roots through the fake zfs command");
-            FILE *args_fp = fopen(g_inventory_args, "r");
-            char args[1024] = {0};
-            if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
-            CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA/child\n") != NULL && strstr(args, "poolB/child\n") != NULL,
-                  "multi-root inventory list is scoped recursively to every distinct configured subtree");
-            CHECK(strstr(args, "poolA\n") == NULL && strstr(args, "poolB\n") == NULL,
-                  "inventory list preserves configured descendants instead of truncating them to pool names");
-            name_list_free(&inventory);
-            batch_free(&std_b); batch_free(&rec_b);
-            std_b = (batch_ctx_t){0};
-            rec_b = (batch_ctx_t){0};
+        batch_ctx_t std_b = {0}, rec_b = {0};
+        batch_add(&std_b, "poolA/child", "p", 1, 0, 0);
+        batch_add(&rec_b, "poolB/child", "p", 1, 0, 0);
+        name_list_t inventory = {0};
+        CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
+              "inventory loading succeeds for multiple roots through the fake zfs command");
+        FILE *args_fp = fopen(g_inventory_args, "r");
+        char args[1024] = {0};
+        if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
+        CHECK(strstr(args, "-r\n") != NULL && strstr(args, "poolA/child\n") != NULL && strstr(args, "poolB/child\n") != NULL,
+              "multi-root inventory list is scoped recursively to every distinct configured subtree");
+        CHECK(strstr(args, "poolA\n") == NULL && strstr(args, "poolB\n") == NULL,
+              "inventory list preserves configured descendants instead of truncating them to pool names");
+        name_list_free(&inventory);
+        batch_free(&std_b); batch_free(&rec_b);
+        std_b = (batch_ctx_t){0};
+        rec_b = (batch_ctx_t){0};
 
-            for (size_t i = 0; i < 600; i++) {
-                char root[STR_BUF_LARGE];
-                snprintf(root, sizeof(root), "p%03zu%.*s", i, 250, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-                batch_add(&std_b, root, "p", 1, 0, 0);
-            }
-            CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
-                  "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
-            args_fp = fopen(g_inventory_args, "r");
-            memset(args, 0, sizeof(args));
-            if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
-            CHECK(strstr(args, "-r\n") == NULL && strstr(args, "p000") == NULL,
-                  "oversized multi-root inventory call falls back to unscoped zfs list");
-            name_list_free(&inventory);
-            batch_free(&std_b); batch_free(&rec_b);
-            unlink(g_fake_zfs);
+        for (size_t i = 0; i < 600; i++) {
+            char root[STR_BUF_LARGE];
+            snprintf(root, sizeof(root), "p%03zu%.*s", i, 250, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+            batch_add(&std_b, root, "p", 1, 0, 0);
         }
+        CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
+              "inventory loading falls back successfully when root arguments exceed ARGV_BYTES_CAP");
+        args_fp = fopen(g_inventory_args, "r");
+        memset(args, 0, sizeof(args));
+        if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
+        CHECK(strstr(args, "-r\n") == NULL && strstr(args, "p000") == NULL,
+              "oversized multi-root inventory call falls back to unscoped zfs list");
+        name_list_free(&inventory);
+        batch_free(&std_b); batch_free(&rec_b);
+        unlink(g_fake_zfs);
         printf("\n");
     }
 
@@ -2013,6 +2062,293 @@ int main(int argc, char **argv) {
                               * without the repair, it's the already-freed oversized entry that
                               * batch_free would double-free by walking past the reduced count. */
         batch_free(&rec_b);
+        printf("\n");
+    }
+
+    printf("== Test 40: finalize_batch on a snap_failed item without a usable inventory only logs 'unable to verify', no false Created= line ==\n");
+    {
+        /*
+         * snap_failed==1 with inventory_ok==0: finalize_batch cannot ask
+         * the (unavailable) inventory whether the snapshot actually made
+         * it, so it must not claim success (no "Created=") and must not
+         * attempt pruning. Note neither of finalize_batch's two
+         * snap_failed-verification `continue`s sets `status`, so a
+         * single-item batch here returns status==0 -- the snapshot
+         * failure itself was already reported by zfs_snapshot_batch's
+         * own return code; finalize_batch's job here is just to not lie
+         * about what happened next.
+         */
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/unverified", "p", 1, 0, -1) == 0,
+              "batch_add succeeded during Test 40 setup");
+        b.items[0].snap_failed = 1;
+
+        name_list_t inventory = {0}; /* never read: inventory_ok==0 short-circuits before it is consulted */
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 40's log capture");
+
+        int status = finalize_batch(&b, &inventory, 0 /* inventory_ok */, &matches, &matches_cap,
+                                     "2026-01-01_00:00:00", 0);
+        if (log_fp) fflush(log_fp);
+
+        CHECK(status == 0, "an unverifiable snap_failed item alone does not flip finalize_batch's status");
+        CHECK(buf != NULL && strstr(buf, "Unable to verify") != NULL &&
+              strstr(buf, "pool/unverified@p_2026-01-01_00:00:00") != NULL,
+              "the specific unverifiable snapshot name is named in the diagnostic");
+        CHECK(buf != NULL && strstr(buf, "Created=") == NULL,
+              "no Created= line is emitted when the snapshot's existence could not be verified");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 41: finalize_batch on a snap_failed item confirmed ABSENT from a usable inventory skips pruning for that dataset ==\n");
+    {
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/absent", "p", 1, 0, -1) == 0,
+              "batch_add succeeded during Test 41 setup");
+        b.items[0].snap_failed = 1;
+
+        name_list_t inventory = {0}; /* usable, but empty -- the snapshot really isn't there */
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 41's log capture");
+
+        int status = finalize_batch(&b, &inventory, 1 /* inventory_ok */, &matches, &matches_cap,
+                                     "2026-01-01_00:00:00", 0);
+        if (log_fp) fflush(log_fp);
+
+        CHECK(status == 0, "a confirmed-absent snap_failed item alone does not flip finalize_batch's status");
+        CHECK(buf != NULL && strstr(buf, "Snapshot not created") != NULL &&
+              strstr(buf, "pruning skipped for dataset 'pool/absent'") != NULL,
+              "the pruning-skipped diagnostic names the correct dataset and prefix");
+        CHECK(buf != NULL && strstr(buf, "Created=") == NULL,
+              "no Created= line is emitted for a snapshot the inventory confirms does not exist");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 42: finalize_batch on a snap_failed item that the inventory shows DID succeed proceeds exactly like a normal success ==\n");
+    {
+        /*
+         * The recovery path: zfs_snapshot_batch's own execution wrapper
+         * reported failure, but the snapshot inventory -- fetched fresh,
+         * after the fact -- proves the snapshot exists. finalize_batch
+         * must not discard a real snapshot's Created=/pruning handling
+         * just because the creation call's own return code was
+         * pessimistic.
+         */
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/actually-there", "p", 1, 4096, -1) == 0,
+              "batch_add succeeded during Test 42 setup");
+        b.items[0].snap_failed = 1;
+
+        name_list_t inventory = {0};
+        CHECK(handle_snapshot_inventory_line("pool/actually-there@p_2026-01-01_00:00:00", &inventory) == 0,
+              "seeded the inventory with the snapshot that 'actually' exists");
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 42's log capture");
+
+        int status = finalize_batch(&b, &inventory, 1 /* inventory_ok */, &matches, &matches_cap,
+                                     "2026-01-01_00:00:00", 0);
+        if (log_fp) fflush(log_fp);
+
+        CHECK(status == 0, "a snap_failed item the inventory confirms exists does not flip finalize_batch's status");
+        CHECK(buf != NULL && strstr(buf, "Created=pool/actually-there@p_2026-01-01_00:00:00") != NULL,
+              "a Created= line IS emitted once the inventory confirms the snapshot exists, despite snap_failed");
+        CHECK(buf != NULL && strstr(buf, "Unable to verify") == NULL && strstr(buf, "Snapshot not created") == NULL,
+              "neither of the unverifiable/absent diagnostics fires once the inventory confirms success");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 43: finalize_batch on a genuinely successful snapshot still reports failure to prune when the inventory is unavailable ==\n");
+    {
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/created-ok", "p", 1, 2048, -1) == 0,
+              "batch_add succeeded during Test 43 setup");
+        /* snap_failed stays 0: the snapshot creation itself succeeded. */
+
+        name_list_t inventory = {0};
+        char **matches = NULL;
+        size_t matches_cap = 0;
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 43's log capture");
+
+        int status = finalize_batch(&b, &inventory, 0 /* inventory_ok */, &matches, &matches_cap,
+                                     "2026-01-01_00:00:00", 0);
+        if (log_fp) fflush(log_fp);
+
+        CHECK(status == 1, "an unavailable inventory after a genuine success is reported as a finalize_batch failure");
+        CHECK(buf != NULL && strstr(buf, "Created=pool/created-ok@p_2026-01-01_00:00:00") != NULL,
+              "the Created= line is still emitted -- the snapshot itself really was created");
+        CHECK(buf != NULL && strstr(buf, "Unable to prune") != NULL &&
+              strstr(buf, "snapshot inventory unavailable") != NULL,
+              "pruning is explicitly reported as skipped due to the unavailable inventory, not silently dropped");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(matches);
+        name_list_free(&inventory);
+        batch_free(&b);
+        printf("\n");
+    }
+
+    printf("== Test 44: zfs_snapshot_batch issues one zfs snapshot call PER PASS when the same dataset is configured twice with different prefixes ==\n");
+    {
+        /*
+         * batch_assign_duplicate_passes' own exact-dataset-repeat branch
+         * (bumping .pass on the second occurrence of the SAME dataset
+         * string) is what's under test here, not the ancestor/descendant
+         * collision handling Test 35 exercises. Two config entries for
+         * the identical dataset with different prefixes are legitimate
+         * (seen_set_add only rejects an exact dataset+prefix repeat),
+         * and ZFS itself rejects two snapshots of the same filesystem in
+         * one `zfs snapshot` call, so this must become two separate
+         * invocations -- one per pass -- not one call naming the
+         * dataset twice.
+         */
+        char trace_path[PATH_MAX];
+        CHECK(snprintf(trace_path, sizeof(trace_path), "%s/pass-calls", g_fake_zfs_dir) < (int)sizeof(trace_path),
+              "Test 44 trace path fits in the isolated test directory");
+        char script[PATH_MAX * 2 + 128];
+        CHECK(snprintf(script, sizeof(script),
+                       "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\n",
+                       trace_path, trace_path) < (int)sizeof(script),
+              "Test 44 fake-zfs script fits in its buffer");
+        CHECK(write_fake_zfs(script) == 0, "installed fake zfs for the multi-pass test");
+
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/dup", "first", 1, -1, 0) == 0 &&
+              batch_add(&b, "pool/dup", "second", 1, -1, 0) == 0,
+              "the same dataset was added twice with different prefixes (legitimate per seen_set_add)");
+        batch_assign_duplicate_passes(&b);
+        CHECK(b.items[0].pass == 0 && b.items[1].pass == 1,
+              "batch_assign_duplicate_passes gives the second occurrence of an EXACT dataset repeat the next pass");
+
+        int rc = zfs_snapshot_batch(&b, 0, "2026-01-01_00:00:00");
+        CHECK(rc == 0, "zfs_snapshot_batch succeeds against the fake zfs command");
+
+        FILE *trace = fopen(trace_path, "r");
+        size_t calls = 0;
+        int saw_first = 0, saw_second = 0;
+        char line[STR_BUF_XLARGE];
+        while (trace && fgets(line, sizeof(line), trace)) {
+            if ((unsigned char)line[0] == 036) { calls++; continue; }
+            if (strstr(line, "pool/dup@first_")) saw_first = 1;
+            if (strstr(line, "pool/dup@second_")) saw_second = 1;
+        }
+        if (trace) fclose(trace);
+        CHECK(calls == 2, "the duplicate dataset produces exactly two separate `zfs snapshot` invocations, one per pass");
+        CHECK(saw_first && saw_second, "each invocation names the expected pass's own snapshot, not both at once");
+
+        batch_free(&b);
+        (void)unlink(trace_path);
+        (void)unlink(g_fake_zfs);
+        printf("\n");
+    }
+
+    printf("== Test 45: load_combined_snapshot_inventory's scoped/unscoped root-bytes cutoff is inclusive of ARGV_BYTES_CAP exactly ==\n");
+    {
+        /*
+         * roots_bytes sums strlen(root)+1 per due root. This targets the
+         * boundary of `int use_scoped = (roots_bytes <= ARGV_BYTES_CAP);`
+         * with realistic multi-root input (many distinct top-level
+         * pools, as a real config would produce) rather than one
+         * implausibly huge dataset name: 1024 roots of 127 bytes each
+         * (+1 separator byte = 128 bytes/root) sum to exactly
+         * ARGV_BYTES_CAP. Growing just one of those roots by a single
+         * byte pushes the same 1024-root set one byte past the cap.
+         */
+        char inventory_script[PATH_MAX + 64];
+        CHECK(snprintf(inventory_script, sizeof(inventory_script),
+                       "#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\n", g_inventory_args) < (int)sizeof(inventory_script) &&
+              write_fake_zfs(inventory_script) == 0,
+              "installed fake zfs for the root-bytes boundary test");
+
+        enum { N_ROOTS = 1024, ROOT_LEN = 127 }; /* 1024 * (127 + 1) == ARGV_BYTES_CAP exactly */
+        CHECK((size_t)N_ROOTS * (ROOT_LEN + 1) == ARGV_BYTES_CAP,
+              "Test 45's root sizing constants sum to exactly ARGV_BYTES_CAP");
+
+        batch_ctx_t std_b = {0}, rec_b = {0};
+        int add_ok = 1;
+        for (int i = 0; i < N_ROOTS && add_ok; i++) {
+            char root[ROOT_LEN + 1];
+            int n = snprintf(root, sizeof(root), "p%04d", i);
+            for (int p = n; p < ROOT_LEN; p++) root[p] = 'x';
+            root[ROOT_LEN] = '\0';
+            if (batch_add(&std_b, root, "p", 1, 0, 0) != 0) add_ok = 0;
+        }
+        CHECK(add_ok, "assembled 1024 distinct, exactly-127-byte root datasets");
+
+        name_list_t inventory = {0};
+        unlink(g_inventory_args);
+        CHECK(load_combined_snapshot_inventory(&inventory, &std_b, &rec_b) == 0,
+              "inventory load succeeds when roots_bytes lands exactly on ARGV_BYTES_CAP");
+        FILE *args_fp = fopen(g_inventory_args, "r");
+        char args[1024] = {0};
+        if (args_fp) { size_t rd = fread(args, 1, sizeof(args) - 1, args_fp); (void)rd; fclose(args_fp); }
+        CHECK(strstr(args, "-r\n") != NULL,
+              "a roots_bytes total exactly equal to ARGV_BYTES_CAP stays scoped ('<=' is inclusive of the boundary)");
+        name_list_free(&inventory);
+
+        CHECK(std_b.count == N_ROOTS, "boundary batch retained all 1024 roots before the +1-byte mutation");
+        if (std_b.count == N_ROOTS) {
+            size_t last = std_b.count - 1;
+            char *grown = diffsnap_realloc(std_b.items[last].dataset, ROOT_LEN + 2);
+            CHECK(grown != NULL, "grew the last root's dataset string by one byte for the over-cap case");
+            if (grown) {
+                grown[ROOT_LEN] = 'y';
+                grown[ROOT_LEN + 1] = '\0';
+                std_b.items[last].dataset = grown;
+            }
+        }
+
+        name_list_t inventory2 = {0};
+        unlink(g_inventory_args);
+        CHECK(load_combined_snapshot_inventory(&inventory2, &std_b, &rec_b) == 0,
+              "inventory load still succeeds via the unscoped fallback when roots_bytes exceeds ARGV_BYTES_CAP by one");
+        FILE *args_fp2 = fopen(g_inventory_args, "r");
+        char args2[1024] = {0};
+        if (args_fp2) { size_t rd = fread(args2, 1, sizeof(args2) - 1, args_fp2); (void)rd; fclose(args_fp2); }
+        CHECK(strstr(args2, "-r\n") == NULL,
+              "a roots_bytes total just one byte over ARGV_BYTES_CAP already falls back to unscoped");
+        name_list_free(&inventory2);
+
+        batch_free(&std_b);
+        unlink(g_inventory_args);
+        unlink(g_fake_zfs);
         printf("\n");
     }
 
