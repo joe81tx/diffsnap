@@ -149,10 +149,32 @@ static void run_ensure_std_fds_test(void) {
     run_ensure_std_fds_one(STDOUT_FILENO, "stdout");
     run_ensure_std_fds_one(STDERR_FILENO, "stderr");
 
-    /* All three fds are open now (real ones, restored above), so a second
-     * call is a documented no-op: it must report success without touching
-     * anything. */
-    CHECK(ensure_std_fds() == 0, "ensure_std_fds is a successful no-op when fd 0/1/2 are all already open");
+    /*
+     * All three fds are open now (real ones, restored above), so a second
+     * call is a documented no-op: it must report success WITHOUT touching
+     * any of fd 0/1/2. Checking only the return code can't tell a true
+     * no-op apart from a spurious close-and-refill-with-/dev/null of an
+     * already-good fd, since ensure_std_fds() returns 0 in both cases.
+     * fstat() each fd before and after and require the exact same open
+     * file description (device/inode/rdev unchanged) -- not just "some fd
+     * happens to be open again" -- to actually prove nothing was touched.
+     */
+    struct stat before_st[3], after_st[3];
+    int stat_before_ok = 1;
+    for (int fd = 0; fd <= 2; fd++) stat_before_ok = stat_before_ok && (fstat(fd, &before_st[fd]) == 0);
+    int noop_rc = ensure_std_fds();
+    int stat_after_ok = 1;
+    for (int fd = 0; fd <= 2; fd++) stat_after_ok = stat_after_ok && (fstat(fd, &after_st[fd]) == 0);
+    CHECK(stat_before_ok && stat_after_ok, "fstat succeeded on fd 0/1/2 both before and after the no-op ensure_std_fds() call");
+    CHECK(noop_rc == 0, "ensure_std_fds is a successful no-op when fd 0/1/2 are all already open");
+    int identity_preserved = stat_before_ok && stat_after_ok;
+    for (int fd = 0; fd <= 2 && identity_preserved; fd++) {
+        identity_preserved = before_st[fd].st_dev == after_st[fd].st_dev &&
+                              before_st[fd].st_ino == after_st[fd].st_ino &&
+                              before_st[fd].st_rdev == after_st[fd].st_rdev;
+    }
+    CHECK(identity_preserved,
+          "ensure_std_fds leaves fd 0/1/2 pointing at exactly the same open file description as before -- not silently closed and refilled with /dev/null even though that would also return 0");
     printf("\n");
 }
 
@@ -505,12 +527,13 @@ static void run_main_pipeline_tests(void) {
     if (fp) {
         fputs("pool/due,7,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
-        diffsnap_override_time((time_t)0);
+        /* test_non_due_localtime ignores the time_t it's passed, so
+         * overriding diffsnap_now()'s value has no observable effect on
+         * this test -- only the localtime_now_fn override matters here. */
         localtime_now_fn = test_non_due_localtime;
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
               "the interval-scheduling gate permits a clean no-work run");
         localtime_now_fn = localtime_r;
-        diffsnap_clear_time_override();
         CHECK(access(args_file, F_OK) != 0, "a non-due entry does not invoke zfs through main()");
     }
 
@@ -527,6 +550,52 @@ static void run_main_pipeline_tests(void) {
         if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
         CHECK(strstr(contents, "pool/due@p_2026-03-08_00:00:00p0500") != NULL,
               "main() rewrites a positive DST offset's '+' to 'p' in snapshot names");
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        /*
+         * Coverage gap: every recursive-specific behavior (ancestor
+         * overlap resolution, pass assignment, subtree written-bytes
+         * summing) was previously exercised only by calling the internal
+         * batch functions directly against hand-built batch_ctx_t values
+         * (Tests 12-19, 33-35, 35a, 38-39) -- never through the actual
+         * config-parsing-to-snapshot pipeline. This drives a `recursive`
+         * field of "yes" all the way through diffsnap_real_main(), so a
+         * wiring bug in how main() dispatches a parsed config line into
+         * rec_b (rather than std_b) -- or in how the recursive path
+         * interacts with metrics scoping, snapshot creation, and
+         * finalize_batch's logging at the main() level -- would actually
+         * be caught.
+         */
+        fputs("pool/tree,1,1,rectest,yes,0\n", fp); fclose(fp);
+        unlink(args_file);
+        unlink(log_file);
+        char rec_script[PATH_MAX + 256];
+        CHECK(snprintf(rec_script, sizeof(rec_script),
+                       "#!/bin/sh\n"
+                       "if [ \"$1\" = get ]; then printf 'pool/tree\\t500\\n'; exit 0; fi\n"
+                       "if [ \"$1\" = snapshot ]; then shift; printf '%%s\\n' \"$@\" >> '%s'; exit 0; fi\n"
+                       "if [ \"$1\" = list ]; then printf 'pool/tree@rectest_2026-03-08_00:00:00p0500\\n'; exit 0; fi\n"
+                       "exit 0\n", args_file) < (int)sizeof(rec_script) &&
+              write_fake_zfs(rec_script) == 0,
+              "fake zfs for main()'s recursive=yes end-to-end test installed");
+        localtime_now_fn = test_positive_offset_localtime;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+              "a recursive=yes config entry completes successfully through the full main() pipeline");
+        localtime_now_fn = localtime_r;
+        FILE *args = fopen(args_file, "r");
+        char contents[2048] = {0};
+        if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+        CHECK(strstr(contents, "-r\n") != NULL,
+              "main() invokes the real `zfs snapshot` call with -r for a recursive=yes config entry");
+        CHECK(strstr(contents, "pool/tree@rectest_2026-03-08_00:00:00p0500\n") != NULL,
+              "the recursive snapshot invocation names the correctly formatted dataset@prefix_timestamp");
+        FILE *log = fopen(log_file, "r");
+        char log_contents[4096] = {0};
+        if (log) { size_t rd = fread(log_contents, 1, sizeof(log_contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(log_contents, "Created=pool/tree@rectest_2026-03-08_00:00:00p0500 Written=500 Recursive") != NULL,
+              "main() logs the recursive Created= line with the subtree written total, proving the recursive path -- not the standard one -- ran end to end through the real pipeline");
     }
 
     int held_lock = open(lock_file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -978,6 +1047,40 @@ int main(int argc, char **argv) {
             const char *const argv[] = {sh_bin, "-c", "kill -9 $$", NULL};
             CHECK(exec_cmd_stream(argv, NULL, NULL) != 0, "strict: signal death is treated as failure");
             CHECK(exec_cmd_stream_lenient(argv, NULL, NULL) != 0, "lenient: signal death is STILL treated as failure (only exit *status* is relaxed, not abnormal termination)");
+        }
+        printf("\n");
+    }
+
+    printf("== Test 3a: signal death after partial stdout output is still treated as failure, and the partial output already delivered is not lost ==\n");
+    {
+        /*
+         * Coverage gap: every fake-zfs/subprocess test up to this point
+         * either produces no output at all before dying (Test 3) or
+         * produces output and exits cleanly (Test 4, Test 30). A real
+         * `zfs` process that gets OOM-killed or otherwise signaled
+         * partway through a long listing would do both at once: emit
+         * some genuinely valid lines, then die abnormally. Combining
+         * Test 3's self-signal with Test 4's handler-delivery check
+         * proves exec_cmd_stream_core drains and hands off whatever was
+         * already written to the pipe before deciding the overall
+         * outcome, rather than discarding buffered-but-unprocessed
+         * output just because the child terminated abnormally.
+         */
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a shell for the partial-output-then-signal test");
+        if (sh_bin) {
+            metric_ctx_t ctx = {0};
+            const char *const argv[] = {sh_bin, "-c",
+                "printf 'pool/child\\t12345\\n'; kill -9 $$", NULL};
+            int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+            CHECK(rc != 0, "signal death is treated as failure even after valid output was already delivered");
+            CHECK(ctx.count == 1, "the single line written before the signal was still delivered to the handler");
+            if (ctx.count == 1) {
+                CHECK(strcmp(ctx.items[0].name, "pool/child") == 0, "the pre-signal line's dataset name was parsed correctly");
+                CHECK(ctx.items[0].written == 12345, "the pre-signal line's written value was parsed correctly");
+            }
+            free(ctx.items);
         }
         printf("\n");
     }
@@ -1998,6 +2101,48 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 35a: resolve_recursive_ancestor_overlaps bumps the SAME item's pass more than once when a 3-level ancestor chain collides at consecutive levels ==\n");
+    {
+        /*
+         * Coverage gap: Test 35 only forces a single pass bump (two
+         * items, one collision). The collision-avoidance loop's
+         * do { ... } while (collision) deliberately restarts its inner
+         * scan from oa=0 every time it bumps a pass, specifically so a
+         * later collision can be caused by a bump that loop itself just
+         * made. A 3-level same-root chain with distinct prefixes (so
+         * nothing is dropped by the same-prefix ancestor-coverage check
+         * Tests 33-34 exercise) forces exactly that: the deepest item
+         * collides with its grandparent at pass 0 and bumps to pass 1,
+         * then -- because the scan restarted from oa=0 -- immediately
+         * collides with its parent (which is already sitting at pass 1)
+         * and must bump again to pass 2. A loop that only ran its inner
+         * scan once per item (continuing from where it left off instead
+         * of restarting) would stop at pass 1 and miss the second,
+         * parent-level collision entirely.
+         */
+        batch_ctx_t rec_b = {0};
+        CHECK(batch_add(&rec_b, "pool/a", "p1", 1, 0) == 0 &&
+              batch_add(&rec_b, "pool/a/b", "p2", 1, 0) == 0 &&
+              batch_add(&rec_b, "pool/a/b/c", "p3", 1, 0) == 0,
+              "3-level ancestor-chain pass-collision test batch setup succeeds");
+
+        int rc = resolve_recursive_ancestor_overlaps(&rec_b);
+
+        CHECK(rc == 0, "resolve_recursive_ancestor_overlaps succeeds for a 3-level ancestor chain with distinct prefixes");
+        CHECK(rec_b.count == 3, "distinct prefixes mean none of the three items is covered/dropped, unlike Tests 33-34");
+        CHECK(rec_b.count == 3 &&
+              strcmp(rec_b.items[0].dataset, "pool/a") == 0 &&
+              strcmp(rec_b.items[1].dataset, "pool/a/b") == 0 &&
+              strcmp(rec_b.items[2].dataset, "pool/a/b/c") == 0,
+              "all three items keep their original relative order (nothing was covered, so nothing was compacted)");
+        CHECK(rec_b.count == 3 &&
+              rec_b.items[0].pass == 0 && rec_b.items[1].pass == 1 && rec_b.items[2].pass == 2,
+              "each level lands on a strictly higher pass than its ancestor -- the deepest item was bumped TWICE (0->1 colliding with its grandparent, then 1->2 colliding with its now-already-bumped parent), not just once");
+
+        batch_free(&rec_b);
+        printf("\n");
+    }
+
     printf("== Test 36: finalize_batch fails safely, not silently, when a snapshot name would not fit its buffer ==\n");
     {
         /*
@@ -2400,6 +2545,13 @@ int main(int argc, char **argv) {
         CHECK(std_b.count == N_ROOTS, "boundary batch retained all 1024 roots before the +1-byte mutation");
         if (std_b.count == N_ROOTS) {
             size_t last = std_b.count - 1;
+            /* Explicit, not relied-upon carryover: this growth must use
+             * the real realloc() regardless of what any earlier block in
+             * this suite left realloc_now_fn/g_realloc_fail_after set to.
+             * See the comment above the OOM blocks in
+             * run_fault_injection_tests for why implicit carryover here
+             * is exactly the ordering hazard this suite otherwise avoids. */
+            realloc_now_fn = realloc;
             char *grown = diffsnap_realloc(std_b.items[last].dataset, ROOT_LEN + 2);
             CHECK(grown != NULL, "grew the last root's dataset string by one byte for the over-cap case");
             if (grown) {
