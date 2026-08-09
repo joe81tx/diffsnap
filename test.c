@@ -1447,6 +1447,62 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 4a: zfs_pool_len/same_zfs_root correctly distinguish adjacent pool names that are textual prefixes of one another ==\n");
+    {
+        /* Every other test in this file that exercises pass-grouping
+         * (batch_item_in_root_pass/batch_root_pass_count, via same_zfs_root)
+         * uses pool names that are never prefixes of one another (pool,
+         * otherpool, thirdpool, poolA, poolB, ...). That leaves an
+         * off-by-one in zfs_pool_len's slash-boundary arithmetic, or in
+         * same_zfs_root's length-equality check, completely uncaught: e.g.
+         * comparing only via strncmp without also requiring a_len == b_len
+         * would let "pool" wrongly match a genuinely different, longer pool
+         * like "pool2". This test drives that directly, plus the boundary
+         * case in the other direction where two *different-looking*
+         * strings genuinely share one top-level pool. */
+        CHECK(zfs_pool_len("pool") == 4, "zfs_pool_len on a bare pool name (no slash) returns the full length");
+        CHECK(zfs_pool_len("pool/a") == 4, "zfs_pool_len stops exactly at the slash, not one before or after it");
+        CHECK(zfs_pool_len("pool2") == 5, "zfs_pool_len on a longer, unrelated bare pool name returns ITS full length, not the shorter one's");
+        CHECK(zfs_pool_len("pool2/a") == 5, "zfs_pool_len stops at the slash for the longer pool name too");
+
+        CHECK(same_zfs_root("pool", "pool") == 1, "identical bare pool names are the same root");
+        CHECK(same_zfs_root("pool", "pool2") == 0,
+              "\"pool\" and \"pool2\" are NOT the same root -- same_zfs_root must reject this on length alone, not just a strncmp prefix match");
+        CHECK(same_zfs_root("pool2", "pool") == 0, "the same check holds with the operands swapped");
+        CHECK(same_zfs_root("pool/a", "pool2/b") == 0,
+              "datasets under two different, prefix-related pools (\"pool\" vs \"pool2\") are not the same root");
+        CHECK(same_zfs_root("pool2/a", "pool2/b") == 1, "two datasets genuinely under the SAME longer pool name are the same root");
+        CHECK(same_zfs_root("poolX/a", "poolXX/b") == 0,
+              "a one-character difference in otherwise-identical-looking pool names (poolX vs poolXX) is not the same root");
+
+        /* The genuinely-nested case in the other direction: a bare pool
+         * name and a dataset one level under that SAME pool must compare
+         * equal, since zfs_pool_len reduces both to the same top-level
+         * pool string. */
+        CHECK(same_zfs_root("tank", "tank/a") == 1,
+              "a bare pool name and a dataset nested one level under that same pool are the same root");
+        CHECK(same_zfs_root("tank/a", "tank/b") == 1, "two datasets nested under the same pool are the same root");
+        CHECK(same_zfs_root("tank/a", "tank2/a") == 0,
+              "same relative sub-path under two different, prefix-related pools (tank vs tank2) is not the same root");
+
+        /* Exercise the real call sites (batch_item_in_root_pass via
+         * batch_root_pass_count), not just same_zfs_root in isolation, with
+         * the same adjacent "pool"/"pool2" pair. */
+        batch_ctx_t ctx = {0};
+        CHECK(batch_add(&ctx, "pool/a", "p", 1, 0) == 0 && batch_add(&ctx, "pool2/b", "p", 1, 0) == 0,
+              "batch_add succeeded for both adjacent-name items during setup");
+        CHECK(batch_root_pass_count(&ctx, "pool") == 1,
+              "batch_root_pass_count for root \"pool\" counts only the item actually under \"pool\", not the unrelated \"pool2\" item");
+        CHECK(batch_root_pass_count(&ctx, "pool2") == 1,
+              "batch_root_pass_count for root \"pool2\" likewise counts only its own item");
+        CHECK(batch_item_in_root_pass(&ctx, 0, "pool", 0) == 1 && batch_item_in_root_pass(&ctx, 0, "pool2", 0) == 0,
+              "the \"pool\" item is in root \"pool\"'s pass but NOT wrongly reported as being in root \"pool2\"'s pass");
+        CHECK(batch_item_in_root_pass(&ctx, 1, "pool2", 0) == 1 && batch_item_in_root_pass(&ctx, 1, "pool", 0) == 0,
+              "the \"pool2\" item is in root \"pool2\"'s pass but NOT wrongly reported as being in root \"pool\"'s pass");
+        batch_free(&ctx);
+        printf("\n");
+    }
+
     printf("== Test 5: root_list_add_unique preserves configured paths and coalesces only ancestor/descendant roots ==\n");
     {
         root_list_t list = {0};
@@ -1749,6 +1805,45 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 17a: find_metric's own length guard rejects an oversized dataset name before it could overflow key.name ==\n");
+    {
+        /*
+         * find_metric() does `memcpy(key.name, dataset, len + 1)` into a
+         * fixed key.name[STR_BUF_LARGE] buffer, guarded by
+         * `len >= sizeof(key.name) -> return NULL`. handle_metric_line()
+         * has its own, separate oversized-name guard on the way IN, so a
+         * name this long could never actually reach the metrics array
+         * through normal ingestion -- meaning find_metric's own guard,
+         * called directly (as it is here, and as sum_subtree_written()
+         * and batch_filter_by_metrics() call it internally), would never
+         * otherwise be exercised. Pin both the accepted boundary (one
+         * byte below the buffer size) and the rejected one (exactly at
+         * the buffer size) so an off-by-one in this guard doesn't quietly
+         * turn into a stack buffer overflow.
+         */
+        metric_ctx_t metrics = {0};
+        char boundary_name[STR_BUF_LARGE]; /* STR_BUF_LARGE == sizeof(key.name) == 256; 255 chars + NUL fits exactly */
+        memset(boundary_name, 'a', sizeof(boundary_name) - 1);
+        boundary_name[sizeof(boundary_name) - 1] = '\0';
+        char boundary_line[STR_BUF_LARGE + 16];
+        CHECK(snprintf(boundary_line, sizeof(boundary_line), "%s\t123", boundary_name) < (int)sizeof(boundary_line),
+              "constructed a metric line for the longest name find_metric can legally hold (255 chars)");
+        CHECK(handle_metric_line(boundary_line, &metrics) == 0 && metrics.count == 1,
+              "handle_metric_line accepts and stores the 255-char boundary name");
+        qsort(metrics.items, metrics.count, sizeof(*metrics.items), compare_metrics);
+        CHECK(find_metric(&metrics, boundary_name) != NULL && find_metric(&metrics, boundary_name)->written == 123,
+              "find_metric succeeds for a dataset name exactly one byte below sizeof(key.name)");
+
+        char too_long_name[STR_BUF_LARGE + 1]; /* 256 chars: exactly at sizeof(key.name), one past the accepted boundary */
+        memset(too_long_name, 'a', sizeof(too_long_name) - 1);
+        too_long_name[sizeof(too_long_name) - 1] = '\0';
+        CHECK(find_metric(&metrics, too_long_name) == NULL,
+              "find_metric's own length guard rejects a 256-char dataset name (len >= sizeof(key.name)) instead of memcpy-ing past key.name's end");
+
+        free(metrics.items);
+        printf("\n");
+    }
+
     printf("== Test 18: batch_filter_by_metrics(recursive=1) -- quiescent parent kept because a descendant is active ==\n");
     {
         /*
@@ -1983,6 +2078,16 @@ int main(int argc, char **argv) {
                       handle_snapshot_inventory_line("pool/ds@snap\textra", &inventory) == -1 &&
                       handle_snapshot_inventory_line("pool/ds@snap@extra", &inventory) == -1,
                   "an inventory row must contain exactly one complete snapshot name");
+            /* The remaining two of handle_snapshot_inventory_line's five
+             * validation branches: a line where '@' is the very first
+             * character (at == line, no dataset part at all) and a line
+             * where '@' is the very last character (at[1] == '\0', an
+             * empty snapshot suffix). Neither was previously driven by any
+             * test here. */
+            CHECK(handle_snapshot_inventory_line("@snap", &inventory) == -1,
+                  "a line starting with '@' (no dataset name before it) is rejected, not treated as a valid empty-dataset row");
+            CHECK(handle_snapshot_inventory_line("pool/ds@", &inventory) == -1,
+                  "a line ending right at '@' (empty snapshot suffix) is rejected, not treated as a valid empty-snapshot row");
             fflush(log_fp);
             CHECK(inventory.count == 1 && strstr(log_buf, "Invalid snapshot inventory line"),
                   "invalid inventory rows are logged and rejected before they enter pruning");
@@ -2108,8 +2213,34 @@ int main(int argc, char **argv) {
     {
         /* Install our own fake command so this test has no ordering
          * dependency on Test 23. Its genuine nonzero failure also emits
-         * stderr, which exec_cmd_stream must drain and route to log_msg. */
-        CHECK(write_fake_zfs("#!/bin/sh\ncase \"$*\" in\n  *badroot*) echo 'badroot diagnostic' >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n") == 0,
+         * stderr, which exec_cmd_stream must drain and route to log_msg.
+         *
+         * Fidelity check: the script also appends its own invocation's
+         * args plus which branch it took to call_log. Without this, the
+         * test's only evidence that "the only nonzero exit is on the
+         * matched root" is ctx.items[*].snap_failed AFTER the fact --
+         * which really only proves diffsnap.c's own handling of whatever
+         * exit codes it happened to receive, not that this script
+         * actually returned exit 1 for badroot specifically and exit 0
+         * for goodroot specifically (e.g. a typo'd case pattern that
+         * accidentally exits 1 for every invocation, or 0 for every
+         * invocation, could still leave snap_failed looking plausible if
+         * some other bug happened to compensate). Reading call_log lets
+         * the test confirm the exit code actually taken for each
+         * dataset's own invocation, independent of how diffsnap.c later
+         * interprets it. */
+        char call_log[PATH_MAX];
+        CHECK(snprintf(call_log, sizeof(call_log), "%s/test24-calls", g_fake_zfs_dir) < (int)sizeof(call_log),
+              "constructed a path for Test 24's fake-zfs call log");
+        unlink(call_log);
+
+        char script[PATH_MAX + 256];
+        CHECK(snprintf(script, sizeof(script),
+                       "#!/bin/sh\ncase \"$*\" in\n"
+                       "  *badroot*) echo \"$* :: exit1\" >> '%s'; echo 'badroot diagnostic' >&2; exit 1 ;;\n"
+                       "  *) echo \"$* :: exit0\" >> '%s'; exit 0 ;;\nesac\n",
+                       call_log, call_log) < (int)sizeof(script) &&
+                  write_fake_zfs(script) == 0,
               "fake zfs script created outside the system ZFS path for Test 24");
         batch_ctx_t ctx = {0};
         int rc1 = batch_add(&ctx, "badroot/x", "p", 1, 0);
@@ -2130,10 +2261,40 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "badroot diagnostic") != NULL,
               "stderr from the genuine nonzero fake-zfs failure is drained and logged");
 
+        char call_log_contents[1024] = {0};
+        FILE *call_log_fp = fopen(call_log, "r");
+        if (call_log_fp) {
+            size_t rd = fread(call_log_contents, 1, sizeof(call_log_contents) - 1, call_log_fp);
+            (void)rd;
+            fclose(call_log_fp);
+        }
+        int line_count = 0, bad_took_exit1 = 0, good_took_exit0 = 0, cross_contamination = 0;
+        char log_copy[sizeof(call_log_contents)];
+        memcpy(log_copy, call_log_contents, sizeof(call_log_contents));
+        char *save = NULL;
+        for (char *ln = strtok_r(log_copy, "\n", &save); ln != NULL; ln = strtok_r(NULL, "\n", &save)) {
+            line_count++;
+            int has_bad = strstr(ln, "badroot/x") != NULL;
+            int has_good = strstr(ln, "goodroot/y") != NULL;
+            int has_exit1 = strstr(ln, "exit1") != NULL;
+            int has_exit0 = strstr(ln, "exit0") != NULL;
+            if (has_bad && has_exit1 && !has_exit0) bad_took_exit1 = 1;
+            if (has_good && has_exit0 && !has_exit1) good_took_exit0 = 1;
+            if ((has_bad && has_exit0) || (has_good && has_exit1)) cross_contamination = 1;
+        }
+        CHECK(line_count == 2, "the fake zfs script recorded exactly one invocation each for badroot and goodroot");
+        CHECK(bad_took_exit1 == 1,
+              "the badroot invocation genuinely took the script's exit-1 branch (verified directly, not just inferred from snap_failed afterward)");
+        CHECK(good_took_exit0 == 1,
+              "the goodroot invocation genuinely took the script's exit-0 branch (verified directly, not just inferred from snap_failed afterward)");
+        CHECK(cross_contamination == 0,
+              "neither invocation's recorded branch is mismatched against its own root -- the nonzero exit is confirmed to be on the matched root only");
+
         batch_free(&ctx);
         if (log_fp) fclose(log_fp);
         log_fp = NULL;
         free(buf);
+        unlink(call_log);
         unlink(g_fake_zfs); /* done with the fake zfs script now */
         printf("\n");
     }
