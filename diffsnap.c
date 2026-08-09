@@ -95,6 +95,17 @@ static struct tm *(*localtime_now_fn)(const time_t *, struct tm *) = localtime_r
 static size_t (*strftime_now_fn)(char *, size_t, const char *, const struct tm *) = strftime;
 static ssize_t (*getline_now_fn)(char **, size_t *, FILE *) = getline;
 static void *(*realloc_now_fn)(void *, size_t) = realloc;
+/* Kept indirect for the same reason as strftime_now_fn above: a real
+ * fclose() failure that is NOT preceded by an already-observed write
+ * failure (i.e. every fprintf/vfprintf to the stream succeeded, and only
+ * the implicit final flush/close fails) is extremely rare and, unlike a
+ * strftime buffer-too-small failure, isn't something a test can reliably
+ * reproduce against a real file once line-buffering is active -- every
+ * log line is already flushed (and any failure already caught) by the
+ * time fclose() runs. Both fclose() call sites below route through this
+ * so the white-box suite can inject that failure and cover the branch
+ * that handles it. */
+static int (*fclose_now_fn)(FILE *) = fclose;
 static int time_override_active = 0;
 static time_t time_override_value;
 
@@ -112,6 +123,11 @@ static void diffsnap_clear_time_override(void) { time_override_active = 0; }
 #endif
 
 static void *diffsnap_realloc(void *ptr, size_t size) { return realloc_now_fn(ptr, size); }
+
+/* Never call fclose() directly on a stream production error paths are
+ * expected to handle failure for -- route through this instead, so
+ * fclose_now_fn's test-time failure injection covers it too. */
+static int diffsnap_fclose(FILE *fp) { return fclose_now_fn(fp); }
 
 /* strdup()-equivalent that funnels through the same indirection as every
  * other allocation, so realloc_now_fn (and its test-time failure injection)
@@ -1448,7 +1464,7 @@ int main(int argc, char *argv[]) {
 cleanup:
 free(line);
 if (conf)
-    fclose(conf);
+    diffsnap_fclose(conf);
 
 free(metrics.items);
 batch_free(&std_b);
@@ -1461,7 +1477,7 @@ if (log_fp) {
                 progname, log_path);
         ret_code = 1;
     }
-    if (fclose(log_fp) != 0) {
+    if (diffsnap_fclose(log_fp) != 0) {
         fprintf(stderr, "%s: failed to flush log file %s: %s\n",
                 progname, log_path, strerror(errno));
         ret_code = 1;

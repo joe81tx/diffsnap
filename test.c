@@ -449,6 +449,15 @@ static void *test_realloc(void *ptr, size_t size) {
     return (g_realloc_fail_after >= 0 && g_realloc_calls > g_realloc_fail_after) ? NULL : realloc(ptr, size);
 }
 
+static int g_fclose_fail;
+static int g_fclose_calls;
+static int test_fclose_failure(FILE *fp) {
+    g_fclose_calls++;
+    int rc = fclose(fp);
+    if (g_fclose_fail) { errno = ENOSPC; return -1; }
+    return rc;
+}
+
 static struct tm *test_positive_offset_localtime(const time_t *value, struct tm *result) {
     (void)value;
     memset(result, 0, sizeof(*result));
@@ -501,6 +510,63 @@ static void run_main_pipeline_tests(void) {
           snprintf(args_file, sizeof(args_file), "%s/main-args", g_fake_zfs_dir) < (int)sizeof(args_file),
           "isolated files for direct main() pipeline tests fit in the test directory");
     conf_path = conf_file; log_path = log_file; lock_path = lock_file;
+
+    printf("== Main(): its own lock/log/config file-open failure branches ==\n");
+    {
+        /*
+         * Gap: main() has three distinct "failed to open X" early-return
+         * branches (lock, log, config), each reachable in production from
+         * an ordinary permissions or missing-directory problem, but none
+         * had a corresponding test. All three point at a path whose
+         * *parent directory* does not exist, so open()/fopen() fails with
+         * ENOENT regardless of this process's privileges (unlike e.g.
+         * chmod 000, which root would sail through).
+         */
+        char missing_dir_path[PATH_MAX];
+        CHECK(snprintf(missing_dir_path, sizeof(missing_dir_path), "%s/missing-subdir", g_fake_zfs_dir) < (int)sizeof(missing_dir_path),
+              "constructed a deliberately-nonexistent parent directory for the open-failure tests");
+        CHECK(access(missing_dir_path, F_OK) != 0, "the parent directory used for these tests really is absent");
+
+        char bad_lock[PATH_MAX], bad_log[PATH_MAX], bad_conf[PATH_MAX];
+        CHECK(snprintf(bad_lock, sizeof(bad_lock), "%s/lock", missing_dir_path) < (int)sizeof(bad_lock) &&
+              snprintf(bad_log, sizeof(bad_log), "%s/log", missing_dir_path) < (int)sizeof(bad_log) &&
+              snprintf(bad_conf, sizeof(bad_conf), "%s/conf", missing_dir_path) < (int)sizeof(bad_conf),
+              "unreachable lock/log/config paths constructed");
+
+        char stderr_buf[512];
+
+        lock_path = bad_lock;
+        memset(stderr_buf, 0, sizeof(stderr_buf));
+        CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf)) == 1,
+              "main() fails when the lock file itself cannot be opened");
+        CHECK(strstr(stderr_buf, "failed to open lock file") != NULL,
+              "the lock-file open failure is reported on stderr");
+        lock_path = lock_file;
+
+        log_path = bad_log;
+        memset(stderr_buf, 0, sizeof(stderr_buf));
+        CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf)) == 1,
+              "main() fails when the log file itself cannot be opened (lock already succeeded)");
+        CHECK(strstr(stderr_buf, "failed to open log file") != NULL,
+              "the log-file open failure is reported on stderr");
+        log_path = log_file;
+
+        conf_path = bad_conf;
+        unlink(log_file);
+        memset(stderr_buf, 0, sizeof(stderr_buf));
+        CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf)) == 1,
+              "main() fails when the config file itself cannot be opened (lock and log already succeeded)");
+        CHECK(strstr(stderr_buf, "failed to open config file") != NULL,
+              "the config-file open failure is reported on stderr");
+        FILE *log = fopen(log_file, "r");
+        char log_contents[512] = {0};
+        if (log) { size_t rd = fread(log_contents, 1, sizeof(log_contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(log_contents, "failed to open config file") != NULL,
+              "unlike the lock/log-open failures above, log_fp is already open by the time the config open fails, so this one is ALSO written through log_msg() into the log file itself");
+        conf_path = conf_file;
+    }
+    printf("\n");
+
 
     char script[PATH_MAX * 2 + 256];
     CHECK(snprintf(script, sizeof(script),
@@ -835,6 +901,173 @@ static void run_main_pipeline_tests(void) {
         if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
         CHECK(strstr(contents, "Failed to allocate metrics command") != NULL,
               "the metrics-fetch argv allocation failure is logged with its own diagnostic");
+    }
+
+    printf("== Gap: comment and blank config lines are actually skipped (not just accepted as data by accident) ==\n");
+    {
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for comment/blank-line coverage");
+        if (fp) {
+            fputs("# a leading comment line\n", fp);
+            fputs("\n", fp); /* a truly blank line: line[0] == '\\0' after trim */
+            /* A comment containing an adjacent-comma pair: if the '#'/blank
+             * check ever moved after the ",," check instead of before it,
+             * this line would misfire "Error: Config error: adjacent comma
+             * delimiters" even though it's just a comment. */
+            fputs("# a comment,, with adjacent commas in it\n", fp);
+            fputs("pool/due,1,1,p,no,0\n", fp);
+            fputs("\n", fp);
+            fputs("# a trailing comment\n", fp);
+            fclose(fp);
+            unlink(args_file);
+            unlink(log_file);
+            char due_script[PATH_MAX + 128];
+            CHECK(snprintf(due_script, sizeof(due_script),
+                           "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> '%s'\n"
+                           "if [ \"$1\" = get ]; then printf 'pool/due\\t100\\n'; fi\nexit 0\n", args_file) < (int)sizeof(due_script) &&
+                  write_fake_zfs(due_script) == 0,
+                  "fake zfs reinstalled for the comment/blank-line test (the previous block's script does not answer for pool/due)");
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+                  "main() succeeds on a config mixing comment lines, blank lines, and one real entry");
+            FILE *args = fopen(args_file, "r");
+            char contents[1024] = {0};
+            if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+            CHECK(strstr(contents, "pool/due") != NULL,
+                  "the real data line after the comments/blank lines is still parsed and acted on");
+            FILE *log = fopen(log_file, "r");
+            char log_contents[2048] = {0};
+            if (log) { size_t rd = fread(log_contents, 1, sizeof(log_contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(log_contents, "Config error") == NULL,
+                  "comment and blank lines never reach any config-error branch, including the adjacent-comma-delimiter check that runs right after the skip check");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: fclose(log_fp) flush-failure is a distinct branch from log_io_failed ==\n");
+    {
+        /*
+         * log_io_failed (already covered via /dev/full) is set the moment
+         * any individual fprintf/vfprintf to log_fp fails. fclose(log_fp)
+         * returning nonzero is a SEPARATE branch reached when every write
+         * to the stream already succeeded (log_io_failed stays 0) and only
+         * the implicit final flush/close fails -- a real occurrence of
+         * that against an ordinary file can't be coaxed into existing
+         * portably (line-buffering, which main() enables successfully in
+         * every environment tried, means each log line is already flushed,
+         * and any failure already caught, before fclose() ever runs). So
+         * this drives it through fclose_now_fn, the same style of
+         * DIFFSNAP_TESTING-only injection point already used for
+         * strftime/getline/localtime failures elsewhere in this suite.
+         */
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(log_file);
+            g_fclose_fail = 1; g_fclose_calls = 0; fclose_now_fn = test_fclose_failure;
+            char stderr_buf[512] = {0};
+            CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf)) == 1,
+                  "main() fails when fclose(log_fp) itself reports a flush/close error");
+            fclose_now_fn = fclose; g_fclose_fail = 0;
+            CHECK(g_fclose_calls >= 1, "the fclose hook was actually reached by main()");
+            CHECK(strstr(stderr_buf, "failed to flush log file") != NULL,
+                  "the flush-failure diagnostic, distinct from the log_io_failed write-failure diagnostic, is reported on stderr");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: dataset/prefix/timestamp length check is exact-boundary tested against ZFS_NAME_MAX, not just clearly-oversized ==\n");
+    {
+        /*
+         * Mirrors Test 45's treatment of the ARGV_BYTES_CAP boundary: a
+         * sum that lands EXACTLY on ZFS_NAME_MAX must be accepted ('>'
+         * excludes equality), and growing it by a single byte must flip
+         * to rejected. The dataset is not due (interval 7, forced to
+         * tm_min=1 via test_non_due_localtime) purely so this stays a
+         * pure validation-path test -- the length check runs unconditionally
+         * before the due check either way, so due-ness is irrelevant to
+         * what's being verified here.
+         */
+        char boundary_dataset[201], boundary_prefix[30];
+        memset(boundary_dataset, 'a', sizeof(boundary_dataset) - 1); boundary_dataset[200] = '\0';
+        memset(boundary_prefix, 'p', sizeof(boundary_prefix) - 1); boundary_prefix[29] = '\0';
+        CHECK(strlen(boundary_dataset) + 1 + strlen(boundary_prefix) + 1 + SNAPSHOT_TIMESTAMP_MAX == ZFS_NAME_MAX,
+              "exact-boundary test constants land precisely on ZFS_NAME_MAX");
+
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fprintf(fp, "%s,7,1,%s,no,0\n", boundary_dataset, boundary_prefix);
+            fclose(fp);
+            unlink(log_file);
+            localtime_now_fn = test_non_due_localtime;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+                  "main() accepts a dataset/prefix/timestamp name whose length lands exactly on ZFS_NAME_MAX");
+            localtime_now_fn = localtime_r;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "exceeds ZFS limit") == NULL,
+                  "the exact-boundary name is NOT flagged as exceeding the ZFS limit");
+        }
+
+        char over_dataset[202];
+        memset(over_dataset, 'a', sizeof(over_dataset) - 1); over_dataset[201] = '\0'; /* one byte longer */
+        CHECK(strlen(over_dataset) + 1 + strlen(boundary_prefix) + 1 + SNAPSHOT_TIMESTAMP_MAX == ZFS_NAME_MAX + 1,
+              "over-boundary test constants land exactly one byte past ZFS_NAME_MAX");
+
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fprintf(fp, "%s,7,1,%s,no,0\n", over_dataset, boundary_prefix);
+            fclose(fp);
+            unlink(log_file);
+            localtime_now_fn = test_non_due_localtime;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() rejects a dataset/prefix/timestamp name exactly one byte past ZFS_NAME_MAX");
+            localtime_now_fn = localtime_r;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "exceeds ZFS limit") != NULL,
+                  "the one-byte-over-boundary name IS flagged as exceeding the ZFS limit");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: a real fake-zfs script emitting ZFS's literal '-' (not applicable) written value ==\n");
+    {
+        /*
+         * handle_metric_line's invalid (-1) written-value path was only
+         * ever driven by directly-constructed metric_ctx_t values (Test 9)
+         * or malformed rows with no such literal (Test 21a). ZFS itself
+         * commonly prints a literal "-" for `written` when the property
+         * doesn't apply to a given dataset/snapshot -- strtoll("-", ...)
+         * leaves endptr pointing at the '-' itself (no digits consumed),
+         * so this correctly falls into the same invalid-metric path, but
+         * that had never been exercised through the real text-output ->
+         * handle_metric_line -> batch_filter_by_metrics pipeline before.
+         */
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fputs("pool/dashval,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(args_file); unlink(log_file);
+            char dash_script[PATH_MAX + 192];
+            CHECK(snprintf(dash_script, sizeof(dash_script),
+                           "#!/bin/sh\n"
+                           "if [ \"$1\" = get ]; then printf 'pool/dashval\\t-\\n'; exit 0; fi\n"
+                           "if [ \"$1\" = snapshot ]; then shift; printf '%%s\\n' \"$@\" >> '%s'; exit 0; fi\n"
+                           "exit 0\n", args_file) < (int)sizeof(dash_script) &&
+                  write_fake_zfs(dash_script) == 0,
+                  "fake zfs emitting a literal '-' written value installed");
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() fails when the real zfs get output reports a literal '-' written value");
+            CHECK(access(args_file, F_OK) != 0,
+                  "a dataset with an unparsable '-' written value is never handed to zfs snapshot");
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "invalid written metric") != NULL,
+                  "the literal '-' value is logged as an invalid written metric, exactly like a directly-constructed -1");
+        }
+        printf("\n");
     }
 
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
