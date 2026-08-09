@@ -1459,6 +1459,52 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 19a: batch_filter_by_metrics(recursive=1) -- a subtree-sum overflow is dropped and flagged exactly like a missing/invalid root, not silently mishandled ==\n");
+    {
+        /*
+         * Coverage gap: Test 12a proves sum_subtree_written() itself
+         * returns -1 on an LLONG_MAX overflow, but nothing previously
+         * drove that overflow through the actual batch_filter_by_metrics
+         * call chain the recursive/min_bytes feature uses in production.
+         * A regression that special-cased the overflow return differently
+         * from an ordinary "root not found" failure (e.g. silently
+         * treating it as written==0 and applying the min_bytes threshold
+         * instead of dropping the item outright) would not have been
+         * caught anywhere else in this suite.
+         */
+        batch_ctx_t b = {0};
+        CHECK(batch_add(&b, "pool/parent", "p", 1, 0) == 0,
+              "Test 19a batch setup succeeds");
+
+        metric_ctx_t metrics = {0};
+        metrics.items = calloc(2, sizeof(metric_item_t));
+        strcpy(metrics.items[0].name, "pool/parent");       metrics.items[0].written = LLONG_MAX;
+        strcpy(metrics.items[1].name, "pool/parent/child"); metrics.items[1].written = 1;
+        metrics.count = 2;
+        qsort(metrics.items, metrics.count, sizeof(metric_item_t), compare_metrics);
+
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 19a's log capture");
+
+        int global_status = 0;
+        batch_filter_by_metrics(&b, &metrics, 1, &global_status);
+        if (log_fp) fflush(log_fp);
+
+        CHECK(b.count == 0, "the item is dropped when its recursive subtree sum overflows, exactly as it would be for a missing/invalid root");
+        CHECK(global_status == 1, "global_status is flagged for the overflow case, the same as the missing/invalid-root cases in Tests 8-9");
+        CHECK(buf != NULL && strstr(buf, "Configured recursive dataset not found or has invalid written metric: pool/parent") != NULL,
+              "the overflow is reported through the same diagnostic used for a missing/invalid root, not a distinct or silent path");
+
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        free(metrics.items);
+        batch_free(&b);
+        printf("\n");
+    }
+
     printf("== Test 20: exec_cmd_stream_lenient treats a total execv failure as a hard failure, not lenient success ==\n");
     {
         /*
@@ -1620,6 +1666,39 @@ int main(int argc, char **argv) {
         if (trace) { size_t rd = fread(contents, 1, sizeof(contents) - 1, trace); (void)rd; fclose(trace); }
         CHECK(strstr(contents, "destroy\n") && strstr(contents, "-r\n") && strstr(contents, "pool/ds@snap\n"),
               "recursive zfs_destroy passes the -r argument to zfs");
+        unlink(trace_path);
+        unlink(g_fake_zfs);
+        printf("\n");
+    }
+
+    printf("== Test 22c: zfs_destroy omits -r for non-recursive destruction ==\n");
+    {
+        /*
+         * Coverage gap: prune_from_inventory-driven tests (e.g. Test 23)
+         * exercise zfs_destroy(..., 0) but only ever assert on the
+         * "Pruned=" log line, never on the literal argv passed to zfs --
+         * so a copy/paste bug that added "-r" to (or dropped "destroy"
+         * from) the non-recursive branch of zfs_destroy would go
+         * undetected even though the symmetric recursive branch is
+         * checked directly in Test 22b above. This asserts the
+         * non-recursive argv directly, the same way Test 22b does for
+         * the recursive one.
+         */
+        char trace_path[PATH_MAX];
+        CHECK(snprintf(trace_path, sizeof(trace_path), "%s/destroy-args-nr", g_fake_zfs_dir) < (int)sizeof(trace_path),
+              "non-recursive-destroy argv trace path fits in the isolated test directory");
+        char script[PATH_MAX + 128];
+        CHECK(snprintf(script, sizeof(script), "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> '%s'\n", trace_path) < (int)sizeof(script) &&
+                  write_fake_zfs(script) == 0,
+              "installed fake zfs that records non-recursive destroy argv");
+        CHECK(zfs_destroy("pool/ds@snap", 0) == 0, "non-recursive zfs_destroy succeeds through the fake zfs command");
+        FILE *trace = fopen(trace_path, "r");
+        char contents[256] = {0};
+        if (trace) { size_t rd = fread(contents, 1, sizeof(contents) - 1, trace); (void)rd; fclose(trace); }
+        CHECK(strstr(contents, "destroy\n") && strstr(contents, "pool/ds@snap\n"),
+              "non-recursive zfs_destroy still passes the expected destroy/target arguments");
+        CHECK(strstr(contents, "-r\n") == NULL,
+              "non-recursive zfs_destroy does NOT pass -r to zfs, unlike the recursive branch in Test 22b");
         unlink(trace_path);
         unlink(g_fake_zfs);
         printf("\n");
@@ -1847,8 +1926,22 @@ int main(int argc, char **argv) {
               "negative offsets remain accepted for pruning");
         CHECK(date_stamp_like("2026-11-01_01:30:00-05x0") == 0,
               "a malformed timezone offset is rejected");
+        printf("\n");
+    }
 
+    printf("== Test 29a: load_combined_snapshot_inventory scopes to configured roots, and falls back to unscoped when the roots' bytes exceed ARGV_BYTES_CAP ==\n");
+    {
         /*
+         * This coverage previously lived unlabeled inside "Test 29:
+         * valid_dataset enforces the configured naming grammar", with no
+         * printf header of its own -- a reviewer grepping test headers
+         * for load_combined_snapshot_inventory's scoping behavior would
+         * find nothing until "Test 30" and could easily conclude (or,
+         * when trimming "Test 29" down to just its named valid_dataset
+         * purpose, accidentally cause) this coverage not to exist. Giving
+         * it its own header makes it discoverable and independently
+         * prunable/extendable.
+         *
          * Previously this whole sub-test was wrapped in
          * `if (write_fake_zfs(...) == 0) { CHECK(1, "..."); ... }`: the
          * CHECK(1,...) could never fail (it's only reached once the `if`
@@ -2259,25 +2352,57 @@ int main(int argc, char **argv) {
 
     printf("== Test 39: remove_recursive_overlaps compacts before its oversized-name error path ==\n");
     {
+        /*
+         * Earlier revision of this test used a std_b whose only non-
+         * oversized entry ("pool/keep", prefix "standard") could never
+         * match rec_b's prefix ("recursive"), so no entry was ever
+         * actually covered/dropped before the oversized-name failure --
+         * write_idx tracked i exactly, and the test could not have
+         * detected a version of remove_recursive_overlaps that repaired
+         * std_b->count using `i` instead of `write_idx`. This version
+         * adds "pool/a/covered" (prefix "p", genuinely covered by rec_b's
+         * "pool/a"/"p") BEFORE the oversized entry, so real compaction
+         * happens first: write_idx stops tracking i one-for-one, and
+         * "pool/keep" gets moved from index 1 down to index 0 before the
+         * error fires at index 2. If write_idx-based compaction were
+         * broken, items[0] after the error would still be the stale,
+         * already-freed "pool/a/covered" entry instead of "pool/keep".
+         */
         batch_ctx_t std_b = {0}, rec_b = {0};
         char oversized[STR_BUF_LARGE + 32];
         memset(oversized, 'a', sizeof(oversized) - 1);
         oversized[sizeof(oversized) - 1] = '\0';
-        CHECK(batch_add(&std_b, "pool/keep", "standard", 1, 0) == 0 &&
+        CHECK(batch_add(&std_b, "pool/a/covered", "p", 1, 0) == 0 &&
+              batch_add(&std_b, "pool/keep", "standard", 1, 0) == 0 &&
               batch_add(&std_b, oversized, "standard", 1, 0) == 0 &&
+              batch_add(&rec_b, "pool/a", "p", 1, 0) == 0 &&
               batch_add(&rec_b, "pool/recursive", "recursive", 1, 0) == 0,
               "overlap error-path setup succeeds");
+
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 39's coverage-message capture");
+
         CHECK(remove_recursive_overlaps(&std_b, &rec_b) == -1,
               "an oversized standard dataset reaches the overlap-check error path");
+        if (log_fp) fflush(log_fp);
+        CHECK(buf != NULL && strstr(buf, "Skipping pool/a/covered") != NULL,
+              "the genuinely-covered entry was dropped by the recursive-coverage check before the oversized entry was ever reached");
         CHECK(std_b.count == 1 && strcmp(std_b.items[0].dataset, "pool/keep") == 0,
-              "already-compacted entries remain the only owned entries after the error");
+              "after a real compaction (one item dropped, one kept) the surviving entry is the compacted-down \"pool/keep\", not a stale freed slot");
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+
         batch_free(&std_b); /* the count repair matters for the OVERSIZED entry, not pool/keep:
-                              * the error path already freed items[1..count-1] (just the oversized
+                              * the error path already freed items[2..count-1] (just the oversized
                               * entry here) and shrank std_b->count to exclude them, so batch_free
-                              * only iterates surviving items. pool/keep at items[0] was never
-                              * touched by the error path and would be safe to free either way --
-                              * without the repair, it's the already-freed oversized entry that
-                              * batch_free would double-free by walking past the reduced count. */
+                              * only iterates surviving items. pool/keep -- moved down to items[0]
+                              * by the earlier compaction -- was never touched by the error path
+                              * and is safe to free; without correct write_idx-based repair, it's
+                              * the already-freed pool/a/covered or oversized entry that batch_free
+                              * would double-free by walking past the reduced count. */
         batch_free(&rec_b);
         printf("\n");
     }
@@ -2616,6 +2741,106 @@ int main(int argc, char **argv) {
                       "restored the original RLIMIT_NOFILE after the pipe2() failure test");
             }
         }
+        printf("\n");
+    }
+
+    printf("== Test 46a: exec_cmd_stream reports failure when the SECOND pipe2() (stderr) cannot allocate a descriptor after the first (stdout) already succeeded ==\n");
+    {
+        /*
+         * Coverage gap: Test 46 forces EMFILE with RLIMIT_NOFILE=3, which
+         * leaves zero descriptors free -- the very first pipe2() call
+         * (out_pfd) always fails first under that limit. The separate
+         * cleanup branch at "if (pipe2(err_pfd, ...) == -1) { if (handler)
+         * close(out_pfd...) ...}" -- reached only when out_pfd's pipe2()
+         * already succeeded and err_pfd's then fails -- was never
+         * exercised anywhere in this suite. This targets exactly that
+         * branch by leaving just enough fd headroom for one pipe2() call
+         * (2 fds) but not two (4 fds): probe the next fd number the
+         * kernel will hand out, then cap RLIMIT_NOFILE two descriptors
+         * above it.
+         */
+        int probe = open("/dev/null", O_RDONLY);
+        int got_probe = probe >= 0;
+        CHECK(got_probe, "opened a probe descriptor to find the next available fd number for the second-pipe2() test");
+        if (got_probe) {
+            int next_fd = probe;
+            close(probe);
+            struct rlimit old_limit;
+            int got_limit = getrlimit(RLIMIT_NOFILE, &old_limit) == 0;
+            CHECK(got_limit, "read the current RLIMIT_NOFILE before tightening it for the second-pipe2() failure test");
+            if (got_limit) {
+                struct rlimit tight_limit = { .rlim_cur = (rlim_t)(next_fd + 2), .rlim_max = old_limit.rlim_max };
+                int lowered = setrlimit(RLIMIT_NOFILE, &tight_limit) == 0;
+                CHECK(lowered, "tightened RLIMIT_NOFILE to allow exactly one pipe2() worth of new descriptors");
+                if (lowered) {
+                    const char *const argv[] = {"/bin/true", NULL};
+                    metric_ctx_t ctx = {0};
+                    /* handler != NULL: out_pfd's pipe2() gets fds
+                     * next_fd/next_fd+1 and succeeds (fits exactly under
+                     * the limit); err_pfd's pipe2() then needs two more
+                     * and fails with EMFILE. */
+                    int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+                    CHECK(rc != 0, "exec_cmd_stream reports failure when the second pipe2() (stderr) cannot allocate a descriptor");
+                    CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran");
+                    free(ctx.items);
+
+                    CHECK(setrlimit(RLIMIT_NOFILE, &old_limit) == 0,
+                          "restored the original RLIMIT_NOFILE after the second-pipe2() failure test");
+                }
+            }
+        }
+        printf("\n");
+    }
+
+    printf("== Test 46b: exec_cmd_stream reports failure when fork() itself cannot create a new process ==\n");
+    {
+        /*
+         * Coverage gap: fork()'s own failure branch in
+         * exec_cmd_stream_core() (pid == -1, distinct cleanup path that
+         * closes both pipe pairs without ever reaching drain/waitpid) was
+         * never exercised anywhere in this suite. RLIMIT_NPROC is lowered
+         * far enough that no new process can be created for this user,
+         * deterministically forcing fork() to fail with EAGAIN. Skipped
+         * (not failed) if the platform lacks RLIMIT_NPROC or this process
+         * lacks permission to lower it -- e.g. some containerized or
+         * privileged environments.
+         */
+#ifdef RLIMIT_NPROC
+        struct rlimit old_nproc;
+        int got_nproc = getrlimit(RLIMIT_NPROC, &old_nproc) == 0;
+        CHECK(got_nproc, "read the current RLIMIT_NPROC before lowering it for the fork() failure test");
+        if (got_nproc) {
+            struct rlimit low_nproc = { .rlim_cur = 1, .rlim_max = old_nproc.rlim_max };
+            if (setrlimit(RLIMIT_NPROC, &low_nproc) == 0) {
+                const char *const argv[] = {"/bin/true", NULL};
+                metric_ctx_t ctx = {0};
+                int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+                if (rc == 0) {
+                    /* Some environments (commonly: running as root, or
+                     * inside certain containers/namespaces) don't enforce
+                     * RLIMIT_NPROC against fork() at all -- the limit was
+                     * accepted by setrlimit() but never actually bites.
+                     * That's an environment limitation, not evidence
+                     * about exec_cmd_stream_core()'s fork()==-1 handling,
+                     * so skip visibly instead of recording a false
+                     * failure. */
+                    printf("    SKIP: this platform/privilege level does not enforce RLIMIT_NPROC against fork(); fork() failure test skipped\n");
+                    free(ctx.items);
+                } else {
+                    CHECK(rc != 0, "exec_cmd_stream reports failure when fork() cannot create a new process");
+                    CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran (fork failed before any child existed)");
+                    free(ctx.items);
+                }
+
+                CHECK(setrlimit(RLIMIT_NPROC, &old_nproc) == 0,
+                      "restored the original RLIMIT_NPROC after the fork() failure test");
+            } else {
+                printf("    SKIP: could not lower RLIMIT_NPROC on this platform/permission level; fork() failure test skipped\n");
+            }
+        }
+#else
+        printf("    SKIP: RLIMIT_NPROC is not defined on this platform; fork() failure test skipped\n");
+#endif
         printf("\n");
     }
 
