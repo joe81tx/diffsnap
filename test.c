@@ -47,6 +47,40 @@ static char g_inventory_args[PATH_MAX];
     } \
 } while (0)
 
+/*
+ * Tests that temporarily lower RLIMIT_NOFILE to force pipe2()/open()
+ * failures must restore it afterward like every other piece of global
+ * state this suite mutates. But unlike an in-process hook (realloc_now_fn,
+ * localtime_now_fn, ...), a failed setrlimit() restore can't just be
+ * CHECK()'d and shrugged off: every later test in this process would then
+ * silently run under an artificially starved file-descriptor budget and
+ * could fail for a reason completely unrelated to what it's testing,
+ * turning one flaky restore into an unbounded number of misleading
+ * downstream failures. So this is fatal rather than a normal CHECK: report
+ * it clearly and stop the whole run instead of letting it cascade.
+ */
+static void restore_rlimit_or_die(int resource, const char *resource_name,
+                                   const struct rlimit *old_limit, const char *msg) {
+    g_tests_run++;
+    if (setrlimit(resource, old_limit) == 0) {
+        printf("    ok: %s\n", msg);
+        return;
+    }
+    g_tests_failed++;
+    printf("    FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__);
+    fprintf(stderr,
+            "FATAL: could not restore %s to rlim_cur=%llu after lowering it for a fault-injection "
+            "test; every remaining test would run under a starved resource limit and produce "
+            "misleading failures, so stopping now instead of continuing. (tests run so far: %d, "
+            "failed: %d)\n",
+            resource_name, (unsigned long long)old_limit->rlim_cur, g_tests_run, g_tests_failed);
+    exit(1);
+}
+
+static void restore_rlimit_nofile_or_die(const struct rlimit *old_limit, const char *msg) {
+    restore_rlimit_or_die(RLIMIT_NOFILE, "RLIMIT_NOFILE", old_limit, msg);
+}
+
 static int setup_fake_zfs(void) {
     if (!mkdtemp(g_fake_zfs_dir)) return -1;
     if (snprintf(g_fake_zfs, sizeof(g_fake_zfs), "%s/zfs", g_fake_zfs_dir) >= (int)sizeof(g_fake_zfs)) return -1;
@@ -394,6 +428,20 @@ static struct tm *test_localtime(const time_t *value, struct tm *result) {
     return g_localtime_fail ? NULL : localtime_r(value, result);
 }
 
+static int g_strftime_fail;
+static int g_strftime_calls;
+static size_t test_strftime(char *buf, size_t max, const char *fmt, const struct tm *tm_info) {
+    g_strftime_calls++;
+    if (g_strftime_fail) {
+        /* strftime() signals failure by returning 0 and leaving buf's
+         * contents unspecified; a zero-size buffer forces glibc's real
+         * strftime() to do exactly that, so this stays a faithful failure
+         * rather than a hand-waved short-circuit. */
+        return strftime(buf, 0, fmt, tm_info);
+    }
+    return strftime(buf, max, fmt, tm_info);
+}
+
 static long g_realloc_calls;
 static long g_realloc_fail_after = -1;
 static void *test_realloc(void *ptr, size_t size) {
@@ -599,13 +647,21 @@ static void run_main_pipeline_tests(void) {
     }
 
     int held_lock = open(lock_file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    CHECK(held_lock >= 0 && flock(held_lock, LOCK_EX | LOCK_NB) == 0,
-          "test process acquired the isolated lock before invoking main()");
-    if (held_lock >= 0) {
+    /* Capture the flock() outcome itself rather than re-deriving it from
+     * held_lock alone: if open() succeeds but flock() fails, held_lock >= 0
+     * would still be true, and gating the next CHECK on that alone would run
+     * main() without the lock actually held -- main() would then likely
+     * acquire it and exit 0, so the next CHECK ("main() exits unsuccessfully
+     * when flock reports an existing instance") would fail for a completely
+     * different, misleading reason instead of being cleanly skipped. */
+    int lock_acquired = held_lock >= 0 && flock(held_lock, LOCK_EX | LOCK_NB) == 0;
+    CHECK(lock_acquired, "test process acquired the isolated lock before invoking main()");
+    if (lock_acquired) {
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() exits unsuccessfully when flock reports an existing instance");
-        flock(held_lock, LOCK_UN); close(held_lock);
+        flock(held_lock, LOCK_UN);
     }
+    if (held_lock >= 0) close(held_lock);
 
     fp = fopen(conf_file, "w");
     if (fp) {
@@ -664,6 +720,22 @@ static void run_main_pipeline_tests(void) {
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() fails when its top-level localtime_r call fails");
         localtime_now_fn = localtime_r; g_localtime_fail = 0;
+    }
+
+    fp = fopen(conf_file, "w");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        g_strftime_calls = 0;
+        g_strftime_fail = 1; strftime_now_fn = test_strftime;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when formatting the snapshot timestamp fails");
+        FILE *log = fopen(log_file, "r");
+        char contents[8192] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "Failed to format timestamp") != NULL,
+              "the timestamp-formatting failure, rather than an unrelated error, is logged");
+        strftime_now_fn = strftime; g_strftime_fail = 0;
+        CHECK(g_strftime_calls >= 1, "the strftime hook was actually reached by main()");
     }
 
     /*
@@ -806,6 +878,29 @@ static void run_fault_injection_tests(void) {
         fclose(log_fp); log_fp = NULL; free(buf);
     }
 
+    buf = NULL;
+    buf_len = 0;
+    log_fp = open_memstream(&buf, &buf_len);
+    CHECK(log_fp != NULL, "memory-backed log capture opened");
+    if (log_fp) {
+        g_strftime_calls = 0;
+        g_strftime_fail = 1;
+        strftime_now_fn = test_strftime;
+        log_msg("message during strftime failure");
+        strftime_now_fn = strftime;
+        g_strftime_fail = 0;
+        fflush(log_fp);
+        size_t newlines = 0;
+        for (size_t i = 0; i < buf_len; i++) if (buf[i] == '\n') newlines++;
+        CHECK(g_strftime_calls == 1, "strftime hook intercepted the logging call");
+        CHECK(buf && strstr(buf, "strftime failed") && strstr(buf, "message during strftime failure"),
+              "strftime failure (not localtime_r failure) is described on the log message");
+        CHECK(buf && strstr(buf, "localtime_r failed") == NULL,
+              "a strftime-only failure is not misreported as a localtime_r failure");
+        CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
+        fclose(log_fp); log_fp = NULL; free(buf);
+    }
+
     batch_ctx_t ctx = {0};
     const size_t count = ALLOC_CHUNK_BATCH + 8;
     for (size_t i = 0; i < count; i++) {
@@ -853,12 +948,26 @@ static void run_fault_injection_tests(void) {
           "batch_add reports an injected growth allocation failure");
     batch_free(&batch);
 
+    /* batch_add() does `d = diffsnap_strdup(dataset); p = diffsnap_strdup(prefix);
+     * if (!d || !p) { free(d); free(p); return -1; }`. Drive each strdup's
+     * allocation failure separately: fail_after=1 fails on the dataset copy
+     * (call 2, right after the growth realloc succeeds as call 1), and
+     * fail_after=2 fails on the prefix copy specifically -- the branch where
+     * `d` is non-NULL and must be freed alongside the failed `p`. Testing
+     * only the first case would leave that free(d) path unexercised. */
     g_realloc_calls = 0; g_realloc_fail_after = 1;
     batch_ctx_t batch_dup = {0};
     CHECK(batch_add(&batch_dup, "pool/a", "p", 1, 0) == -1,
-          "batch_add reports an injected dataset/prefix string-copy allocation failure after a successful growth");
-    CHECK(batch_dup.count == 0, "batch_add leaves the batch empty when the string copy fails");
+          "batch_add reports an injected dataset string-copy allocation failure after a successful growth");
+    CHECK(batch_dup.count == 0, "batch_add leaves the batch empty when the dataset string copy fails");
     batch_free(&batch_dup);
+
+    g_realloc_calls = 0; g_realloc_fail_after = 2;
+    batch_ctx_t batch_dup2 = {0};
+    CHECK(batch_add(&batch_dup2, "pool/a", "p", 1, 0) == -1,
+          "batch_add reports an injected prefix string-copy allocation failure after the dataset copy succeeds");
+    CHECK(batch_dup2.count == 0, "batch_add leaves the batch empty when the prefix string copy fails");
+    batch_free(&batch_dup2);
     g_realloc_fail_after = 0;
 
     seen_set_t seen = {0};
@@ -2737,7 +2846,7 @@ int main(int argc, char **argv) {
                 CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran");
                 free(ctx.items);
 
-                CHECK(setrlimit(RLIMIT_NOFILE, &old_limit) == 0,
+                restore_rlimit_nofile_or_die(&old_limit,
                       "restored the original RLIMIT_NOFILE after the pipe2() failure test");
             }
         }
@@ -2784,7 +2893,7 @@ int main(int argc, char **argv) {
                     CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran");
                     free(ctx.items);
 
-                    CHECK(setrlimit(RLIMIT_NOFILE, &old_limit) == 0,
+                    restore_rlimit_nofile_or_die(&old_limit,
                           "restored the original RLIMIT_NOFILE after the second-pipe2() failure test");
                 }
             }
@@ -2832,7 +2941,7 @@ int main(int argc, char **argv) {
                     free(ctx.items);
                 }
 
-                CHECK(setrlimit(RLIMIT_NPROC, &old_nproc) == 0,
+                restore_rlimit_or_die(RLIMIT_NPROC, "RLIMIT_NPROC", &old_nproc,
                       "restored the original RLIMIT_NPROC after the fork() failure test");
             } else {
                 printf("    SKIP: could not lower RLIMIT_NPROC on this platform/permission level; fork() failure test skipped\n");

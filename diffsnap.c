@@ -87,6 +87,12 @@ static const char *log_path = LOG_PATH;
 static const char *lock_path = LOCK_PATH;
 static time_t (*time_now_fn)(time_t *) = time;
 static struct tm *(*localtime_now_fn)(const time_t *, struct tm *) = localtime_r;
+/* Kept indirect (rather than calling strftime() directly) purely so the
+ * white-box suite can inject a formatting failure; strftime() failing in
+ * production is extremely rare (buffer too small for the given format), but
+ * both call sites below have an explicit error path for it that deserves
+ * coverage. */
+static size_t (*strftime_now_fn)(char *, size_t, const char *, const struct tm *) = strftime;
 static ssize_t (*getline_now_fn)(char **, size_t *, FILE *) = getline;
 static void *(*realloc_now_fn)(void *, size_t) = realloc;
 static int time_override_active = 0;
@@ -233,7 +239,7 @@ static void log_msg(const char *fmt, ...) {
     if (localtime_now_fn(&t, &tm_info) == NULL) {
         localtime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
-    } else if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
+    } else if (strftime_now_fn(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
         strftime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
@@ -1411,7 +1417,7 @@ int main(int argc, char *argv[]) {
      * The spring transition can skip up to an hour of wall-clock intervals;
      * intervals that divide 60 evenly avoid additional hour-boundary skips
      * caused by the scheduler's interval arithmetic. */
-    if (strftime(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = global_status ? global_status : 1; goto cleanup; }
+    if (strftime_now_fn(snap_time, sizeof(snap_time), "%Y-%m-%d_%H:%M:%S%z", &tm_info) == 0) { log_msg("Error: Failed to format timestamp"); ret_code = global_status ? global_status : 1; goto cleanup; }
     /* ZFS snapshot names reject '+'. Preserve the offset's sign while
      * encoding a positive one as 'p' (for example, p0500). */
     if (snap_time[19] == '+') snap_time[19] = 'p';
