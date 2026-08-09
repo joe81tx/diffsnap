@@ -28,6 +28,7 @@
 
 #include <assert.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <limits.h>
 
 static int g_tests_run = 0;
@@ -80,30 +81,73 @@ static int write_fake_zfs(const char *script) {
  * else. The real stderr is restored immediately afterward regardless of
  * outcome.
  */
+/*
+ * Drives ensure_std_fds() with exactly one of fd 0/1/2 closed, and confirms
+ * that slot specifically -- and only that slot -- gets refilled with
+ * /dev/null. The real fd is saved aside first (via dup) and restored
+ * immediately afterward regardless of outcome, so a failure partway through
+ * never leaves the test binary's own stdio permanently damaged.
+ *
+ * CHECK()'s own diagnostic output goes through printf(), which is buffered
+ * and targets fd 1 (stdout). When the fd under test IS fd 1, calling
+ * CHECK() (or anything else that touches stdio) between closing it and
+ * ensure_std_fds() refilling it corrupts stdout: buffered content queued
+ * during that window ends up flushed to whatever winds up sitting on fd 1
+ * once it's next valid, not necessarily the real terminal/pipe, silently
+ * scrambling this and unrelated later output. So every step below uses
+ * only raw syscalls -- no printf/CHECK -- until the real fd is fully
+ * restored; results are captured into locals and reported via CHECK()
+ * only afterward, once stdio is safe to use again for every one of fd
+ * 0/1/2, not just the two (0 and 2) that happen not to alias stdout.
+ */
+static void run_ensure_std_fds_one(int fd, const char *fd_name) {
+    int saved = dup(fd);
+    int dup_ok = saved >= 0;
+    int close_ok = 0, rc = -1, leaves_open = 0, refilled_with_devnull = 0, restore_ok = 0;
+
+    if (dup_ok) {
+        if (fd == STDERR_FILENO) fflush(stderr);
+        else if (fd == STDOUT_FILENO) fflush(stdout);
+
+        close_ok = (close(fd) == 0);
+
+        rc = ensure_std_fds();
+        leaves_open = (fcntl(fd, F_GETFD) != -1);
+
+        int null_fd = open("/dev/null", O_RDONLY);
+        struct stat target_st, null_st;
+        refilled_with_devnull = (null_fd >= 0 && fstat(fd, &target_st) == 0 && fstat(null_fd, &null_st) == 0 &&
+                                  target_st.st_dev == null_st.st_dev && target_st.st_rdev == null_st.st_rdev);
+        if (null_fd >= 0) close(null_fd);
+
+        restore_ok = (dup2(saved, fd) != -1);
+        close(saved);
+    }
+
+    /* fd is now fully restored (or was never touched, if dup itself
+     * failed) -- safe to use stdio/CHECK from here on. */
+    printf("-- ensure_std_fds: fd %d (%s) --\n", fd, fd_name);
+    CHECK(dup_ok, "dup'd the real fd aside before closing it for the ensure_std_fds test");
+    if (!dup_ok) return;
+    CHECK(close_ok, "closed the target fd to simulate a launcher that starts diffsnap with it already closed");
+    CHECK(rc == 0, "ensure_std_fds succeeds when the target fd starts closed");
+    CHECK(leaves_open, "ensure_std_fds leaves the target fd open afterward");
+    CHECK(refilled_with_devnull,
+          "ensure_std_fds refills the closed slot specifically with /dev/null, not just any open file");
+    CHECK(restore_ok, "restored the real fd after the ensure_std_fds test");
+}
+
 static void run_ensure_std_fds_test(void) {
     printf("== ensure_std_fds: refills a closed low-numbered stdio slot with /dev/null ==\n");
-    int saved = dup(STDERR_FILENO);
-    if (saved < 0) {
-        CHECK(0, "dup'd the real stderr aside before closing it for the ensure_std_fds test");
-        printf("\n");
-        return;
-    }
-    fflush(stderr);
-    CHECK(close(STDERR_FILENO) == 0, "closed fd 2 to simulate a launcher that starts diffsnap with stderr already closed");
-
-    int rc = ensure_std_fds();
-    CHECK(rc == 0, "ensure_std_fds succeeds when fd 2 starts closed");
-    CHECK(fcntl(STDERR_FILENO, F_GETFD) != -1, "ensure_std_fds leaves fd 2 open afterward");
-
-    int null_fd = open("/dev/null", O_RDONLY);
-    struct stat fd2_st, null_st;
-    CHECK(null_fd >= 0 && fstat(STDERR_FILENO, &fd2_st) == 0 && fstat(null_fd, &null_st) == 0 &&
-          fd2_st.st_dev == null_st.st_dev && fd2_st.st_rdev == null_st.st_rdev,
-          "ensure_std_fds refills the closed slot specifically with /dev/null, not just any open file");
-    if (null_fd >= 0) close(null_fd);
-
-    CHECK(dup2(saved, STDERR_FILENO) != -1, "restored the real stderr after the ensure_std_fds test");
-    close(saved);
+    /*
+     * The loop inside ensure_std_fds() is identical for fd 0, 1, and 2, but
+     * that's exactly the kind of "obviously symmetric" code a coverage gap
+     * likes to hide behind -- only exercising fd 2 leaves fd 0 (stdin) and
+     * fd 1 (stdout) entirely untested. Drive all three explicitly.
+     */
+    run_ensure_std_fds_one(STDIN_FILENO, "stdin");
+    run_ensure_std_fds_one(STDOUT_FILENO, "stdout");
+    run_ensure_std_fds_one(STDERR_FILENO, "stderr");
 
     /* All three fds are open now (real ones, restored above), so a second
      * call is a documented no-op: it must report success without touching
@@ -117,8 +161,12 @@ static void run_chunk_test(void) {
     CHECK(snprintf(trace_path, sizeof(trace_path), "%s/chunks", g_fake_zfs_dir) < (int)sizeof(trace_path),
           "chunk trace path fits in the isolated test directory");
     char script[PATH_MAX * 2 + 128];
+    /* Explicit trailing `exit 0` so any call this script receives (not
+     * just "snapshot") exits successfully like real zfs would, instead of
+     * falling through to the exit status of the `[ "$1" = snapshot ]`
+     * test itself (nonzero when it doesn't match). */
     CHECK(snprintf(script, sizeof(script),
-                   "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\n",
+                   "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\nexit 0\n",
                    trace_path, trace_path) < (int)sizeof(script),
           "chunk fake-zfs script fits in its buffer");
     CHECK(write_fake_zfs(script) == 0, "installed fake zfs for chunking test");
@@ -190,13 +238,14 @@ static void run_system_tests(void) {
     CHECK(1, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
 
     const char *const create_standard[] = {zfs_path, "create", "-p", standard, NULL};
-    int create_issued = 1;
     if (exec_cmd_stream(create_standard, NULL, NULL) != 0) {
         CHECK(0, "created an isolated real-ZFS standard dataset");
-        if (create_issued) {
-            const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
-            (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
-        }
+        /* Best-effort cleanup attempt even though `create` itself reported
+         * failure: a partial/racy create (e.g. ancestor already existed)
+         * can still have left something under `dataset` to remove. The
+         * destroy's own result is intentionally ignored either way. */
+        const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
+        (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
@@ -822,7 +871,13 @@ static void run_fault_injection_tests(void) {
     realloc_now_fn = realloc;
     int overlap_setup = batch_add(&standard, "pool/a/child", "p", 1, 0) == 0 &&
                         batch_add(&recursive_cover, "pool/a", "p", 1, 0) == 0;
-    g_realloc_calls = 0; realloc_now_fn = test_realloc;
+    /* Explicitly set (not relied-upon carryover): this must fail on the
+     * very first realloc call inside remove_recursive_overlaps (the
+     * rec_keys array growth), regardless of what any earlier block in
+     * this function left g_realloc_fail_after set to. See the comment
+     * above the two OOM blocks below for why implicit carryover here is
+     * exactly the ordering hazard this suite tries to avoid. */
+    g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
     CHECK(overlap_setup && remove_recursive_overlaps(&standard, &recursive_cover) == -1,
           "remove_recursive_overlaps reports an injected allocation failure");
     CHECK(standard.count == 1 && recursive_cover.count == 1,
@@ -1772,12 +1827,29 @@ int main(int argc, char **argv) {
 
             CHECK(rc == 0, "the concurrent stdout+stderr command succeeds");
             CHECK(ctx.count == 40, "all 40 stdout lines were delivered to the handler through the poll()-driven drain, none dropped");
-            int has_first = 0, has_last = 0;
+            /*
+             * Checking count==40 plus just the first/last names leaves a
+             * duplicate-plus-drop (e.g. "pool/ds1" delivered twice while
+             * "pool/ds17" is silently lost) able to pass this test, since
+             * that failure mode preserves both the count and the first/last
+             * names. The setup makes every line's dataset name AND written
+             * value independently derivable ($i and $i*10), so verify all
+             * 40 are present exactly once with their correct values.
+             */
+            int seen[41] = {0};
+            int all_present_once = 1, all_values_correct = 1;
             for (size_t i = 0; i < ctx.count; i++) {
-                if (strcmp(ctx.items[i].name, "pool/ds1") == 0) has_first = 1;
-                if (strcmp(ctx.items[i].name, "pool/ds40") == 0) has_last = 1;
+                int n = 0;
+                if (sscanf(ctx.items[i].name, "pool/ds%d", &n) == 1 && n >= 1 && n <= 40) {
+                    seen[n]++;
+                    if (ctx.items[i].written != (long long)n * 10) all_values_correct = 0;
+                } else {
+                    all_present_once = 0;
+                }
             }
-            CHECK(has_first && has_last, "both the first and last stdout lines survived interleaving with concurrent stderr output");
+            for (int n = 1; n <= 40; n++) if (seen[n] != 1) all_present_once = 0;
+            CHECK(all_present_once, "every one of pool/ds1..pool/ds40 was delivered exactly once, none dropped or duplicated");
+            CHECK(all_values_correct, "every delivered line's written value matches its own $i*10, not a neighbor's (no cross-line corruption during interleaved draining)");
             CHECK(buf != NULL && strstr(buf, "stderr-1") != NULL && strstr(buf, "stderr-40") != NULL,
                   "stderr output interleaved with stdout was also fully drained and logged, not starved by the stdout side of poll()");
 
@@ -2243,8 +2315,10 @@ int main(int argc, char **argv) {
         CHECK(snprintf(trace_path, sizeof(trace_path), "%s/pass-calls", g_fake_zfs_dir) < (int)sizeof(trace_path),
               "Test 44 trace path fits in the isolated test directory");
         char script[PATH_MAX * 2 + 128];
+        /* Explicit trailing `exit 0`, matching the same fix in
+         * run_chunk_test's identical script -- see comment there. */
         CHECK(snprintf(script, sizeof(script),
-                       "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\n",
+                       "#!/bin/sh\nif [ \"$1\" = snapshot ]; then\n shift\n printf '%%s\\n' \"$@\" >> '%s'\n printf '\\036\\n' >> '%s'\nfi\nexit 0\n",
                        trace_path, trace_path) < (int)sizeof(script),
               "Test 44 fake-zfs script fits in its buffer");
         CHECK(write_fake_zfs(script) == 0, "installed fake zfs for the multi-pass test");
@@ -2348,6 +2422,96 @@ int main(int argc, char **argv) {
 
         batch_free(&std_b);
         unlink(g_inventory_args);
+        unlink(g_fake_zfs);
+        printf("\n");
+    }
+
+    printf("== Test 46: exec_cmd_stream reports failure when pipe2() itself cannot allocate a descriptor ==\n");
+    {
+        /*
+         * Coverage gap: exec_cmd_stream_core()'s own pipe2()/fork() failure
+         * branches (the "internal plumbing failures" the exec_cmd_stream_
+         * lenient comment distinguishes from a tolerable nonzero zfs exit)
+         * were never exercised anywhere else in this suite. Forcing a real
+         * pipe2() failure deterministically -- without needing a handler-
+         * count-dependent bug in diffsnap.c itself -- is done by lowering
+         * RLIMIT_NOFILE far enough that no new descriptor can be allocated
+         * at all: fd 0/1/2 are already in use, so a soft limit of 3 leaves
+         * no numerically-eligible slot free for pipe2()'s two new fds,
+         * guaranteeing EMFILE on the very first pipe2() call regardless of
+         * how many other descriptors this process happens to have open.
+         * The original limit is restored on every path out of this block.
+         */
+        struct rlimit old_limit;
+        int got_limit = getrlimit(RLIMIT_NOFILE, &old_limit) == 0;
+        CHECK(got_limit, "read the current RLIMIT_NOFILE before lowering it for the pipe2() failure test");
+        if (got_limit) {
+            struct rlimit low_limit = { .rlim_cur = 3, .rlim_max = old_limit.rlim_max };
+            int lowered = setrlimit(RLIMIT_NOFILE, &low_limit) == 0;
+            CHECK(lowered, "lowered RLIMIT_NOFILE to exhaust available file descriptors");
+            if (lowered) {
+                const char *const argv[] = {"/bin/true", NULL};
+                metric_ctx_t ctx = {0};
+                /* handler != NULL forces exec_cmd_stream_core() down the
+                 * "if (handler && pipe2(out_pfd, ...) == -1)" branch --
+                 * the specific pipe2() call site this test targets. */
+                int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+                CHECK(rc != 0, "exec_cmd_stream reports failure when pipe2() cannot allocate a descriptor for stdout");
+                CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran");
+                free(ctx.items);
+
+                CHECK(setrlimit(RLIMIT_NOFILE, &old_limit) == 0,
+                      "restored the original RLIMIT_NOFILE after the pipe2() failure test");
+            }
+        }
+        printf("\n");
+    }
+
+    printf("== Test 47: create_batch_snapshots logs its own diagnostic (not just zfs_snapshot_batch's) on failure ==\n");
+    {
+        /*
+         * Coverage gap: every other test drives zfs_snapshot_batch()
+         * directly, so create_batch_snapshots()'s own wrapper log line
+         * ("Error: %s zfs snapshot batch execution failed") was never
+         * itself asserted on. Covers both the standard and recursive
+         * message variants.
+         */
+        CHECK(write_fake_zfs("#!/bin/sh\nexit 1\n") == 0,
+              "installed a fake zfs that always fails, for the create_batch_snapshots wrapper test");
+
+        batch_ctx_t std_b = {0};
+        CHECK(batch_add(&std_b, "pool/wrap-std", "p", 1, 0) == 0,
+              "batch_add succeeded for the standard create_batch_snapshots wrapper test");
+        char *buf = NULL;
+        size_t buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 47's standard-batch log capture");
+        int rc_std = create_batch_snapshots(&std_b, "2026-01-01_00:00:00", 0);
+        if (log_fp) fflush(log_fp);
+        CHECK(rc_std != 0, "create_batch_snapshots propagates zfs_snapshot_batch's failure for the standard batch");
+        CHECK(buf != NULL && strstr(buf, "Error: standard zfs snapshot batch execution failed") != NULL,
+              "create_batch_snapshots logs its own standard-batch diagnostic, not just the underlying zfs error");
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        batch_free(&std_b);
+
+        batch_ctx_t rec_b = {0};
+        CHECK(batch_add(&rec_b, "pool/wrap-rec", "p", 1, 0) == 0,
+              "batch_add succeeded for the recursive create_batch_snapshots wrapper test");
+        buf = NULL; buf_len = 0;
+        log_fp = open_memstream(&buf, &buf_len);
+        CHECK(log_fp != NULL, "open_memstream succeeded for Test 47's recursive-batch log capture");
+        int rc_rec = create_batch_snapshots(&rec_b, "2026-01-01_00:00:00", 1);
+        if (log_fp) fflush(log_fp);
+        CHECK(rc_rec != 0, "create_batch_snapshots propagates zfs_snapshot_batch's failure for the recursive batch");
+        CHECK(buf != NULL && strstr(buf, "Error: recursive zfs snapshot batch execution failed") != NULL,
+              "create_batch_snapshots logs its own recursive-batch diagnostic, distinct from the standard-batch wording");
+        if (log_fp) fclose(log_fp);
+        log_fp = NULL;
+        free(buf);
+        batch_free(&rec_b);
+
         unlink(g_fake_zfs);
         printf("\n");
     }
