@@ -426,13 +426,11 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
                 out_reader->failed = 1;
                 close(out_reader->fd);
                 out_reader->fd = -1;
-                out_open = 0;
             }
             if (err_open) {
                 err_reader->failed = 1;
                 close(err_reader->fd);
                 err_reader->fd = -1;
-                err_open = 0;
             }
             break;
         }
