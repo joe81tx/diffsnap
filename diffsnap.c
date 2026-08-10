@@ -46,16 +46,6 @@
 #define ARGV_BYTES_CAP (128 * 1024)
 #define STR_BUF_SMALL 32
 #define STR_BUF_MED 64
-/*
- * ZFS's real limit on a full name (e.g. "filesystem@snapname") is
- * ZFS_MAX_DATASET_NAME_LEN - 1 ASCII characters, which is 255, not 256 --
- * see zfs(8): "The maximum length of a dataset name is
- * ZFS_MAX_DATASET_NAME_LEN - 1 ASCII characters (currently 255)". Using 256
- * here let both a bare configured dataset name and a fully composed
- * "dataset@prefix_timestamp" snapshot name reach one character past what
- * `zfs` itself will accept, which `zfs snapshot`/`zfs get`/`zfs list` then
- * reject at runtime despite passing this program's own validation.
- */
 #define ZFS_NAME_MAX 255
 #define SNAPSHOT_TIMESTAMP_MAX 24 /* YYYY-MM-DD_HH:MM:SS plus UTC offset */
 #define STR_BUF_LARGE (ZFS_NAME_MAX + 1)
