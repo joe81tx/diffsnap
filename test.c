@@ -567,6 +567,90 @@ static void run_main_pipeline_tests(void) {
     }
     printf("\n");
 
+    printf("== Gap: main() fails at its own top-level ensure_std_fds() call when a closed low fd cannot be refilled ==\n");
+    {
+        /*
+         * Coverage gap: ensure_std_fds() itself is unit-tested directly
+         * (run_ensure_std_fds_test above), but main()'s own
+         * "if (ensure_std_fds() != 0) { early_fail(...); return 1; }"
+         * branch -- the very first thing main() does, before the lock
+         * file is even opened -- was never driven to failure through
+         * diffsnap_real_main() itself. ensure_std_fds()'s only failure
+         * mode is its internal open("/dev/null") call failing for a
+         * closed fd 0/1/2 slot.
+         *
+         * fd 0 (stdin) is the target rather than fd 1/2 so the normal
+         * run_main_capture_stderr()-style stderr capture keeps working
+         * throughout: the capture stream is dup2()'d onto stderr BEFORE
+         * fd 0 is closed and RLIMIT_NOFILE is lowered, so that dup2()
+         * call itself still has a normal fd budget, and only fd 0's own
+         * re-creation is starved afterward.
+         *
+         * Starving fd 0 specifically requires RLIMIT_NOFILE's soft limit
+         * lowered all the way to 0: fd 0 is the lowest possible
+         * descriptor number, so unlike Test 46/46a's technique of leaving
+         * headroom for exactly one pipe2() call, there is no higher
+         * cutoff that blocks fd 0 alone while leaving already-open
+         * descriptors (which remain valid regardless of a lowered soft
+         * limit -- only *new* fd-allocating calls are refused) usable.
+         *
+         * The original RLIMIT_NOFILE and the real fd 0/stderr are
+         * restored on every path out of this block; a failed RLIMIT_NOFILE
+         * restore is routed through restore_rlimit_nofile_or_die (fatal),
+         * the same discipline Test 46 uses, since a failed restore here
+         * would starve every later test in this process of new fds.
+         */
+        FILE *capture = tmpfile();
+        int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+        int capture_ok = capture != NULL && saved_stderr >= 0;
+        CHECK(capture_ok, "opened a capture file and saved the real stderr aside for the ensure_std_fds()-failure test");
+        if (capture_ok) {
+            fflush(stderr);
+            int redirected = dup2(fileno(capture), STDERR_FILENO) >= 0;
+            CHECK(redirected, "redirected stderr to the capture file before starving fd 0 (so the redirect itself isn't affected by the lowered rlimit)");
+            if (redirected) {
+                int saved_stdin = dup(STDIN_FILENO);
+                int dup_ok = saved_stdin >= 0;
+                CHECK(dup_ok, "saved the real fd 0 aside before closing it for the ensure_std_fds()-failure test");
+                if (dup_ok) {
+                    int close_ok = close(STDIN_FILENO) == 0;
+                    CHECK(close_ok, "closed fd 0 to simulate a launcher that starts diffsnap with stdin already closed");
+                    struct rlimit old_limit;
+                    int got_limit = getrlimit(RLIMIT_NOFILE, &old_limit) == 0;
+                    CHECK(got_limit, "read the current RLIMIT_NOFILE before starving fd 0 for the ensure_std_fds()-failure test");
+                    if (close_ok && got_limit) {
+                        struct rlimit zero_limit = { .rlim_cur = 0, .rlim_max = old_limit.rlim_max };
+                        int lowered = setrlimit(RLIMIT_NOFILE, &zero_limit) == 0;
+                        if (!lowered) {
+                            printf("    SKIP: could not lower RLIMIT_NOFILE to 0 on this platform/permission level; ensure_std_fds()-failure test skipped\n");
+                        } else {
+                            int rc = diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL});
+
+                            restore_rlimit_nofile_or_die(&old_limit,
+                                  "restored the original RLIMIT_NOFILE after the ensure_std_fds()-failure test");
+
+                            fflush(stderr);
+                            rewind(capture);
+                            char stderr_buf[256] = {0};
+                            size_t got = fread(stderr_buf, 1, sizeof(stderr_buf) - 1, capture);
+                            (void)got;
+
+                            CHECK(rc == 1, "main() fails when its own top-level ensure_std_fds() call cannot refill a closed fd 0");
+                            CHECK(strstr(stderr_buf, "failed to establish standard file descriptors") != NULL,
+                                  "the ensure_std_fds() failure is reported on stderr with its own distinct diagnostic");
+                        }
+                    }
+                    (void)dup2(saved_stdin, STDIN_FILENO);
+                    close(saved_stdin);
+                }
+            }
+            fflush(stderr);
+            (void)dup2(saved_stderr, STDERR_FILENO);
+            close(saved_stderr);
+        }
+        if (capture) fclose(capture);
+        printf("\n");
+    }
 
     char script[PATH_MAX * 2 + 256];
     CHECK(snprintf(script, sizeof(script),
@@ -901,6 +985,108 @@ static void run_main_pipeline_tests(void) {
         if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
         CHECK(strstr(contents, "Failed to allocate metrics command") != NULL,
               "the metrics-fetch argv allocation failure is logged with its own diagnostic");
+    }
+
+    printf("== Gap: main()'s own resolve_recursive_ancestor_overlaps() failure path is exercised through the real pipeline, not just the helper directly ==\n");
+    {
+        /*
+         * Coverage gap: resolve_recursive_ancestor_overlaps()'s own -1
+         * return (its "covered" array allocation failing) is unit-tested
+         * directly against a hand-built batch_ctx_t (the OOM block in
+         * run_fault_injection_tests), but main()'s own
+         * "if (resolve_recursive_ancestor_overlaps(&rec_b) != 0) { ...
+         * goto cleanup; }" wiring was never driven through
+         * diffsnap_real_main() itself. A single due, recursive config
+         * entry puts exactly one item into rec_b, so its first (and only)
+         * allocation is deterministically the 10th diffsnap_realloc call
+         * of the whole run: seen_set_add's growth + key copy (2 calls),
+         * batch_add's growth + dataset copy + prefix copy (3 calls),
+         * collect_due_roots' single root_list_add_unique growth + string
+         * copy (2 calls), the metrics-fetch m_argv allocation (1 call),
+         * and handle_metric_line's own growth allocation for the fake
+         * zfs's one "pool/tree 500" line (1 call) account for the first
+         * 9; resolve_recursive_ancestor_overlaps' "covered" allocation is
+         * therefore call 10. Asserting the exact call count turns any
+         * drift in this derivation into a loud, explicit failure instead
+         * of a silently mistargeted injection (same rationale as the
+         * metrics-fetch-argv test above).
+         */
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fputs("pool/tree,1,1,rectest,yes,0\n", fp); fclose(fp);
+            unlink(args_file);
+            unlink(log_file);
+            CHECK(write_fake_zfs("#!/bin/sh\nif [ \"$1\" = get ]; then printf 'pool/tree\\t500\\n'; exit 0; fi\nexit 0\n") == 0,
+                  "fake zfs for main()'s resolve_recursive_ancestor_overlaps() OOM test installed");
+            g_realloc_calls = 0; g_realloc_fail_after = 9; realloc_now_fn = test_realloc;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() fails when its own resolve_recursive_ancestor_overlaps() call reports an allocation failure");
+            CHECK(g_realloc_calls == 10,
+                  "the injected failure landed on exactly the 10th realloc call -- resolve_recursive_ancestor_overlaps' own 'covered' allocation, not an earlier or later one");
+            realloc_now_fn = realloc; g_realloc_fail_after = -1;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "Failed to check recursive ancestor overlaps") != NULL,
+                  "the resolve_recursive_ancestor_overlaps() failure is logged with its own distinct diagnostic");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: main()'s own remove_recursive_overlaps() failure path is exercised through the real pipeline, not just the helper directly ==\n");
+    {
+        /*
+         * Same rationale as the resolve_recursive_ancestor_overlaps() gap
+         * above, for remove_recursive_overlaps()'s own -1 return (its
+         * rec_keys array allocation failing). Reaching this call with
+         * both std_b.count>0 and rec_b.count>0 (remove_recursive_overlaps
+         * short-circuits to 0, allocating nothing, if either is empty)
+         * requires one standard and one recursive due config entry on two
+         * unrelated pools, so neither is dropped by ancestor-coverage
+         * filtering before this call is reached.
+         *
+         * Call-by-call: line 1 (std) costs seen_set_add's growth+key copy
+         * (2) and batch_add's growth+dataset+prefix copy (3) = 5; line 2
+         * (rec) costs seen_set_add's key copy alone -- no growth, since
+         * the shared seen_set_t already grew on line 1 -- (1) and
+         * batch_add's own growth+dataset+prefix copy for the separate
+         * rec_b array (3) = 4; collect_due_roots costs one
+         * root_list_add_unique growth+copy for the std root (2) plus one
+         * copy-only call for the unrelated rec root, whose growth was
+         * already covered (1) = 3; the metrics-fetch m_argv allocation is
+         * 1 call; handle_metric_line's single growth allocation covers
+         * both fake-zfs output lines (metrics.count stays under
+         * ALLOC_CHUNK_METRIC, so only the first line triggers growth) = 1
+         * call; resolve_recursive_ancestor_overlaps -- which must SUCCEED
+         * here, unlike the gap test above, so remove_recursive_overlaps
+         * is actually reached -- costs its "covered" allocation plus its
+         * "order" allocation for the one surviving rec_b item = 2 calls.
+         * Total: 5+4+3+1+1+2 = 16 calls precede remove_recursive_overlaps'
+         * own first allocation, which is therefore call 17.
+         */
+        fp = fopen(conf_file, "w");
+        if (fp) {
+            fputs("poolstd/a,1,1,p,no,0\n", fp);
+            fputs("poolrec/b,1,1,p,yes,0\n", fp);
+            fclose(fp);
+            unlink(args_file);
+            unlink(log_file);
+            CHECK(write_fake_zfs("#!/bin/sh\nif [ \"$1\" = get ]; then printf 'poolstd/a\\t500\\n'; printf 'poolrec/b\\t500\\n'; exit 0; fi\nexit 0\n") == 0,
+                  "fake zfs for main()'s remove_recursive_overlaps() OOM test installed");
+            g_realloc_calls = 0; g_realloc_fail_after = 16; realloc_now_fn = test_realloc;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() fails when its own remove_recursive_overlaps() call reports an allocation failure");
+            CHECK(g_realloc_calls == 17,
+                  "the injected failure landed on exactly the 17th realloc call -- remove_recursive_overlaps' own rec_keys allocation, not an earlier or later one");
+            realloc_now_fn = realloc; g_realloc_fail_after = -1;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "Failed to check recursive overlaps") != NULL &&
+                  strstr(contents, "Failed to check recursive ancestor overlaps") == NULL,
+                  "the remove_recursive_overlaps() failure is logged with its own distinct diagnostic, not the ancestor-overlap or metrics-fetch ones");
+        }
+        printf("\n");
     }
 
     printf("== Gap: comment and blank config lines are actually skipped (not just accepted as data by accident) ==\n");
@@ -3393,6 +3579,47 @@ int main(int argc, char **argv) {
         batch_free(&rec_b);
 
         unlink(g_fake_zfs);
+        printf("\n");
+    }
+
+    printf("== Test 48: zfs_snapshot_exec_chunk fails safely instead of silently truncating when handed an arena smaller than the formatted name needs ==\n");
+    {
+        /*
+         * Coverage gap: zfs_snapshot_batch_root_pass always sizes
+         * chunk_bytes to exactly the sum of each item's own
+         * strlen(dataset)+strlen(prefix)+strlen(timestamp)+3, so
+         * format_snapshot_name() can never actually overflow the arena
+         * through that real caller -- the truncation guard itself,
+         * "if (written < 0 || (size_t)written >= remaining)", was never
+         * reachable from any test in this suite, the same way Test 32
+         * documents valid_prefix's dead empty-string check. Rather than
+         * leaving it unacknowledged, this drives it directly: call
+         * zfs_snapshot_exec_chunk (the real static function, no shim)
+         * with a deliberately undersized chunk_bytes -- smaller than the
+         * formatted "dataset@prefix_timestamp" actually needs -- bypassing
+         * the caller's own correct sizing, exactly as Test 36 does to
+         * finalize_batch's analogous snprintf guard. realloc_now_fn is
+         * set explicitly (not relied-upon carryover) per this suite's own
+         * established discipline for exactly this reason.
+         */
+        realloc_now_fn = realloc;
+        batch_ctx_t chunk_ctx2 = {0};
+        CHECK(batch_add(&chunk_ctx2, "pool/chunk", "p", 1, 0) == 0,
+              "batch_add succeeded during Test 48 setup");
+        size_t chunk_indices2[1] = {0};
+
+        /* "pool/chunk@p_2026-01-01_00:00:00" needs 33 bytes (32 chars +
+         * NUL); chunk_bytes=10 is deliberately far too small, forcing
+         * format_snapshot_name's return value to be >= remaining on the
+         * chunk's only item. No fake zfs is installed: the truncation
+         * check fires before exec_cmd_stream is ever called, so a real
+         * `zfs` invocation must not happen for this test to be valid. */
+        int rc = zfs_snapshot_exec_chunk(&chunk_ctx2, 0, "2026-01-01_00:00:00", chunk_indices2, 1, 10);
+        CHECK(rc == -1, "zfs_snapshot_exec_chunk reports failure when the formatted name would not fit the arena it was given");
+        CHECK(chunk_ctx2.count == 1 && chunk_ctx2.items[0].snap_failed == 1,
+              "the item is marked snap_failed rather than silently snapshotted under a truncated name");
+
+        batch_free(&chunk_ctx2);
         printf("\n");
     }
 
