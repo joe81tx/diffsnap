@@ -285,17 +285,18 @@ static void run_system_tests(void) {
           "real-ZFS child dataset names fit in the ZFS name buffer");
 
     const char *const check_pool[] = {zfs_path, "list", "-H", "-o", "name", pool, NULL};
-    if (exec_cmd_stream(check_pool, NULL, NULL) != 0) {
-        CHECK(0, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
+    int pool_available = exec_cmd_stream(check_pool, NULL, NULL) == 0;
+    CHECK(pool_available, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
+    if (!pool_available) {
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
     }
-    CHECK(1, "the required real ZFS pool is available (rpool on Linux, zroot on FreeBSD)");
 
     const char *const create_standard[] = {zfs_path, "create", "-p", standard, NULL};
-    if (exec_cmd_stream(create_standard, NULL, NULL) != 0) {
-        CHECK(0, "created an isolated real-ZFS standard dataset");
+    int standard_created = exec_cmd_stream(create_standard, NULL, NULL) == 0;
+    CHECK(standard_created, "created an isolated real-ZFS standard dataset");
+    if (!standard_created) {
         /* Best-effort cleanup attempt even though `create` itself reported
          * failure: a partial/racy create (e.g. ancestor already existed)
          * can still have left something under `dataset` to remove. The
@@ -307,17 +308,16 @@ static void run_system_tests(void) {
         return;
     }
     created = 1;
-    CHECK(1, "created an isolated real-ZFS standard dataset");
     const char *const create_tree[] = {zfs_path, "create", "-p", tree_child, NULL};
-    if (exec_cmd_stream(create_tree, NULL, NULL) != 0) {
-        CHECK(0, "created an isolated nested real-ZFS dataset tree");
+    int tree_created = exec_cmd_stream(create_tree, NULL, NULL) == 0;
+    CHECK(tree_created, "created an isolated nested real-ZFS dataset tree");
+    if (!tree_created) {
         const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
         (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
     }
-    CHECK(1, "created an isolated nested real-ZFS dataset tree");
 
     metric_ctx_t real_metrics = {0};
     const char *const get_written[] = {
@@ -722,6 +722,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the non-due interval-scheduling test");
     if (fp) {
         fputs("pool/due,7,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
@@ -736,6 +737,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the positive-DST-offset due-entry test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
@@ -751,6 +753,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the recursive=yes end-to-end pipeline test");
     if (fp) {
         /*
          * Coverage gap: every recursive-specific behavior (ancestor
@@ -814,6 +817,7 @@ static void run_main_pipeline_tests(void) {
     if (held_lock >= 0) close(held_lock);
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the log_io_failed exit-code test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         /*
@@ -839,6 +843,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the ZFS_NAME_MAX rejection test");
     if (fp) {
         char long_dataset[240], long_prefix[32];
         memset(long_dataset, 'a', sizeof(long_dataset) - 1); long_dataset[sizeof(long_dataset) - 1] = '\0';
@@ -855,6 +860,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the getline failure test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         getline_now_fn = test_getline_failure;
@@ -864,15 +870,24 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the top-level localtime_r failure test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        g_localtime_calls = 0;
         g_localtime_fail = 1; localtime_now_fn = test_localtime;
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() fails when its top-level localtime_r call fails");
+        FILE *log = fopen(log_file, "r");
+        char contents[8192] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "Error: localtime_r failed") != NULL,
+              "the localtime_r failure, rather than an unrelated error, is logged");
         localtime_now_fn = localtime_r; g_localtime_fail = 0;
+        CHECK(g_localtime_calls >= 1, "the localtime hook was actually reached by main()");
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the timestamp strftime failure test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         g_strftime_calls = 0;
@@ -900,6 +915,7 @@ static void run_main_pipeline_tests(void) {
      * rather than unit-testing either helper in isolation.
      */
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the scoped metrics-fetch test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         unlink(args_file);
@@ -920,6 +936,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the unscoped metrics-fetch fallback test");
     if (fp) {
         /* Enough due roots, each long but still within the per-line ZFS
          * name limit main() enforces during parsing, to push their combined
@@ -953,6 +970,7 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the metrics-fetch argv allocation-failure test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
         unlink(log_file);
@@ -1012,6 +1030,7 @@ static void run_main_pipeline_tests(void) {
          * metrics-fetch-argv test above).
          */
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the resolve_recursive_ancestor_overlaps() OOM test");
         if (fp) {
             fputs("pool/tree,1,1,rectest,yes,0\n", fp); fclose(fp);
             unlink(args_file);
@@ -1065,6 +1084,7 @@ static void run_main_pipeline_tests(void) {
          * own first allocation, which is therefore call 17.
          */
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the remove_recursive_overlaps() OOM test");
         if (fp) {
             fputs("poolstd/a,1,1,p,no,0\n", fp);
             fputs("poolrec/b,1,1,p,yes,0\n", fp);
@@ -1146,6 +1166,7 @@ static void run_main_pipeline_tests(void) {
          * strftime/getline/localtime failures elsewhere in this suite.
          */
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the fclose(log_fp) flush-failure test");
         if (fp) {
             fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
             unlink(log_file);
@@ -1180,6 +1201,7 @@ static void run_main_pipeline_tests(void) {
               "exact-boundary test constants land precisely on ZFS_NAME_MAX");
 
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the ZFS_NAME_MAX exact-boundary acceptance test");
         if (fp) {
             fprintf(fp, "%s,7,1,%s,no,0\n", boundary_dataset, boundary_prefix);
             fclose(fp);
@@ -1201,6 +1223,7 @@ static void run_main_pipeline_tests(void) {
               "over-boundary test constants land exactly one byte past ZFS_NAME_MAX");
 
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the ZFS_NAME_MAX over-boundary rejection test");
         if (fp) {
             fprintf(fp, "%s,7,1,%s,no,0\n", over_dataset, boundary_prefix);
             fclose(fp);
@@ -1232,6 +1255,7 @@ static void run_main_pipeline_tests(void) {
          * handle_metric_line -> batch_filter_by_metrics pipeline before.
          */
         fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the literal '-' written-value test");
         if (fp) {
             fputs("pool/dashval,1,1,p,no,0\n", fp); fclose(fp);
             unlink(args_file); unlink(log_file);
@@ -1629,6 +1653,33 @@ int main(int argc, char **argv) {
                 CHECK(ctx.items[0].written == 12345, "parsed written value is correct");
             }
             free(ctx.items);
+
+            /*
+             * exec_cmd_stream_lenient is the wrapper main() actually uses
+             * for the scoped `zfs get` metrics fetch, and it's expected to
+             * deliver handler output identically to the strict wrapper
+             * above; only its exit-code tolerance differs. Every other
+             * lenient-specific test in this file (Test 2, Test 20) passes
+             * handler=NULL and checks only exit-code semantics, so without
+             * this block the lenient wrapper's handler-delivery path would
+             * be exercised only by the optional --system suite. Cover it
+             * here directly so a regression that broke handler wiring
+             * specifically inside exec_cmd_stream_lenient (e.g. dropping
+             * the handler pointer before calling exec_cmd_stream_core)
+             * fails the default suite too.
+             */
+            metric_ctx_t lenient_ctx = {0};
+            const char *const lenient_argv[] = {sh_bin, "-c", "printf 'pool/child2\\t54321\\n'", NULL};
+            int lenient_rc = exec_cmd_stream_lenient(lenient_argv, handle_metric_line, &lenient_ctx);
+            CHECK(lenient_rc == 0, "lenient call with echo succeeds");
+            CHECK(lenient_ctx.count == 1, "lenient wrapper's handler received exactly one parsed line");
+            if (lenient_ctx.count == 1) {
+                CHECK(strcmp(lenient_ctx.items[0].name, "pool/child2") == 0,
+                      "lenient wrapper's parsed dataset name is correct");
+                CHECK(lenient_ctx.items[0].written == 54321,
+                      "lenient wrapper's parsed written value is correct");
+            }
+            free(lenient_ctx.items);
         }
         printf("\n");
     }
