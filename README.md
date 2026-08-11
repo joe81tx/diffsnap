@@ -100,7 +100,7 @@ Fields:
 
 Blank lines and lines where the first character is `#` are ignored.
 
-If the same dataset and prefix combination are configured more than once, the first entry is accepted and the rest will not and generate a log entry.
+If the same dataset and prefix combination are configured more than once, the first entry is accepted and the rest are not and generate a log entry.
 
 Example config:  
 
