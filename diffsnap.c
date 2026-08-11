@@ -528,12 +528,16 @@ static int exec_cmd_stream_lenient(const char *const argv[], line_handler_t hand
 
 static int handle_metric_line(const char *line, void *data) {
     metric_ctx_t *ctx = (metric_ctx_t *)data;
+    /* handle_metric_line() needs a mutable copy of `line` (the tab is
+     * overwritten with '\0' below), but never needs to guard against
+     * truncation here: `line` is reader->buf from the stream_reader_t
+     * that invoked us, and stream_reader_consume()/stream_reader_line()
+     * never deliver more than sizeof(reader->buf)-1 bytes to a handler --
+     * a longer line instead flips reader->failed and is dropped before any
+     * handler call. line_copy uses that same STR_BUF_XLARGE size, so it is
+     * always exactly big enough. */
     char line_copy[STR_BUF_XLARGE];
-    int line_len = snprintf(line_copy, sizeof(line_copy), "%s", line);
-    if (line_len < 0 || (size_t)line_len >= sizeof(line_copy)) {
-        log_msg("Error: Skipping oversized metric line");
-        return -1;
-    }
+    strcpy(line_copy, line);
     char *name = line_copy;
     char *tab = strchr(name, '\t');
     if (!tab) {
