@@ -260,8 +260,10 @@ static void log_msg(const char *fmt, ...) {
     va_end(args);
 }
 
-/* These formats are shared by all snapshot construction and recursive
- * coverage lookups, respectively, so their separators stay synchronized. */
+/* format_snapshot_name is shared by all snapshot construction call sites, and
+ * format_dataset_prefix_key by every dataset/prefix key lookup -- duplicate
+ * detection in seen_set_add() during config parsing as well as recursive
+ * coverage lookups -- so their separators stay synchronized. */
 static int format_snapshot_name(char *dst, size_t dst_size, const char *dataset,
                                 const char *prefix, const char *timestamp) {
     return snprintf(dst, dst_size, "%s@%s_%s", dataset, prefix, timestamp);
@@ -728,9 +730,9 @@ static int prune_from_inventory(const name_list_t *inventory, const char *datase
 }
 
 /* .written starts at -1, a documented "not yet computed" sentinel: no
- * metrics fetch has run for this item yet. batch_filter_by_metrics() (or
- * the recursive equivalent) fills in the real value once `zfs get written`
- * has been read; until then -1 distinguishes "unknown" from "measured 0". */
+ * metrics fetch has run for this item yet. batch_filter_by_metrics()
+ * fills in the real value once `zfs get written` has been read; until
+ * then -1 distinguishes "unknown" from "measured 0". */
 static int batch_add(batch_ctx_t *ctx, const char *dataset, const char *prefix, size_t retention, long long min_bytes) {
     if (ctx->count >= ctx->capacity) {
         size_t new_cap = ctx->capacity == 0 ? ALLOC_CHUNK_BATCH : ctx->capacity * 2;
@@ -947,7 +949,8 @@ static int zfs_snapshot_exec_chunk(batch_ctx_t *ctx, int recursive, const char *
  * bytes under ARGV_BYTES_CAP. Items are packed greedily in their existing
  * order; a chunk always contains at least one item even if that single
  * item's own bytes exceed the cap (can't split further, and in practice
- * unreachable given the ~800-byte ceiling on one snapshot name).
+ * unreachable given the ~256-byte ceiling on one snapshot name imposed by
+ * ZFS_NAME_MAX at config-parse time).
  */
 static int zfs_snapshot_batch_root_pass(batch_ctx_t *ctx, int recursive, const char *timestamp, const char *root_dataset, size_t pass) {
     size_t *indices = NULL, count = 0, capacity = 0;
@@ -1054,9 +1057,9 @@ static int handle_snapshot_inventory_line(const char *line, void *data) {
 
 /*
  * Loads every snapshot relevant to this run exactly once, covering both the
- * standard and recursive batches together (items 5 and 6). Sorted newest-
- * first by creation time, matching what per-item pruning previously relied
- * on from its own individual `zfs list -S creation` call. This single
+ * standard and recursive batches together. Sorted newest-first by creation
+ * time, matching what per-item pruning previously relied on from its own
+ * individual `zfs list -S creation` call. This single
  * listing is reused both to verify snapshots that zfs_snapshot_batch flagged
  * as failed, and to drive pruning for every item in both batches.
  */
