@@ -96,6 +96,15 @@ static void *(*realloc_now_fn)(void *, size_t) = realloc;
  * so the white-box suite can inject that failure and cover the branch
  * that handles it. */
 static int (*fclose_now_fn)(FILE *) = fclose;
+/* Routed indirect for the same reason: a genuine fork() failure (EAGAIN
+ * from RLIMIT_NPROC/pid exhaustion, ENOMEM, ...) is environment-dependent
+ * and not everywhere reproducible on demand, so the white-box suite can
+ * inject it deterministically through this seam to exercise
+ * exec_cmd_stream_core()'s pid == -1 cleanup path specifically, rather
+ * than only being able to infer that path was reached from a nonzero
+ * return code that other failure modes (pipe/drain/wait) could also
+ * produce. */
+static pid_t (*fork_now_fn)(void) = fork;
 static int time_override_active = 0;
 static time_t time_override_value;
 
@@ -109,7 +118,17 @@ static void diffsnap_override_time(time_t value) {
     time_override_value = value;
 }
 
-static void diffsnap_clear_time_override(void) { time_override_active = 0; }
+/* Save/restore accessors so a test that temporarily overrides the clock
+ * can put it back exactly as found -- active-or-not, and prior value --
+ * instead of unconditionally clearing it and assuming it was inactive
+ * beforehand. A prior or later-inserted test that itself holds an active
+ * override would otherwise have that override silently discarded. */
+static int diffsnap_time_override_is_active(void) { return time_override_active; }
+static time_t diffsnap_time_override_get_value(void) { return time_override_value; }
+static void diffsnap_time_override_restore(int was_active, time_t was_value) {
+    time_override_active = was_active;
+    time_override_value = was_value;
+}
 #endif
 
 static void *diffsnap_realloc(void *ptr, size_t size) { return realloc_now_fn(ptr, size); }
@@ -495,7 +514,7 @@ static exec_result_t exec_cmd_stream_core(const char *const argv[], line_handler
         if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
         result.processing_rc = -1; return result;
     }
-    pid_t pid = fork();
+    pid_t pid = fork_now_fn();
     if (pid == -1) {
         if (handler) { close(out_pfd[0]); close(out_pfd[1]); }
         close(err_pfd[0]); close(err_pfd[1]);

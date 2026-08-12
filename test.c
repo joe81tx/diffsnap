@@ -81,6 +81,40 @@ static void restore_rlimit_nofile_or_die(const struct rlimit *old_limit, const c
     restore_rlimit_or_die(RLIMIT_NOFILE, "RLIMIT_NOFILE", old_limit, msg);
 }
 
+/*
+ * Tests that temporarily dup2() a standard fd (stdin/stderr) away from its
+ * original target to capture output/starve input must restore it
+ * afterward, and a failed restore can't just be CHECK()'d and shrugged off
+ * either: unlike an in-process hook, leaving fd 0/2 pointed at a closed
+ * file (or never reattached to the real terminal/pipe) would corrupt
+ * whatever every later test in this process reads from or prints to,
+ * turning one flaky restore into an unbounded number of misleading
+ * downstream failures. So this is fatal, mirroring restore_rlimit_or_die
+ * above -- and it always closes saved_fd itself (success or failure) so
+ * callers never need a second cleanup step.
+ */
+static void restore_stdfd_or_die(int saved_fd, int target_fd, const char *fd_name, const char *msg) {
+    g_tests_run++;
+    int rc = dup2(saved_fd, target_fd);
+    int dup2_errno = errno;
+    close(saved_fd);
+    if (rc >= 0) {
+        printf("    ok: %s\n", msg);
+        return;
+    }
+    g_tests_failed++;
+    printf("    FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__);
+    /* fd_name here may itself be corrupted (this IS the stderr-restore
+     * failure path), so this diagnostic is best-effort; the exit() below
+     * is what actually prevents the corruption from cascading. */
+    fprintf(stderr,
+            "FATAL: could not restore fd %d (%s) after redirecting it for a test (dup2 errno=%d: %s); "
+            "every remaining test would run with a corrupted standard fd and produce misleading "
+            "failures, so stopping now instead of continuing. (tests run so far: %d, failed: %d)\n",
+            target_fd, fd_name, dup2_errno, strerror(dup2_errno), g_tests_run, g_tests_failed);
+    exit(1);
+}
+
 static int setup_fake_zfs(void) {
     if (!mkdtemp(g_fake_zfs_dir)) return -1;
     if (snprintf(g_fake_zfs, sizeof(g_fake_zfs), "%s/zfs", g_fake_zfs_dir) >= (int)sizeof(g_fake_zfs)) return -1;
@@ -277,7 +311,20 @@ static void run_system_tests(void) {
 
     printf("== System tests: real ZFS snapshot, inventory, recursive, and pruning paths ==\n");
     zfs_path = ZFS_PATH;
-    CHECK(snprintf(dataset, sizeof(dataset), "%s/diffsnap-test-%ld", pool, (long)getpid()) < (int)sizeof(dataset),
+    /*
+     * PID alone is not a reliable uniqueness key: after PID reuse, a stale
+     * rpool/diffsnap-test-<pid> left behind by a previous (e.g. killed or
+     * crashed) run under the same PID could still exist, and `zfs create
+     * -p` against it would silently succeed against that pre-existing
+     * fixture rather than a fresh dataset -- after which the final
+     * recursive destroy would remove content this run never created.
+     * Folding in the current time narrows the window but can't eliminate
+     * it by itself, so this is paired below with an explicit pre-flight
+     * check that the target dataset name does not already exist before
+     * anything is created under it.
+     */
+    CHECK(snprintf(dataset, sizeof(dataset), "%s/diffsnap-test-%ld-%llx", pool, (long)getpid(),
+                    (unsigned long long)time(NULL)) < (int)sizeof(dataset),
           "isolated real-ZFS test dataset name fits in the ZFS name buffer");
     CHECK(snprintf(standard, sizeof(standard), "%s/standard", dataset) < (int)sizeof(standard) &&
           snprintf(tree, sizeof(tree), "%s/tree", dataset) < (int)sizeof(tree) &&
@@ -293,16 +340,38 @@ static void run_system_tests(void) {
         return;
     }
 
+    /*
+     * Refuse to proceed if the target dataset name already exists: this is
+     * the only way to be sure the create/destroy below operates solely on
+     * a fixture this run created, and never adopts (and later destroys) a
+     * pre-existing dataset left over from a prior PID-reused run or
+     * outside interference.
+     */
+    const char *const check_target[] = {zfs_path, "list", "-H", "-o", "name", dataset, NULL};
+    int target_already_exists = exec_cmd_stream(check_target, NULL, NULL) == 0;
+    CHECK(!target_already_exists,
+          "the isolated real-ZFS test dataset name does not already exist before this run creates anything under it");
+    if (target_already_exists) {
+        zfs_path = g_fake_zfs;
+        printf("\n");
+        return;
+    }
+
     const char *const create_standard[] = {zfs_path, "create", "-p", standard, NULL};
     int standard_created = exec_cmd_stream(create_standard, NULL, NULL) == 0;
     CHECK(standard_created, "created an isolated real-ZFS standard dataset");
     if (!standard_created) {
-        /* Best-effort cleanup attempt even though `create` itself reported
-         * failure: a partial/racy create (e.g. ancestor already existed)
-         * can still have left something under `dataset` to remove. The
-         * destroy's own result is intentionally ignored either way. */
+        /* Cleanup attempt even though `create` itself reported failure: a
+         * partial/racy create (e.g. ancestor already existed) can still
+         * have left something under `dataset` to remove. The pre-flight
+         * check above already established that nothing under `dataset`
+         * pre-dates this run, so anything found here is this run's own
+         * partial state and the destroy's result is worth reporting
+         * rather than silently discarding -- an unreported failure here
+         * would abandon a fixture with no test remaining to catch it. */
         const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
-        (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
+        CHECK(exec_cmd_stream(destroy_dataset, NULL, NULL) == 0,
+              "cleaned up the partially-created real-ZFS test dataset after a standard-dataset create failure");
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
@@ -313,7 +382,8 @@ static void run_system_tests(void) {
     CHECK(tree_created, "created an isolated nested real-ZFS dataset tree");
     if (!tree_created) {
         const char *const destroy_dataset[] = {zfs_path, "destroy", "-r", dataset, NULL};
-        (void)exec_cmd_stream(destroy_dataset, NULL, NULL);
+        CHECK(exec_cmd_stream(destroy_dataset, NULL, NULL) == 0,
+              "cleaned up the partially-created real-ZFS test dataset after a nested-tree create failure");
         zfs_path = g_fake_zfs;
         printf("\n");
         return;
@@ -451,11 +521,62 @@ static void *test_realloc(void *ptr, size_t size) {
 
 static int g_fclose_fail;
 static int g_fclose_calls;
+/* If nonzero, only the g_fclose_fail_at_call'th invocation of
+ * test_fclose_failure() is made to fail; every other call succeeds
+ * normally. diffsnap_fclose() is shared by both the config-file close and
+ * the log-file close (in that fixed order, at main()'s single cleanup
+ * label), so leaving this at 0 would fail whichever close happens first
+ * to reach the hook -- broader than "the log close specifically" -- and a
+ * test asserting only that *some* hooked close occurred can't tell those
+ * apart. Targeting a call index lets a test pin down and confirm exactly
+ * which of the two closes was made to fail. */
+static int g_fclose_fail_at_call;
 static int test_fclose_failure(FILE *fp) {
     g_fclose_calls++;
     int rc = fclose(fp);
-    if (g_fclose_fail) { errno = ENOSPC; return -1; }
+    if (g_fclose_fail && (g_fclose_fail_at_call == 0 || g_fclose_calls == g_fclose_fail_at_call)) {
+        errno = ENOSPC; return -1;
+    }
     return rc;
+}
+
+/* fork_now_fn injection: deterministically forces exec_cmd_stream_core()
+ * into its pid == -1 branch, independent of any platform-specific
+ * RLIMIT_NPROC behavior. g_fork_calls lets a test confirm the hook was
+ * actually reached (i.e. fork_now_fn, not fork(), supplied the pid), which
+ * is what makes the resulting failure attributable specifically to the
+ * fork()==-1 branch rather than to a downstream pipe/drain/wait failure --
+ * with this injection, pipe2() already succeeded and drain/waitpid are
+ * never reached, so a nonzero exec_cmd_stream() return here can only come
+ * from the branch under test. */
+static int g_fork_fail;
+static int g_fork_calls;
+static pid_t test_fork_failure(void) {
+    g_fork_calls++;
+    if (g_fork_fail) { errno = EAGAIN; return -1; }
+    return fork();
+}
+
+/*
+ * Counts exact occurrences of "<stem><n>" in hay, where a match is only
+ * counted if it is NOT followed by another digit (so "stderr-1" does not
+ * also match inside "stderr-10", "stderr-17-corrupt", etc.). Used to
+ * verify every expected numbered log/stdout line is present exactly once,
+ * rather than only spot-checking the first and last.
+ */
+static int count_exact_numbered_occurrences(const char *hay, const char *stem, int n) {
+    if (!hay) return 0;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "%s%d", stem, n);
+    size_t needle_len = strlen(needle);
+    int count = 0;
+    const char *p = hay;
+    while ((p = strstr(p, needle)) != NULL) {
+        unsigned char after = (unsigned char)p[needle_len];
+        if (!isdigit(after)) count++;
+        p += needle_len;
+    }
+    return count;
 }
 
 static struct tm *test_positive_offset_localtime(const time_t *value, struct tm *result) {
@@ -507,8 +628,8 @@ static int run_main_capture_stderr(int argc, char **argv, char *buf, size_t buf_
         size_t got = fread(buf, 1, buf_size - 1, capture);
         buf[got] = '\0';
     }
-    (void)dup2(saved, STDERR_FILENO);
-    close(saved);
+    restore_stdfd_or_die(saved, STDERR_FILENO, "stderr",
+                          "restored the real stderr after run_main_capture_stderr()'s redirection");
     fclose(capture);
     return rc;
 }
@@ -651,13 +772,13 @@ static void run_main_pipeline_tests(void) {
                                   "the ensure_std_fds() failure is reported on stderr with its own distinct diagnostic");
                         }
                     }
-                    (void)dup2(saved_stdin, STDIN_FILENO);
-                    close(saved_stdin);
+                    restore_stdfd_or_die(saved_stdin, STDIN_FILENO, "stdin",
+                                         "restored the real stdin after starving fd 0 for the ensure_std_fds()-failure test");
                 }
             }
             fflush(stderr);
-            (void)dup2(saved_stderr, STDERR_FILENO);
-            close(saved_stderr);
+            restore_stdfd_or_die(saved_stderr, STDERR_FILENO, "stderr",
+                                  "restored the real stderr after capturing it for the ensure_std_fds()-failure test");
         }
         if (capture) fclose(capture);
         printf("\n");
@@ -1317,12 +1438,20 @@ static void run_main_pipeline_tests(void) {
         if (fp) {
             fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
             unlink(log_file);
-            g_fclose_fail = 1; g_fclose_calls = 0; fclose_now_fn = test_fclose_failure;
+            /* main()'s single cleanup label always closes conf (if
+             * non-NULL) before log_fp, in that fixed order -- so with a
+             * valid config file present (as set up above), the 1st hooked
+             * close is the config close and the 2nd is the log close.
+             * Target call #2 specifically so this test's failure is
+             * attributable to the log close, not "whichever close the
+             * hook happens to see first". */
+            g_fclose_fail = 1; g_fclose_calls = 0; g_fclose_fail_at_call = 2; fclose_now_fn = test_fclose_failure;
             char stderr_buf[512] = {0};
             CHECK(run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf)) == 1,
                   "main() fails when fclose(log_fp) itself reports a flush/close error");
-            fclose_now_fn = fclose; g_fclose_fail = 0;
-            CHECK(g_fclose_calls >= 1, "the fclose hook was actually reached by main()");
+            fclose_now_fn = fclose; g_fclose_fail = 0; g_fclose_fail_at_call = 0;
+            CHECK(g_fclose_calls == 2,
+                  "diffsnap_fclose was invoked exactly twice (config, then log), confirming call #2 -- the one made to fail -- was the log close");
             CHECK(strstr(stderr_buf, "failed to flush log file") != NULL,
                   "the flush-failure diagnostic, distinct from the log_io_failed write-failure diagnostic, is reported on stderr");
         }
@@ -1497,12 +1626,15 @@ static void run_main_pipeline_tests(void) {
 
 static void run_fault_injection_tests(void) {
     printf("== Fault injection: in-process time, localtime, and allocation hooks ==\n");
+    int prior_time_override_active = diffsnap_time_override_is_active();
+    time_t prior_time_override_value = diffsnap_time_override_get_value();
     diffsnap_override_time((time_t)0);
     CHECK(diffsnap_now() == (time_t)0, "the test overrides diffsnap's clock without changing the system clock");
-    diffsnap_clear_time_override();
+    diffsnap_time_override_restore(prior_time_override_active, prior_time_override_value);
 
     char *buf = NULL;
     size_t buf_len = 0;
+    FILE *prior_log_fp = log_fp;
     log_fp = open_memstream(&buf, &buf_len);
     CHECK(log_fp != NULL, "memory-backed log capture opened");
     if (log_fp) {
@@ -1519,11 +1651,12 @@ static void run_fault_injection_tests(void) {
         CHECK(buf && strstr(buf, "localtime_r failed") && strstr(buf, "message during localtime failure"),
               "timestamp failure is described on the log message");
         CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
-        fclose(log_fp); log_fp = NULL; free(buf);
+        fclose(log_fp); log_fp = prior_log_fp; free(buf);
     }
 
     buf = NULL;
     buf_len = 0;
+    prior_log_fp = log_fp;
     log_fp = open_memstream(&buf, &buf_len);
     CHECK(log_fp != NULL, "memory-backed log capture opened");
     if (log_fp) {
@@ -1542,7 +1675,7 @@ static void run_fault_injection_tests(void) {
         CHECK(buf && strstr(buf, "localtime_r failed") == NULL,
               "a strftime-only failure is not misreported as a localtime_r failure");
         CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
-        fclose(log_fp); log_fp = NULL; free(buf);
+        fclose(log_fp); log_fp = prior_log_fp; free(buf);
     }
 
     batch_ctx_t ctx = {0};
@@ -2393,6 +2526,7 @@ int main(int argc, char **argv) {
 
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 19a's log capture");
 
@@ -2406,7 +2540,7 @@ int main(int argc, char **argv) {
               "the overflow is reported through the same diagnostic used for a missing/invalid root, not a distinct or silent path");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(metrics.items);
         batch_free(&b);
@@ -2471,6 +2605,7 @@ int main(int argc, char **argv) {
     {
         metric_ctx_t metrics = {0};
         char *log_buf = NULL; size_t log_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&log_buf, &log_len);
         CHECK(log_fp != NULL, "opened a log capture for malformed metric rows");
         if (log_fp) {
@@ -2483,7 +2618,7 @@ int main(int argc, char **argv) {
             CHECK(metrics.count == 0 && strstr(log_buf, "missing tab delimiter") &&
                   strstr(log_buf, "unexpected fields") && strstr(log_buf, "empty dataset or written value"),
                   "missing, extra, and empty metric fields each produce a diagnostic log entry");
-            fclose(log_fp); log_fp = NULL;
+            fclose(log_fp); log_fp = prior_log_fp;
         }
         free(log_buf); free(metrics.items);
         printf("\n");
@@ -2546,6 +2681,7 @@ int main(int argc, char **argv) {
         CHECK(g_spy_calls == 0, "a NUL-containing stdout record is never handed to its parser");
 
         char *log_buf = NULL; size_t log_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&log_buf, &log_len);
         CHECK(log_fp != NULL, "opened a log capture for NUL-containing stderr");
         if (log_fp) {
@@ -2556,7 +2692,7 @@ int main(int argc, char **argv) {
             fflush(log_fp);
             CHECK(stderr_reader.failed == 0 && strstr(log_buf, "bad\\x00x") != NULL,
                   "a NUL in stderr is safely escaped in its diagnostic log line");
-            fclose(log_fp); log_fp = NULL;
+            fclose(log_fp); log_fp = prior_log_fp;
         }
         free(log_buf);
 
@@ -2567,6 +2703,7 @@ int main(int argc, char **argv) {
     {
         name_list_t inventory = {0};
         char *log_buf = NULL; size_t log_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&log_buf, &log_len);
         CHECK(log_fp != NULL, "opened a log capture for invalid snapshot inventory rows");
         if (log_fp) {
@@ -2588,7 +2725,7 @@ int main(int argc, char **argv) {
             fflush(log_fp);
             CHECK(inventory.count == 1 && strstr(log_buf, "Invalid snapshot inventory line"),
                   "invalid inventory rows are logged and rejected before they enter pruning");
-            fclose(log_fp); log_fp = NULL;
+            fclose(log_fp); log_fp = prior_log_fp;
         }
         free(log_buf);
         name_list_free(&inventory);
@@ -2651,14 +2788,33 @@ int main(int argc, char **argv) {
     printf("== Test 23: prune_from_inventory's date_stamp_like gate excludes prefix-matching but non-date-shaped snapshot names ==\n");
     {
         /* This test owns its fake command: ordinary destroy calls succeed
-         * without touching real ZFS. */
-        CHECK(write_fake_zfs("#!/bin/sh\nexit 0\n") == 0,
+         * without touching real ZFS.
+         *
+         * Fidelity check: the script also appends every invocation's own
+         * args to call_log. Without this, the test's only evidence that
+         * the malformed entry was "never selected for pruning" is
+         * prune_from_inventory's OWN log_msg() output -- which really only
+         * proves what the function logged, not what it actually told zfs
+         * to destroy. A bug that destroyed the malformed snapshot without
+         * (or incorrectly) logging that destroy would still pass a
+         * log-text-only check. Reading call_log lets the test confirm
+         * which snapshot names zfs was actually invoked against,
+         * independent of what prune_from_inventory chose to log. */
+        char call_log23[PATH_MAX];
+        CHECK(snprintf(call_log23, sizeof(call_log23), "%s/test23-calls", g_fake_zfs_dir) < (int)sizeof(call_log23),
+              "constructed a path for Test 23's fake-zfs call log");
+        unlink(call_log23);
+
+        char script23[PATH_MAX + 64];
+        CHECK(snprintf(script23, sizeof(script23), "#!/bin/sh\necho \"$*\" >> '%s'\nexit 0\n", call_log23) < (int)sizeof(script23) &&
+              write_fake_zfs(script23) == 0,
               "fake zfs script created outside the system ZFS path for Test 23");
 
         /* Capture log_msg() output so we can see exactly what got pruned,
          * the same technique test_localtime_standalone.c uses. */
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for capturing log_msg output");
 
@@ -2693,12 +2849,32 @@ int main(int argc, char **argv) {
         }
         CHECK(pruned_count == 1, "exactly one snapshot was pruned -- the malformed-name entry was never counted as a match");
         CHECK(buf != NULL && strstr(buf, "myprefix_garbage-not-a-date") == NULL,
-              "the non-date-shaped entry was never selected for pruning");
+              "the non-date-shaped entry was never selected for pruning, per the application's own log");
         CHECK(buf != NULL && strstr(buf, "myprefix_2026-01-01_00:00:00") != NULL,
-              "the oldest genuinely date-stamped entry is the one that was pruned, leaving the newest one retained");
+              "the oldest genuinely date-stamped entry is the one that was pruned, leaving the newest one retained, per the application's own log");
 
+        char call_log23_contents[1024] = {0};
+        FILE *call_log23_fp = fopen(call_log23, "r");
+        if (call_log23_fp) {
+            size_t rd = fread(call_log23_contents, 1, sizeof(call_log23_contents) - 1, call_log23_fp);
+            (void)rd;
+            fclose(call_log23_fp);
+        }
+        int destroy_calls = 0;
+        {
+            const char *p = call_log23_contents;
+            while ((p = strstr(p, "destroy")) != NULL) { destroy_calls++; p += 7; }
+        }
+        CHECK(destroy_calls == 1,
+              "exactly one `zfs destroy` invocation actually reached the fake command, matching the single logged prune");
+        CHECK(strstr(call_log23_contents, "myprefix_garbage-not-a-date") == NULL,
+              "the malformed non-date-shaped name was never passed as an argument to any real zfs invocation, not merely absent from the application's own log text");
+        CHECK(strstr(call_log23_contents, "myprefix_2026-01-01_00:00:00") != NULL,
+              "the actual `zfs destroy` invocation's argv names the oldest genuinely date-stamped snapshot");
+
+        unlink(call_log23);
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches); /* matches holds borrowed pointers into inventory -- only the array itself is ours to free */
         name_list_free(&inventory);
@@ -2746,6 +2922,7 @@ int main(int argc, char **argv) {
 
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 24 stderr capture");
         int rc = zfs_snapshot_batch(&ctx, 0, "2026-01-01_00:00:00");
@@ -2789,7 +2966,7 @@ int main(int argc, char **argv) {
 
         batch_free(&ctx);
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         unlink(call_log);
         unlink(g_fake_zfs); /* done with the fake zfs script now */
@@ -3011,6 +3188,7 @@ int main(int argc, char **argv) {
         if (sh_bin) {
             char *buf = NULL;
             size_t buf_len = 0;
+            FILE *prior_log_fp = log_fp;
             log_fp = open_memstream(&buf, &buf_len);
             CHECK(log_fp != NULL, "open_memstream succeeded for capturing stderr-routed log output");
 
@@ -3030,13 +3208,18 @@ int main(int argc, char **argv) {
              * that failure mode preserves both the count and the first/last
              * names. The setup makes every line's dataset name AND written
              * value independently derivable ($i and $i*10), so verify all
-             * 40 are present exactly once with their correct values.
+             * 40 are present exactly once with their correct values. The
+             * sscanf uses %n and compares the consumed length against the
+             * full name length so a malformed replacement like
+             * "pool/ds17-corrupt" is rejected rather than silently parsed
+             * as ds17.
              */
             int seen[41] = {0};
             int all_present_once = 1, all_values_correct = 1;
             for (size_t i = 0; i < ctx.count; i++) {
-                int n = 0;
-                if (sscanf(ctx.items[i].name, "pool/ds%d", &n) == 1 && n >= 1 && n <= 40) {
+                int n = 0, consumed = 0;
+                if (sscanf(ctx.items[i].name, "pool/ds%d%n", &n, &consumed) == 1 &&
+                    consumed == (int)strlen(ctx.items[i].name) && n >= 1 && n <= 40) {
                     seen[n]++;
                     if (ctx.items[i].written != (long long)n * 10) all_values_correct = 0;
                 } else {
@@ -3044,13 +3227,25 @@ int main(int argc, char **argv) {
                 }
             }
             for (int n = 1; n <= 40; n++) if (seen[n] != 1) all_present_once = 0;
-            CHECK(all_present_once, "every one of pool/ds1..pool/ds40 was delivered exactly once, none dropped or duplicated");
+            CHECK(all_present_once, "every one of pool/ds1..pool/ds40 was delivered exactly once, none dropped, duplicated, or corrupted");
             CHECK(all_values_correct, "every delivered line's written value matches its own $i*10, not a neighbor's (no cross-line corruption during interleaved draining)");
-            CHECK(buf != NULL && strstr(buf, "stderr-1") != NULL && strstr(buf, "stderr-40") != NULL,
-                  "stderr output interleaved with stdout was also fully drained and logged, not starved by the stdout side of poll()");
+
+            /*
+             * Checking only stderr-1 and stderr-40 leaves a drain bug that
+             * drops stderr-2..stderr-39 (while the first/last still make it
+             * through) undetected, despite the CHECK message previously
+             * claiming full draining. Verify all 40 are present exactly
+             * once, the same standard already applied to stdout above.
+             */
+            int stderr_all_present_once = 1;
+            for (int n = 1; n <= 40; n++) {
+                if (count_exact_numbered_occurrences(buf, "stderr-", n) != 1) stderr_all_present_once = 0;
+            }
+            CHECK(buf != NULL && stderr_all_present_once,
+                  "every one of stderr-1..stderr-40 was drained and logged exactly once, not just the first and last, and not starved by the stdout side of poll()");
 
             if (log_fp) fclose(log_fp);
-            log_fp = NULL;
+            log_fp = prior_log_fp;
             free(buf);
             free(ctx.items);
         }
@@ -3065,6 +3260,7 @@ int main(int argc, char **argv) {
         if (sh_bin) {
             char *buf = NULL;
             size_t buf_len = 0;
+            FILE *prior_log_fp = log_fp;
             log_fp = open_memstream(&buf, &buf_len);
             CHECK(log_fp != NULL, "open_memstream succeeded for capturing log output");
 
@@ -3084,11 +3280,24 @@ int main(int argc, char **argv) {
             CHECK(rc == 0, "the command succeeds even though stdout closes long before stderr finishes");
             CHECK(ctx.count == 1 && strcmp(ctx.items[0].name, "pool/only") == 0,
                   "the single stdout line emitted before the close was captured");
-            CHECK(buf != NULL && strstr(buf, "late-stderr-1") != NULL && strstr(buf, "late-stderr-10") != NULL,
-                  "all stderr lines emitted AFTER stdout's fd closed were still drained to completion, not cut off early");
+            CHECK(ctx.count == 1 && ctx.items[0].written == 99,
+                  "the single stdout line's written value was parsed correctly, not just its name (a parser that preserves the name but corrupts the value would otherwise pass)");
+
+            /*
+             * Checking only late-stderr-1 and late-stderr-10 leaves a drain
+             * bug that drops late-stderr-2..late-stderr-9 undetected,
+             * despite the CHECK message previously claiming full draining.
+             * Verify all 10 are present exactly once.
+             */
+            int late_stderr_all_present_once = 1;
+            for (int n = 1; n <= 10; n++) {
+                if (count_exact_numbered_occurrences(buf, "late-stderr-", n) != 1) late_stderr_all_present_once = 0;
+            }
+            CHECK(buf != NULL && late_stderr_all_present_once,
+                  "every one of late-stderr-1..late-stderr-10 emitted AFTER stdout's fd closed was drained to completion exactly once, not cut off early");
 
             if (log_fp) fclose(log_fp);
-            log_fp = NULL;
+            log_fp = prior_log_fp;
             free(buf);
             free(ctx.items);
         }
@@ -3111,6 +3320,49 @@ int main(int argc, char **argv) {
               "valid_prefix(\"\") returns 1 now that the unreachable empty-string rejection was removed -- documents the new contract rather than silently changing behavior");
         CHECK(valid_prefix("ok_name-1") == 1, "an ordinary alnum/underscore/hyphen prefix is still accepted");
         CHECK(valid_prefix("bad name") == 0, "a prefix containing a disallowed character (space) is still rejected");
+        printf("\n");
+    }
+
+    printf("== Test 32a: the exact caller-invariant Test 32 relies on -- an empty PREFIX field is rejected by the adjacent-comma gate before valid_prefix() ever sees it ==\n");
+    {
+        /*
+         * Test 32 above documents that valid_prefix("") is unreachable
+         * because "the only caller never passes an empty prefix". The
+         * generic adjacent-comma coverage elsewhere in this suite exercises
+         * a leading comma (empty dataset field) and an empty retention
+         * field, but never specifically an empty prefix field -- exactly
+         * the field valid_prefix() itself validates. Supply that exact
+         * case (an empty 4th/prefix field via "pool/a,1,1,,no,0") through
+         * the real end-to-end config pipeline and confirm it is rejected
+         * at the adjacent-comma stage, never reaching -- let alone being
+         * accepted or rejected by -- valid_prefix(). std_b/rec_b both stay
+         * empty for a config with no valid entries, so main() never issues
+         * any zfs command for this case; no fake-zfs script is needed.
+         */
+        char conf_file32a[PATH_MAX], log_file32a[PATH_MAX], lock_file32a[PATH_MAX];
+        CHECK(snprintf(conf_file32a, sizeof(conf_file32a), "%s/t32a.conf", g_fake_zfs_dir) < (int)sizeof(conf_file32a) &&
+              snprintf(log_file32a, sizeof(log_file32a), "%s/t32a.log", g_fake_zfs_dir) < (int)sizeof(log_file32a) &&
+              snprintf(lock_file32a, sizeof(lock_file32a), "%s/t32a.lock", g_fake_zfs_dir) < (int)sizeof(lock_file32a),
+              "isolated files for Test 32a fit in the test directory");
+        conf_path = conf_file32a; log_path = log_file32a; lock_path = lock_file32a;
+
+        FILE *fp32a = fopen(conf_file32a, "w");
+        CHECK(fp32a != NULL, "opened isolated config for the empty-prefix-field adjacent-comma test");
+        if (fp32a) {
+            fputs("pool/a,1,1,,no,0\n", fp32a);
+            fclose(fp32a);
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() rejects a config line whose prefix field is empty");
+            FILE *log32a = fopen(log_file32a, "r");
+            char contents32a[4096] = {0};
+            if (log32a) { size_t rd = fread(contents32a, 1, sizeof(contents32a) - 1, log32a); (void)rd; fclose(log32a); }
+            CHECK(strstr(contents32a, "adjacent comma delimiters") != NULL,
+                  "an empty prefix field (adjacent commas around it) is caught by the adjacent-comma gate");
+            CHECK(strstr(contents32a, "invalid prefix") == NULL,
+                  "the line never reaches valid_prefix() at all, so no 'invalid prefix' diagnostic is emitted for it -- the caller invariant Test 32 relies on is genuinely exercised here, not just asserted in a comment");
+        }
+        unlink(conf_file32a); unlink(log_file32a); unlink(lock_file32a);
+        conf_path = CONF_PATH; log_path = LOG_PATH; lock_path = LOCK_PATH;
         printf("\n");
     }
 
@@ -3260,6 +3512,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for capturing finalize_batch's log output");
 
@@ -3273,7 +3526,7 @@ int main(int argc, char **argv) {
               "no false 'Created=' line is emitted for a name that couldn't be safely formatted");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3294,6 +3547,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded");
 
@@ -3305,7 +3559,7 @@ int main(int argc, char **argv) {
               "the Created= line uses the correctly-formatted, non-truncated snapshot name");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3329,6 +3583,7 @@ int main(int argc, char **argv) {
 
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "opened a log capture for Test 38's coverage messages");
 
@@ -3344,7 +3599,7 @@ int main(int argc, char **argv) {
               "a two-level-gap descendant is also recognized as covered, exercising is_recursively_covered's ancestor walk past its first iteration");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         batch_free(&std_b); batch_free(&rec_b);
         printf("\n");
@@ -3381,6 +3636,7 @@ int main(int argc, char **argv) {
 
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 39's coverage-message capture");
 
@@ -3392,7 +3648,7 @@ int main(int argc, char **argv) {
         CHECK(std_b.count == 1 && strcmp(std_b.items[0].dataset, "pool/keep") == 0,
               "after a real compaction (one item dropped, one kept) the surviving entry is the compacted-down \"pool/keep\", not a stale freed slot");
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
 
         batch_free(&std_b); /* the count repair matters for the OVERSIZED entry, not pool/keep:
@@ -3430,6 +3686,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 40's log capture");
 
@@ -3445,7 +3702,7 @@ int main(int argc, char **argv) {
               "no Created= line is emitted when the snapshot's existence could not be verified");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3465,6 +3722,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 41's log capture");
 
@@ -3480,7 +3738,7 @@ int main(int argc, char **argv) {
               "no Created= line is emitted for a snapshot the inventory confirms does not exist");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3510,6 +3768,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 42's log capture");
 
@@ -3524,7 +3783,7 @@ int main(int argc, char **argv) {
               "neither of the unverifiable/absent diagnostics fires once the inventory confirms success");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3544,6 +3803,7 @@ int main(int argc, char **argv) {
         size_t matches_cap = 0;
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 43's log capture");
 
@@ -3559,7 +3819,7 @@ int main(int argc, char **argv) {
               "pruning is explicitly reported as skipped due to the unavailable inventory, not silently dropped");
 
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         free(matches);
         name_list_free(&inventory);
@@ -3800,12 +4060,38 @@ int main(int argc, char **argv) {
          * Coverage gap: fork()'s own failure branch in
          * exec_cmd_stream_core() (pid == -1, distinct cleanup path that
          * closes both pipe pairs without ever reaching drain/waitpid) was
-         * never exercised anywhere in this suite. RLIMIT_NPROC is lowered
-         * far enough that no new process can be created for this user,
-         * deterministically forcing fork() to fail with EAGAIN. Skipped
-         * (not failed) if the platform lacks RLIMIT_NPROC or this process
-         * lacks permission to lower it -- e.g. some containerized or
-         * privileged environments.
+         * never exercised anywhere in this suite.
+         *
+         * Primary check: fork_now_fn is hooked to deterministically return
+         * -1/EAGAIN without ever calling the real fork(). Because pipe2()
+         * has already succeeded by this point and the pid == -1 branch
+         * returns before drain_command_streams()/waitpid() are ever
+         * reached, a nonzero exec_cmd_stream() result here can only come
+         * from the branch under test -- unlike checking rc != 0 alone,
+         * which a pipe/drain/wait failure could equally satisfy.
+         * g_fork_calls == 1 additionally confirms the hook (and therefore
+         * this exact injected failure) was actually reached, rather than
+         * some earlier branch returning nonzero before fork_now_fn was
+         * ever called.
+         */
+        const char *const argv[] = {"/bin/true", NULL};
+        metric_ctx_t ctx = {0};
+        g_fork_fail = 1; g_fork_calls = 0; fork_now_fn = test_fork_failure;
+        int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+        fork_now_fn = fork; g_fork_fail = 0;
+        CHECK(rc != 0, "exec_cmd_stream reports failure when the fork_now_fn hook forces fork() to fail");
+        CHECK(g_fork_calls == 1, "fork_now_fn was invoked exactly once, confirming the reported failure is attributable to the fork()==-1 branch specifically");
+        CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran (fork failed before any child existed)");
+        free(ctx.items);
+
+        /*
+         * Secondary, best-effort check: also exercise a genuine OS-level
+         * fork() failure (not just the injected hook) by lowering
+         * RLIMIT_NPROC far enough that no new process can be created for
+         * this user. Skipped (not failed) if the platform lacks
+         * RLIMIT_NPROC, this process lacks permission to lower it, or this
+         * environment doesn't enforce it against fork() at all -- e.g.
+         * some containerized or privileged environments.
          */
 #ifdef RLIMIT_NPROC
         struct rlimit old_nproc;
@@ -3829,8 +4115,8 @@ int main(int argc, char **argv) {
                     printf("    SKIP: this platform/privilege level does not enforce RLIMIT_NPROC against fork(); fork() failure test skipped\n");
                     free(ctx.items);
                 } else {
-                    CHECK(rc != 0, "exec_cmd_stream reports failure when fork() cannot create a new process");
-                    CHECK(ctx.count == 0, "no metric lines were parsed since the command never actually ran (fork failed before any child existed)");
+                    CHECK(rc != 0, "(secondary, real-OS fork() failure via RLIMIT_NPROC) exec_cmd_stream reports failure when fork() cannot create a new process");
+                    CHECK(ctx.count == 0, "(secondary) no metric lines were parsed since the command never actually ran (fork failed before any child existed)");
                     free(ctx.items);
                 }
 
@@ -3863,6 +4149,7 @@ int main(int argc, char **argv) {
               "batch_add succeeded for the standard create_batch_snapshots wrapper test");
         char *buf = NULL;
         size_t buf_len = 0;
+        FILE *prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 47's standard-batch log capture");
         int rc_std = create_batch_snapshots(&std_b, "2026-01-01_00:00:00", 0);
@@ -3871,7 +4158,7 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "Error: standard zfs snapshot batch execution failed") != NULL,
               "create_batch_snapshots logs its own standard-batch diagnostic, not just the underlying zfs error");
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         batch_free(&std_b);
 
@@ -3879,6 +4166,7 @@ int main(int argc, char **argv) {
         CHECK(batch_add(&rec_b, "pool/wrap-rec", "p", 1, 0) == 0,
               "batch_add succeeded for the recursive create_batch_snapshots wrapper test");
         buf = NULL; buf_len = 0;
+        prior_log_fp = log_fp;
         log_fp = open_memstream(&buf, &buf_len);
         CHECK(log_fp != NULL, "open_memstream succeeded for Test 47's recursive-batch log capture");
         int rc_rec = create_batch_snapshots(&rec_b, "2026-01-01_00:00:00", 1);
@@ -3887,7 +4175,7 @@ int main(int argc, char **argv) {
         CHECK(buf != NULL && strstr(buf, "Error: recursive zfs snapshot batch execution failed") != NULL,
               "create_batch_snapshots logs its own recursive-batch diagnostic, distinct from the standard-batch wording");
         if (log_fp) fclose(log_fp);
-        log_fp = NULL;
+        log_fp = prior_log_fp;
         free(buf);
         batch_free(&rec_b);
 
