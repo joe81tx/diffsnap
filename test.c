@@ -1411,6 +1411,60 @@ static void run_main_pipeline_tests(void) {
         printf("\n");
     }
 
+    printf("== Gap: log_path is opened in append mode (\"ae\"), not truncated, across separate main() invocations ==\n");
+    {
+        /*
+         * Coverage gap: main() opens the log file with
+         * fopen(log_path, "ae") (diffsnap.c ~line 1280) -- append mode,
+         * so a log line written by one cron-scheduled run must survive
+         * into the next run's log file rather than being wiped out.
+         * Every other main()-pipeline test in this suite unlink(log_file)s
+         * before its own scenario (by design, so each test's log
+         * assertions see only its own fresh content), so the "a" vs a
+         * hypothetical "w" distinction was never actually exercised
+         * anywhere: a regression that changed the fopen mode to
+         * truncate-on-open would still pass every other test here, since
+         * none of them ever look at more than one run's log file at once.
+         *
+         * This drives two separate diffsnap_real_main() invocations back
+         * to back, deliberately WITHOUT unlinking log_file in between,
+         * each against a fake zfs reporting a different (and therefore
+         * individually identifiable) written-bytes value, then confirms
+         * the log file contains BOTH runs' Created= lines afterward, in
+         * the order they were written -- not just the second run's,
+         * which is what a truncating open would leave behind.
+         */
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the log-append test");
+        if (fp) {
+            fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(log_file);
+
+            CHECK(write_fake_zfs("#!/bin/sh\nif [ \"$1\" = get ]; then printf 'pool/due\\t111\\n'; exit 0; fi\nexit 0\n") == 0,
+                  "fake zfs for the log-append test's first run installed");
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+                  "the first of two back-to-back main() runs succeeds");
+
+            CHECK(write_fake_zfs("#!/bin/sh\nif [ \"$1\" = get ]; then printf 'pool/due\\t222\\n'; exit 0; fi\nexit 0\n") == 0,
+                  "fake zfs for the log-append test's second run installed");
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+                  "the second of two back-to-back main() runs succeeds without the log file being unlinked first");
+
+            FILE *log = fopen(log_file, "r");
+            char contents[4096] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            char *first_pos = strstr(contents, "Written=111");
+            char *second_pos = strstr(contents, "Written=222");
+            CHECK(first_pos != NULL,
+                  "the FIRST run's log entry (Written=111) is still present in the log file after the second run -- proves append, not truncate");
+            CHECK(second_pos != NULL,
+                  "the second run's own log entry (Written=222) is also present");
+            CHECK(first_pos != NULL && second_pos != NULL && first_pos < second_pos,
+                  "the first run's entry precedes the second run's entry -- new content was appended after it, not written over it");
+        }
+        printf("\n");
+    }
+
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
           "main() accepts --help");
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--version", NULL}) == 0,
@@ -1661,14 +1715,25 @@ static void run_fault_injection_tests(void) {
     realloc_now_fn = realloc; g_realloc_fail_after = -1;
     name_list_free(&inv_list);
     batch_free(&inv_std); batch_free(&inv_rec);
-    g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
 
     name_list_t inventory = {0};
     inventory.names = calloc(1, sizeof(*inventory.names));
     if (inventory.names) {
         inventory.names[0] = strdup("pool/a@p_2026-01-01_00:00:00"); inventory.count = 1; inventory.capacity = 1;
         char **matches = NULL; size_t matches_cap = 0;
-        g_realloc_calls = 0; realloc_now_fn = test_realloc;
+        /* Explicit, not relied-upon carryover: this must fail on the very
+         * first realloc call inside prune_from_inventory (the match-list
+         * growth) regardless of what any earlier block in this function
+         * left g_realloc_fail_after set to. Previously this read
+         * g_realloc_fail_after=0 left over from the load_combined_
+         * snapshot_inventory cleanup a few lines above -- harmless today,
+         * but that value was never actually *for* this block, so removing
+         * or reordering that unrelated cleanup line would have silently
+         * disabled the failure injection here instead of loudly breaking
+         * this CHECK. See the comment above the remove_recursive_overlaps()
+         * OOM blocks earlier in this function for why implicit carryover
+         * here is exactly the ordering hazard this suite otherwise avoids. */
+        g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
         CHECK(prune_from_inventory(&inventory, "pool/a", "p", 1, 0, &matches, &matches_cap) == -1,
               "prune_from_inventory reports an injected match-list growth allocation failure");
         free(matches);
