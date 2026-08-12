@@ -1330,7 +1330,6 @@ int main(int argc, char *argv[]) {
     seen_set_t seen = { NULL, 0, 0 };
     char *line = NULL; FILE *conf = NULL;
     log_io_failed = 0;
-    time_override_active = 0;
     if ((log_fp = fopen(log_path, "ae")) == NULL) {
         int saved_errno = errno;
         early_fail("%s: failed to open log file %s: %s", progname, log_path, strerror(saved_errno));
