@@ -469,6 +469,17 @@ static struct tm *test_positive_offset_localtime(const time_t *value, struct tm 
     return result;
 }
 
+static struct tm *test_negative_offset_localtime(const time_t *value, struct tm *result) {
+    (void)value;
+    memset(result, 0, sizeof(*result));
+    result->tm_year = 126; result->tm_mon = 2; result->tm_mday = 8;
+    result->tm_hour = 0; result->tm_min = 0; result->tm_sec = 0;
+#if defined(__GLIBC__) || defined(__FreeBSD__)
+    result->tm_gmtoff = -5 * 60 * 60;
+#endif
+    return result;
+}
+
 static struct tm *test_non_due_localtime(const time_t *value, struct tm *result) {
     (void)value;
     memset(result, 0, sizeof(*result));
@@ -750,6 +761,35 @@ static void run_main_pipeline_tests(void) {
         if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
         CHECK(strstr(contents, "pool/due@p_2026-03-08_00:00:00p0500") != NULL,
               "main() rewrites a positive DST offset's '+' to 'p' in snapshot names");
+    }
+
+    fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the negative-UTC-offset due-entry test");
+    if (fp) {
+        /*
+         * Coverage gap: main()'s `if (snap_time[19] == '+') snap_time[19]
+         * = 'p';` (diffsnap.c ~line 1434) had a deterministic,
+         * host-independent test for the branch being taken (positive
+         * offset, above) but none for the branch NOT being taken. Every
+         * other "due" test that doesn't override localtime_now_fn only
+         * incidentally covers whichever offset sign the test host's real
+         * local timezone happens to produce, which isn't reliable
+         * coverage of this specific branch on every machine or CI runner
+         * this suite might run on. This pins down the negative-offset
+         * side explicitly: '-' must survive unmodified, since only '+'
+         * is rejected by ZFS snapshot names.
+         */
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        unlink(args_file);
+        localtime_now_fn = test_negative_offset_localtime;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 0,
+              "a due entry completes through main() with the fake zfs command under a negative UTC offset");
+        localtime_now_fn = localtime_r;
+        FILE *args = fopen(args_file, "r");
+        char contents[8192] = {0};
+        if (args) { size_t rd = fread(contents, 1, sizeof(contents) - 1, args); (void)rd; fclose(args); }
+        CHECK(strstr(contents, "pool/due@p_2026-03-08_00:00:00-0500") != NULL,
+              "main() leaves a negative UTC offset's '-' unmodified in snapshot names (only '+' is rewritten)");
     }
 
     fp = fopen(conf_file, "w");
@@ -1105,6 +1145,97 @@ static void run_main_pipeline_tests(void) {
             CHECK(strstr(contents, "Failed to check recursive overlaps") != NULL &&
                   strstr(contents, "Failed to check recursive ancestor overlaps") == NULL,
                   "the remove_recursive_overlaps() failure is logged with its own distinct diagnostic, not the ancestor-overlap or metrics-fetch ones");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: main()'s own seen_set_add() allocation-failure branch is exercised through the real pipeline, not just the helper directly ==\n");
+    {
+        /*
+         * Coverage gap: seen_set_add()'s own -1 return is unit-tested
+         * directly against a hand-built seen_set_t (the OOM block in
+         * run_fault_injection_tests), but main()'s own
+         * "if (seen_rc == -1) { log_msg(...); global_status = 1;
+         * continue; }" wiring (diffsnap.c ~line 1341) was never driven
+         * through diffsnap_real_main() itself. A bug in that wiring --
+         * e.g. forgetting the continue and falling through into the
+         * duplicate-check or batch_add() with a dataset that was never
+         * successfully tracked -- would go undetected by the suite's own
+         * stated methodology for this exact class of gap (see the
+         * resolve_recursive_ancestor_overlaps()/remove_recursive_overlaps()
+         * gap tests above).
+         *
+         * A single due config entry makes seen_set_add()'s own growth
+         * allocation (the empty seen->keys array) the very first
+         * diffsnap_realloc call of the entire run -- nothing upstream of
+         * it in main() allocates through this hook. Failing call 1
+         * therefore lands deterministically on that growth, before the
+         * key-copy strdup even runs.
+         */
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the seen_set_add() OOM test");
+        if (fp) {
+            fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(args_file);
+            unlink(log_file);
+            CHECK(write_fake_zfs("#!/bin/sh\nexit 0\n") == 0,
+                  "fake zfs for main()'s seen_set_add() OOM test installed");
+            g_realloc_calls = 0; g_realloc_fail_after = 0; realloc_now_fn = test_realloc;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() fails when its own seen_set_add() call reports an allocation failure");
+            CHECK(g_realloc_calls == 1,
+                  "the injected failure landed on exactly the 1st realloc call -- seen_set_add's own growth allocation, not an earlier or later one");
+            realloc_now_fn = realloc; g_realloc_fail_after = -1;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "Failed to track config entry for") != NULL,
+                  "the seen_set_add() failure is logged with its own distinct diagnostic");
+            CHECK(access(args_file, F_OK) != 0,
+                  "main() actually takes the continue: the untracked entry never reaches zfs at all (batch_add/zfs_snapshot_batch is never invoked for it)");
+        }
+        printf("\n");
+    }
+
+    printf("== Gap: main()'s own batch_add() allocation-failure branch is exercised through the real pipeline, not just the helper directly ==\n");
+    {
+        /*
+         * Same rationale as the seen_set_add() gap above, for batch_add()'s
+         * own -1 return inside main()'s parsing loop (diffsnap.c
+         * ~lines 1344-1345). Unlike the seen_rc==-1 branch, this one has
+         * no `continue` after logging -- a distinct control-flow shape
+         * (it's already the last statement in the loop body, so the
+         * absence of `continue` is not currently observable, but the
+         * wiring -- that global_status is set and the batch stays exactly
+         * one item short -- still deserves its own end-to-end assertion
+         * rather than only the helper-level one).
+         *
+         * A single due, non-recursive config entry makes seen_set_add()
+         * succeed fully first (growth + key-copy strdup = 2 calls), so
+         * batch_add()'s own growth allocation for std_b is exactly the
+         * 3rd diffsnap_realloc call of the run.
+         */
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the batch_add() OOM test");
+        if (fp) {
+            fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(args_file);
+            unlink(log_file);
+            CHECK(write_fake_zfs("#!/bin/sh\nexit 0\n") == 0,
+                  "fake zfs for main()'s batch_add() OOM test installed");
+            g_realloc_calls = 0; g_realloc_fail_after = 2; realloc_now_fn = test_realloc;
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() fails when its own batch_add() call reports an allocation failure");
+            CHECK(g_realloc_calls == 3,
+                  "the injected failure landed on exactly the 3rd realloc call -- batch_add's own growth allocation, not an earlier or later one");
+            realloc_now_fn = realloc; g_realloc_fail_after = -1;
+            FILE *log = fopen(log_file, "r");
+            char contents[1024] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "Failed to allocate batch entry for") != NULL,
+                  "the batch_add() failure is logged with its own distinct diagnostic");
+            CHECK(access(args_file, F_OK) != 0,
+                  "main() never reaches zfs for an entry whose batch_add() call failed");
         }
         printf("\n");
     }
@@ -3435,6 +3566,8 @@ int main(int argc, char **argv) {
         if (args_fp2) { size_t rd = fread(args2, 1, sizeof(args2) - 1, args_fp2); (void)rd; fclose(args_fp2); }
         CHECK(strstr(args2, "-r\n") == NULL,
               "a roots_bytes total just one byte over ARGV_BYTES_CAP already falls back to unscoped");
+        CHECK(strstr(args2, "p0000") == NULL,
+              "none of the over-cap roots' own names leak into the unscoped call either (mirrors Test 29a's equivalent check)");
         name_list_free(&inventory2);
 
         batch_free(&std_b);
@@ -3662,14 +3795,39 @@ int main(int argc, char **argv) {
         /* "pool/chunk@p_2026-01-01_00:00:00" needs 33 bytes (32 chars +
          * NUL); chunk_bytes=10 is deliberately far too small, forcing
          * format_snapshot_name's return value to be >= remaining on the
-         * chunk's only item. No fake zfs is installed: the truncation
-         * check fires before exec_cmd_stream is ever called, so a real
-         * `zfs` invocation must not happen for this test to be valid. */
+         * chunk's only item.
+         *
+         * The truncation check is expected to fire before exec_cmd_stream
+         * is ever called -- but that "expected" is exactly what this test
+         * must prove, not assume. Merely having no fake zfs installed (or
+         * one that just exits nonzero) can't distinguish "the guard
+         * fired, zfs was never invoked" from "the guard is broken, a
+         * truncated/garbled argv was execed and zfs -- or execv itself,
+         * if no binary happened to be installed at zfs_path -- merely
+         * failed for a completely unrelated reason": both produce
+         * rc == -1 and snap_failed == 1. So install a fake zfs that
+         * leaves an unambiguous trace if it's ever invoked at all, and
+         * assert that trace is absent afterward. This makes the test
+         * fail loudly if the guard is ever removed or broken, instead of
+         * coincidentally still passing because the binary was missing. */
+        char sentinel[PATH_MAX];
+        CHECK(snprintf(sentinel, sizeof(sentinel), "%s/test48-invoked", g_fake_zfs_dir) < (int)sizeof(sentinel),
+              "Test 48 sentinel path fits in its buffer");
+        unlink(sentinel);
+        char sentinel_script[PATH_MAX + 64];
+        CHECK(snprintf(sentinel_script, sizeof(sentinel_script), "#!/bin/sh\ntouch '%s'\nexit 0\n", sentinel) < (int)sizeof(sentinel_script) &&
+              write_fake_zfs(sentinel_script) == 0,
+              "installed a fake zfs for Test 48 that records whether it was ever invoked");
+
         int rc = zfs_snapshot_exec_chunk(&chunk_ctx2, 0, "2026-01-01_00:00:00", chunk_indices2, 1, 10);
         CHECK(rc == -1, "zfs_snapshot_exec_chunk reports failure when the formatted name would not fit the arena it was given");
         CHECK(chunk_ctx2.count == 1 && chunk_ctx2.items[0].snap_failed == 1,
               "the item is marked snap_failed rather than silently snapshotted under a truncated name");
+        CHECK(access(sentinel, F_OK) != 0,
+              "the truncation guard genuinely fires before exec_cmd_stream ever runs zfs -- proven by a real invocation trace being absent, not merely by an incidental exit code");
 
+        unlink(sentinel);
+        unlink(g_fake_zfs);
         batch_free(&chunk_ctx2);
         printf("\n");
     }
