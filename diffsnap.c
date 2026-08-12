@@ -363,12 +363,37 @@ static void seen_set_free(seen_set_t *set) {
 }
 
 static void stream_reader_line(stream_reader_t *reader) {
-    reader->buf[reader->used] = '\0';
-    trim_trailing_whitespace(reader->buf);
-    if (reader->is_stderr) {
-        if (reader->buf[0] != '\0') log_msg("Error: zfs: %s", reader->buf);
-    } else if (!reader->failed && reader->handler(reader->buf, reader->data) != 0) {
+    /* stdout is a text protocol parsed below with C-string routines.  A NUL
+     * would make those routines silently ignore the rest of the record, so
+     * reject it before adding our terminator or examining delimiters. */
+    if (!reader->is_stderr && memchr(reader->buf, '\0', reader->used) != NULL) {
+        log_msg("Error: zfs stdout contained a NUL byte");
         reader->failed = 1;
+        reader->used = 0;
+        return;
+    }
+
+    if (reader->is_stderr) {
+        /* stderr is diagnostic-only.  Preserve a raw NUL visibly rather
+         * than letting C-string logging truncate the message at that byte. */
+        char escaped[STR_BUF_XLARGE * 4 + 1];
+        size_t used = reader->used;
+        while (used > 0 && isspace((unsigned char)reader->buf[used - 1])) used--;
+        size_t out = 0;
+        for (size_t i = 0; i < used; i++) {
+            if (reader->buf[i] == '\0') {
+                memcpy(&escaped[out], "\\x00", 4);
+                out += 4;
+            } else {
+                escaped[out++] = reader->buf[i];
+            }
+        }
+        escaped[out] = '\0';
+        if (out != 0) log_msg("Error: zfs: %s", escaped);
+    } else {
+        reader->buf[reader->used] = '\0';
+        trim_trailing_whitespace(reader->buf);
+        if (!reader->failed && reader->handler(reader->buf, reader->data) != 0) reader->failed = 1;
     }
     reader->used = 0;
 }
@@ -1306,7 +1331,16 @@ int main(int argc, char *argv[]) {
     if (localtime_now_fn(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
     long long current_day_mins = (tm_info.tm_hour * 60) + tm_info.tm_min;
-    while (getline_now_fn(&line, &line_cap, conf) != -1) {
+    ssize_t line_len;
+    while ((line_len = getline_now_fn(&line, &line_cap, conf)) != -1) {
+        /* getline() reports a byte count, but the parser below uses C-string
+         * functions. Reject embedded NULs so they cannot conceal fields or
+         * delimiters after the first one. */
+        if (memchr(line, '\0', (size_t)line_len) != NULL) {
+            log_msg("Error: Config error: NUL byte in line");
+            global_status = 1;
+            continue;
+        }
         trim_trailing_whitespace(line);
         if (line[0] == '\0' || line[0] == '#') continue;
         if (line[0] == ',' || strstr(line, ",,") != NULL) {

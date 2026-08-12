@@ -748,6 +748,22 @@ static void run_main_pipeline_tests(void) {
     }
 
     fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for embedded-NUL rejection");
+    if (fp) {
+        const char nul_config[] = "pool/hidden,1,1,p,no,0\0,ignored\n";
+        CHECK(fwrite(nul_config, 1, sizeof(nul_config) - 1, fp) == sizeof(nul_config) - 1,
+              "wrote a config record containing an embedded NUL byte");
+        fclose(fp);
+        CHECK(diffsnap_real_main(1, (char *[]) {"diffsnap-test", NULL}) == 1,
+              "main() rejects a config record whose NUL would otherwise conceal later fields");
+        FILE *log = fopen(log_file, "r");
+        char contents[4096] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "Config error: NUL byte in line") != NULL,
+              "the embedded-NUL config rejection is logged explicitly");
+    }
+
+    fp = fopen(conf_file, "w");
     CHECK(fp != NULL, "opened isolated main() config for the positive-DST-offset due-entry test");
     if (fp) {
         fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
@@ -2517,6 +2533,32 @@ int main(int argc, char **argv) {
         CHECK(ok_reader.failed == 0, "an ordinary in-bounds line does not mark the reader failed");
         CHECK(g_spy_calls == 1, "handler() IS invoked normally for a well-formed, in-bounds line");
         CHECK(strcmp(g_spy_last_line, "pool/child\t12345") == 0, "handler() receives the complete, untruncated line content");
+
+        /* A raw NUL must be rejected before the handler's C-string parsing
+         * can make it disappear along with a malicious suffix. */
+        stream_reader_t nul_reader = {0};
+        nul_reader.is_stderr = 0;
+        nul_reader.handler = spy_line_handler;
+        char nul_stdout[] = {'p', 'o', 'o', 'l', '\t', '1', '\0', 'x', '\n'};
+        g_spy_calls = 0;
+        stream_reader_consume(&nul_reader, nul_stdout, (ssize_t)sizeof(nul_stdout));
+        CHECK(nul_reader.failed == 1, "a NUL-containing stdout record fails the command stream");
+        CHECK(g_spy_calls == 0, "a NUL-containing stdout record is never handed to its parser");
+
+        char *log_buf = NULL; size_t log_len = 0;
+        log_fp = open_memstream(&log_buf, &log_len);
+        CHECK(log_fp != NULL, "opened a log capture for NUL-containing stderr");
+        if (log_fp) {
+            stream_reader_t stderr_reader = {0};
+            stderr_reader.is_stderr = 1;
+            char nul_stderr[] = {'b', 'a', 'd', '\0', 'x', '\n'};
+            stream_reader_consume(&stderr_reader, nul_stderr, (ssize_t)sizeof(nul_stderr));
+            fflush(log_fp);
+            CHECK(stderr_reader.failed == 0 && strstr(log_buf, "bad\\x00x") != NULL,
+                  "a NUL in stderr is safely escaped in its diagnostic log line");
+            fclose(log_fp); log_fp = NULL;
+        }
+        free(log_buf);
 
         printf("\n");
     }
