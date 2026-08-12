@@ -1880,7 +1880,29 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("== Test 4a: zfs_pool_len/same_zfs_root correctly distinguish adjacent pool names that are textual prefixes of one another ==\n");
+    printf("== Test 4a: unterminated stdout records are rejected by both wrappers ==\n");
+    {
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a POSIX shell for the unterminated-record test");
+        if (sh_bin) {
+            const char *const argv[] = {sh_bin, "-c", "printf 'pool/partial\\t12345'", NULL};
+            metric_ctx_t strict_ctx = {0}, lenient_ctx = {0};
+            CHECK(exec_cmd_stream(argv, handle_metric_line, &strict_ctx) != 0,
+                  "strict rejects stdout ending in an unterminated metric record");
+            CHECK(strict_ctx.count == 0,
+                  "strict never delivers the unterminated metric record to its handler");
+            CHECK(exec_cmd_stream_lenient(argv, handle_metric_line, &lenient_ctx) != 0,
+                  "lenient also rejects an unterminated record despite its relaxed exit-status policy");
+            CHECK(lenient_ctx.count == 0,
+                  "lenient never delivers the unterminated metric record to its handler");
+            free(strict_ctx.items);
+            free(lenient_ctx.items);
+        }
+        printf("\n");
+    }
+
+    printf("== Test 4b: zfs_pool_len/same_zfs_root correctly distinguish adjacent pool names that are textual prefixes of one another ==\n");
     {
         /* Every other test in this file that exercises pass-grouping
          * (batch_item_in_root_pass/batch_root_pass_count, via same_zfs_root)

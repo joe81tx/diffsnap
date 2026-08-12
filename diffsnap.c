@@ -439,7 +439,17 @@ static int drain_command_streams(stream_reader_t *out_reader, stream_reader_t *e
             } else {
                 if (nread < 0 && errno == EINTR) continue;
                 if (nread < 0) reader->failed = 1;
-                if (reader->used > 0) stream_reader_line(reader);
+                if (reader->used > 0) {
+                    /* stdout is a newline-delimited protocol.  EOF before
+                     * the delimiter means this is a partial record, not a
+                     * final valid line; never hand it to the parser. */
+                    if (reader->is_stderr) {
+                        stream_reader_line(reader);
+                    } else {
+                        reader->failed = 1;
+                        reader->used = 0;
+                    }
+                }
                 close(reader->fd);
                 reader->fd = -1;
                 if (reader == out_reader) out_open = 0;
