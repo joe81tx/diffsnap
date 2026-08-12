@@ -48,6 +48,16 @@ static char g_inventory_args[PATH_MAX];
 } while (0)
 
 /*
+ * Forward-declared so the fatal restore-failure paths below (which run
+ * before setup_fake_zfs()/cleanup_fake_zfs() are defined later in this
+ * file) can still tear down the mkdtemp()'d fake-zfs directory before
+ * calling exit(1) -- otherwise a FATAL abort here leaks that temp
+ * directory (and whatever fake-zfs script/trace files were installed in
+ * it) on disk instead of removing it like every non-fatal exit path does.
+ */
+static void cleanup_fake_zfs(void);
+
+/*
  * Tests that temporarily lower RLIMIT_NOFILE to force pipe2()/open()
  * failures must restore it afterward like every other piece of global
  * state this suite mutates. But unlike an in-process hook (realloc_now_fn,
@@ -74,6 +84,7 @@ static void restore_rlimit_or_die(int resource, const char *resource_name,
             "misleading failures, so stopping now instead of continuing. (tests run so far: %d, "
             "failed: %d)\n",
             resource_name, (unsigned long long)old_limit->rlim_cur, g_tests_run, g_tests_failed);
+    cleanup_fake_zfs();
     exit(1);
 }
 
@@ -112,6 +123,7 @@ static void restore_stdfd_or_die(int saved_fd, int target_fd, const char *fd_nam
             "every remaining test would run with a corrupted standard fd and produce misleading "
             "failures, so stopping now instead of continuing. (tests run so far: %d, failed: %d)\n",
             target_fd, fd_name, dup2_errno, strerror(dup2_errno), g_tests_run, g_tests_failed);
+    cleanup_fake_zfs();
     exit(1);
 }
 
