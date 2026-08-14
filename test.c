@@ -1622,6 +1622,48 @@ static void run_main_pipeline_tests(void) {
         printf("\n");
     }
 
+    printf("== Gap: main()'s own inventory_ok=0 wiring (a genuine `zfs list` failure, not an allocation failure) is exercised through the real pipeline ==\n");
+    {
+        /*
+         * Coverage gap: load_combined_snapshot_inventory()'s strict-failure
+         * branch is now unit-tested directly (Test 29b), but main()'s own
+         * "if (load_combined_snapshot_inventory(...) != 0) { log_msg(...);
+         * inventory_ok = 0; }" wiring, and finalize_batch()'s handling of
+         * inventory_ok=0 for a snapshot that itself SUCCEEDED (as opposed
+         * to Test 43's direct, hand-built inventory_ok=0 call), was never
+         * driven through diffsnap_real_main() itself. Unlike every other
+         * "Gap:" failure above, this one must let snapshot creation
+         * succeed and only fail the subsequent `zfs list` call, so the
+         * fake zfs script here handles "get" (metrics) and "snapshot"
+         * normally and fails only "list".
+         */
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the inventory_ok=0 end-to-end test");
+        if (fp) {
+            fputs("pool/tree,1,1,invtest,no,0\n", fp); fclose(fp);
+            unlink(log_file);
+            CHECK(write_fake_zfs(
+                      "#!/bin/sh\n"
+                      "if [ \"$1\" = get ]; then printf 'pool/tree\\t500\\n'; exit 0; fi\n"
+                      "if [ \"$1\" = snapshot ]; then exit 0; fi\n"
+                      "if [ \"$1\" = list ]; then echo 'strict-list-failure' >&2; exit 1; fi\n"
+                      "exit 0\n") == 0,
+                  "fake zfs for the inventory_ok=0 end-to-end test installed: snapshot creation succeeds, `list` genuinely fails");
+            CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+                  "main() reports overall failure when snapshot creation succeeded but the post-creation inventory listing genuinely failed");
+            FILE *log = fopen(log_file, "r");
+            char contents[2048] = {0};
+            if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(contents, "Error: Unable to list snapshots for batch verification and pruning") != NULL,
+                  "main() logs the distinct inventory-listing-failed diagnostic, proving the failure was attributed to load_combined_snapshot_inventory, not some other step");
+            CHECK(strstr(contents, "Created=pool/tree@invtest_") != NULL,
+                  "the snapshot itself is still reported as created -- inventory_ok=0 must not be confused with (or mask) snapshot creation failure");
+            CHECK(strstr(contents, "Error: Unable to prune snapshots for pool/tree: snapshot inventory unavailable") != NULL,
+                  "finalize_batch's own inventory_ok=0 branch fires for a real, successfully-created snapshot reached through main(), not just the hand-built inventory_ok=0 call in Test 43");
+        }
+        printf("\n");
+    }
+
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--help", NULL}) == 0,
           "main() accepts --help");
     CHECK(diffsnap_real_main(2, (char *[]){"diffsnap-test", "--version", NULL}) == 0,
@@ -2711,6 +2753,80 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 22d: stream_reader_consume flushes (not drops) an overlong stderr line across multiple buffer-overflow boundaries, unlike stdout's fail-and-discard ==\n");
+    {
+        /*
+         * Coverage gap: Test 22 proves the stdout overflow branch marks
+         * the reader failed and never hands truncated content to
+         * handler(). The comment right above that branch in
+         * stream_reader_consume() ("only stderr lines ... still get
+         * flushed after this point") documents a DIFFERENT behavior for
+         * stderr that no test exercised: for stderr, overflow does NOT
+         * set failed, and the buffered content so far is flushed via
+         * stream_reader_line() as its own diagnostic log line, then
+         * accumulation continues for the rest of the same (still
+         * newline-less) line. A single overlong stderr line can
+         * therefore legitimately produce several separate
+         * "Error: zfs: ..." log entries rather than one. This drives a
+         * stderr chunk long enough to cross that overflow boundary
+         * twice, then explicitly flushes the trailing remainder the same
+         * way drain_command_streams does at EOF (diffsnap.c ~line 491),
+         * and proves every byte of the original line reappears across
+         * the log entries -- none dropped, none handed to a parser, and
+         * the reader never marked failed.
+         */
+        char *log_buf = NULL; size_t log_len = 0;
+        FILE *prior_log_fp = log_fp;
+        log_fp = open_memstream(&log_buf, &log_len);
+        CHECK(log_fp != NULL, "opened a log capture for the overlong-stderr-line test");
+        if (log_fp) {
+            stream_reader_t reader = {0};
+            reader.is_stderr = 1;
+
+            /* 511 usable bytes per buffer fill (STR_BUF_XLARGE-1); two
+             * full fills plus a final partial remainder, all one
+             * logical (newline-less) line. */
+            const size_t total = 511 * 2 + 50;
+            char *overlong = malloc(total);
+            CHECK(overlong != NULL, "allocated the overlong single-line stderr payload");
+            if (overlong) {
+                memset(overlong, 'B', total);
+                stream_reader_consume(&reader, overlong, (ssize_t)total);
+                CHECK(reader.failed == 0,
+                      "an overlong stderr line does NOT mark the reader failed (unlike the equivalent stdout case in Test 22)");
+                CHECK(reader.used == 50,
+                      "the trailing 50-byte remainder (after two 511-byte overflow flushes) is still buffered, not discarded, pending EOF or a newline");
+
+                /* Mirror drain_command_streams' own EOF-time flush of a
+                 * stderr reader with leftover content (diffsnap.c line
+                 * ~491), the only place the trailing remainder gets
+                 * logged in the real pipeline. */
+                stream_reader_line(&reader);
+                fflush(log_fp);
+
+                int error_lines = 0;
+                size_t total_bs_logged = 0;
+                const char *p = log_buf;
+                while ((p = strstr(p, "Error: zfs: ")) != NULL) {
+                    error_lines++;
+                    p += strlen("Error: zfs: ");
+                    const char *q = p;
+                    while (*q == 'B') { total_bs_logged++; q++; }
+                }
+                CHECK(error_lines == 3,
+                      "the overlong stderr line produced exactly three separate diagnostic log entries: two mid-line overflow flushes plus the final EOF-time flush of the remainder");
+                CHECK(total_bs_logged == total,
+                      "every one of the original line's bytes shows up across those log entries -- the overflow-flush boundary neither drops nor duplicates content");
+
+                free(overlong);
+            }
+            fclose(log_fp);
+        }
+        log_fp = prior_log_fp;
+        free(log_buf);
+        printf("\n");
+    }
+
     printf("== Test 22a: snapshot inventory accepts exactly one complete snapshot name per line ==\n");
     {
         name_list_t inventory = {0};
@@ -2817,8 +2933,25 @@ int main(int argc, char **argv) {
               "constructed a path for Test 23's fake-zfs call log");
         unlink(call_log23);
 
+        /*
+         * Fidelity fix: this previously logged each invocation's argv via
+         * `echo "$*"`, which space-joins every argument onto one line and
+         * so cannot distinguish an argument boundary from a literal space
+         * inside an argument. valid_dataset() explicitly permits spaces in
+         * dataset/snapshot names (see its own comment), so a space-joined
+         * log is fundamentally ambiguous for verifying real zfs argv in
+         * general, even though this particular test doesn't currently use
+         * space-containing names. Every other fake script in this file
+         * that needs to verify argv (Test 22b/22c, Test 24, run_chunk_test,
+         * Test 44, Test 45, Test 29a/29b) uses `printf '%s\n' "$@"`
+         * instead, which preserves exact argument boundaries one per line
+         * regardless of an argument's own content. Matching that here
+         * keeps this test's call-log verification meaningful even if it's
+         * later extended to a space-containing name, instead of being a
+         * landmine that only looks correct today.
+         */
         char script23[PATH_MAX + 64];
-        CHECK(snprintf(script23, sizeof(script23), "#!/bin/sh\necho \"$*\" >> '%s'\nexit 0\n", call_log23) < (int)sizeof(script23) &&
+        CHECK(snprintf(script23, sizeof(script23), "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> '%s'\nexit 0\n", call_log23) < (int)sizeof(script23) &&
               write_fake_zfs(script23) == 0,
               "fake zfs script created outside the system ZFS path for Test 23");
 
@@ -3184,6 +3317,53 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    printf("== Test 29b: load_combined_snapshot_inventory reports failure and frees the list when the underlying `zfs list` genuinely fails (not an allocation failure) ==\n");
+    {
+        /*
+         * Coverage gap: every other failure exercised against
+         * load_combined_snapshot_inventory (the run_fault_injection_tests
+         * "Gap:" blocks) drives it to -1 purely via injected allocation
+         * failure. None of them ever exercise the
+         * `if (rc != 0) { name_list_free(list); return -1; }` branch at the
+         * end of load_combined_snapshot_inventory itself, i.e. the case
+         * where exec_cmd_stream() successfully runs `zfs list` but the
+         * command genuinely exits non-zero. diffsnap.c's own comment calls
+         * this listing "intentionally strict" (unlike the pre-validation
+         * metrics fetch, which is lenient) -- exactly the kind of asymmetry
+         * a regression (e.g. accidentally swapping in
+         * exec_cmd_stream_lenient here) would silently break with nothing
+         * in this file noticing. This drives that exact branch directly,
+         * and also proves the failure path frees whatever the list already
+         * held rather than leaking it.
+         */
+        char fail_script[PATH_MAX + 64];
+        CHECK(snprintf(fail_script, sizeof(fail_script),
+                       "#!/bin/sh\nif [ \"$1\" = list ]; then echo 'strict-list-failure' >&2; exit 1; fi\nexit 0\n") <
+              (int)sizeof(fail_script) && write_fake_zfs(fail_script) == 0,
+              "installed a fake zfs script whose `list` subcommand genuinely fails");
+
+        batch_ctx_t std_b = {0}, rec_b = {0};
+        batch_add(&std_b, "pool/child", "p", 1, 0);
+        name_list_t inventory = {0};
+        inventory.names = (char **)diffsnap_realloc(NULL, sizeof(char *));
+        CHECK(inventory.names != NULL, "seeded the inventory with pre-existing content before the failing call");
+        if (inventory.names) {
+            inventory.capacity = 1;
+            inventory.names[0] = diffsnap_strdup("pool/child@stale");
+            inventory.count = 1;
+        }
+
+        int rc = load_combined_snapshot_inventory(&inventory, &std_b, &rec_b);
+        CHECK(rc == -1,
+              "load_combined_snapshot_inventory reports failure when `zfs list` itself exits non-zero, distinct from an allocation failure");
+        CHECK(inventory.names == NULL && inventory.count == 0 && inventory.capacity == 0,
+              "load_combined_snapshot_inventory frees (and does not leak) whatever the list already held before the strict `zfs list` failure, via name_list_free(list) on that path");
+
+        batch_free(&std_b); batch_free(&rec_b);
+        unlink(g_fake_zfs);
+        printf("\n");
+    }
+
     printf("== Test 30: drain_command_streams (poll()-based) drains concurrent, interleaved stdout+stderr without hanging or dropping data ==\n");
     {
         /*
@@ -3307,6 +3487,91 @@ int main(int argc, char **argv) {
             }
             CHECK(buf != NULL && late_stderr_all_present_once,
                   "every one of late-stderr-1..late-stderr-10 emitted AFTER stdout's fd closed was drained to completion exactly once, not cut off early");
+
+            if (log_fp) fclose(log_fp);
+            log_fp = prior_log_fp;
+            free(buf);
+            free(ctx.items);
+        }
+        printf("\n");
+    }
+
+    printf("== Test 31a: drain_command_streams correctly reassembles lines delivered as large, block-buffered bursts spanning multiple read() calls, not just small line-by-line writes ==\n");
+    {
+        /*
+         * Fidelity gap: Test 30 and Test 31 both exercise a producer that
+         * issues one small, unbuffered write(2) per line -- each shell
+         * `printf`/`echo` call is its own syscall, closely matching a
+         * LINE-buffered producer. A real `zfs` binary writing to a pipe is
+         * normally FULLY (block) buffered by libc, so in practice its
+         * output usually arrives as one or a few large writes right before
+         * the process exits, not one write per line. Since
+         * drain_command_streams() reads into a fixed STR_BUF_XLARGE
+         * (512-byte) buffer per read(2) call, a multi-kilobyte burst
+         * forces several read() calls back-to-back and is very likely to
+         * land at least one line's own bytes split across two separate
+         * read() calls / stream_reader_consume() invocations -- exactly
+         * the reassembly case a producer that trickles output a line at a
+         * time can never exercise, and a case the poll()-based rewrite
+         * specifically has to get right.
+         *
+         * This drives that shape directly for BOTH streams: the fake
+         * command builds its entire stdout output (200 lines, comfortably
+         * several times STR_BUF_XLARGE) in a shell variable and emits it
+         * with a single printf, then does the same for stderr.
+         */
+        const char *const sh_candidates[] = {"/bin/sh", "/usr/bin/sh", NULL};
+        const char *sh_bin = find_bin(sh_candidates);
+        CHECK(sh_bin != NULL, "found a shell for the bulk-burst reassembly test");
+        if (sh_bin) {
+            char *buf = NULL;
+            size_t buf_len = 0;
+            FILE *prior_log_fp = log_fp;
+            log_fp = open_memstream(&buf, &buf_len);
+            CHECK(log_fp != NULL, "open_memstream succeeded for capturing bulk-burst stderr output");
+
+            metric_ctx_t ctx = {0};
+            const char *const argv[] = {sh_bin, "-c",
+                "i=1; out=\"pool/ds1\t10\"; err=\"stderr-1\"; i=2; "
+                "while [ $i -le 200 ]; do "
+                "out=\"$out\n"
+                "pool/ds$i\t$((i*10))\"; "
+                "err=\"$err\n"
+                "stderr-$i\"; "
+                "i=$((i+1)); done; "
+                "printf '%s\\n' \"$out\"; "
+                "printf '%s\\n' \"$err\" >&2", NULL};
+            int rc = exec_cmd_stream(argv, handle_metric_line, &ctx);
+            fflush(log_fp);
+
+            CHECK(rc == 0, "the bulk-burst command succeeds");
+            CHECK(ctx.count == 200,
+                  "all 200 stdout lines were delivered to the handler, even though they arrived as one large multi-kilobyte burst instead of one write per line");
+
+            int seen[201] = {0};
+            int all_present_once = 1, all_values_correct = 1;
+            for (size_t i = 0; i < ctx.count; i++) {
+                int n = 0, consumed = 0;
+                if (sscanf(ctx.items[i].name, "pool/ds%d%n", &n, &consumed) == 1 &&
+                    consumed == (int)strlen(ctx.items[i].name) && n >= 1 && n <= 200) {
+                    seen[n]++;
+                    if (ctx.items[i].written != (long long)n * 10) all_values_correct = 0;
+                } else {
+                    all_present_once = 0;
+                }
+            }
+            for (int n = 1; n <= 200; n++) if (seen[n] != 1) all_present_once = 0;
+            CHECK(all_present_once,
+                  "every one of pool/ds1..pool/ds200 was delivered exactly once, none dropped, duplicated, or corrupted at a read()-boundary split");
+            CHECK(all_values_correct,
+                  "every delivered line's written value is correct, proving a line split across two read() calls was reassembled before parsing rather than parsed from a truncated half");
+
+            int stderr_all_present_once = 1;
+            for (int n = 1; n <= 200; n++) {
+                if (count_exact_numbered_occurrences(buf, "stderr-", n) != 1) stderr_all_present_once = 0;
+            }
+            CHECK(buf != NULL && stderr_all_present_once,
+                  "every one of stderr-1..stderr-200 was reassembled correctly from the same kind of large stderr burst");
 
             if (log_fp) fclose(log_fp);
             log_fp = prior_log_fp;
