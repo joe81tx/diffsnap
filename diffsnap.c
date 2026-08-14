@@ -410,8 +410,17 @@ static void stream_reader_line(stream_reader_t *reader) {
         escaped[out] = '\0';
         if (out != 0) log_msg("Error: zfs: %s", escaped);
     } else {
+        /* Deliberately NOT trimmed here. A stdout line is opaque data to
+         * this layer -- for handle_snapshot_inventory_line() the entire
+         * line *is* the identifier (a zfs snapshot name), and ZFS permits
+         * space characters, including trailing ones, in dataset/snapshot
+         * names. Trimming here would silently normalize a real on-disk
+         * name, letting two distinct snapshots collide in the inventory
+         * that verification and pruning (up to zfs destroy) both rely on.
+         * A handler that needs trimming for its own field (e.g.
+         * handle_metric_line()'s numeric value) does so itself, scoped to
+         * that field only. */
         reader->buf[reader->used] = '\0';
-        trim_trailing_whitespace(reader->buf);
         if (!reader->failed && reader->handler(reader->buf, reader->data) != 0) reader->failed = 1;
     }
     reader->used = 0;
@@ -604,6 +613,7 @@ static int handle_metric_line(const char *line, void *data) {
         return 0;
     }
     char *value = tab;
+    trim_trailing_whitespace(value);
     if (*name == '\0' || *value == '\0') {
         log_msg("Error: Skipping metric line with empty dataset or written value: %s", line);
         return 0;
