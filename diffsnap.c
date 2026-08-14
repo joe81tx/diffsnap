@@ -1520,8 +1520,13 @@ int main(int argc, char *argv[]) {
     ret_code = global_status;
 cleanup:
 free(line);
-if (conf)
-    diffsnap_fclose(conf);
+if (conf) {
+    if (diffsnap_fclose(conf) != 0) {
+        int saved_errno = errno;
+        log_msg("Error: failed to close config file %s: %s", conf_path, strerror(saved_errno));
+        ret_code = ret_code ? ret_code : 1;
+    }
+}
 
 free(metrics.items);
 batch_free(&std_b);

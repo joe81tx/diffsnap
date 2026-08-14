@@ -1585,6 +1585,51 @@ static void run_main_pipeline_tests(void) {
         printf("\n");
     }
 
+    printf("== Gap: fclose(conf) failure is surfaced, not silently discarded ==\n");
+    {
+        /*
+         * Mirrors the fclose(log_fp) test just above, but targets call #1
+         * (the config close) instead of call #2 (the log close).
+         * diffsnap_fclose(conf)'s return value used to be discarded
+         * outright at main()'s cleanup label -- unlike log_fp, whose close
+         * failure is checked and reported -- so a config file that reads
+         * back completely successfully (every getline() call returns data,
+         * feof() is set, the parse loop runs to completion normally) but
+         * then fails specifically at close() -- the deferred-error pattern
+         * some NFS/FUSE filesystems use, where a read that was actually
+         * served from a stale or since-invalidated cache is only flagged
+         * at the final close-to-open consistency check -- would previously
+         * be silently ignored: main() would go on to create/prune real
+         * snapshots based on that config and still exit 0. This drives
+         * that path via the same fclose_now_fn hook, targeting the config
+         * close specifically so the failure is unambiguously attributable
+         * to it and not to the log close covered above.
+         */
+        fp = fopen(conf_file, "w");
+        CHECK(fp != NULL, "opened isolated main() config for the fclose(conf) close-failure test");
+        if (fp) {
+            fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+            unlink(log_file);
+            /* Target call #1 (config close), the opposite of the log-close
+             * test above. */
+            g_fclose_fail = 1; g_fclose_calls = 0; g_fclose_fail_at_call = 1; fclose_now_fn = test_fclose_failure;
+            char stderr_buf[512] = {0};
+            int rc = run_main_capture_stderr(1, (char *[]){"diffsnap-test", NULL}, stderr_buf, sizeof(stderr_buf));
+            fclose_now_fn = fclose; g_fclose_fail = 0; g_fclose_fail_at_call = 0;
+            CHECK(rc == 1, "main() fails when fclose(conf) itself reports a close error, even though every line was read and acted on successfully");
+            CHECK(g_fclose_calls == 2,
+                  "diffsnap_fclose was invoked exactly twice (config, then log), confirming call #1 -- the one made to fail -- was the config close, and that the (unhooked) log close still ran afterward");
+            FILE *log = fopen(log_file, "r");
+            char log_contents[1024] = {0};
+            if (log) { size_t rd = fread(log_contents, 1, sizeof(log_contents) - 1, log); (void)rd; fclose(log); }
+            CHECK(strstr(log_contents, "failed to close config file") != NULL,
+                  "the config close-failure diagnostic is written to the log file, not just stderr");
+            CHECK(strstr(log_contents, "Created=pool/due@p_") != NULL,
+                  "the config close failure is surfaced without suppressing the snapshot the run legitimately created before hitting cleanup -- confirming this test exercises the 'read succeeded, close failed after the fact' case, not a read failure");
+        }
+        printf("\n");
+    }
+
     printf("== Gap: dataset/prefix/timestamp length check is exact-boundary tested against ZFS_NAME_MAX, not just clearly-oversized ==\n");
     {
         /*
