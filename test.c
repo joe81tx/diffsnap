@@ -1842,6 +1842,7 @@ static void run_fault_injection_tests(void) {
     printf("== Fault injection: in-process time, localtime, and allocation hooks ==\n");
     int prior_time_override_active = diffsnap_time_override_is_active();
     time_t prior_time_override_value = diffsnap_time_override_get_value();
+    time_t overridden_time;
     diffsnap_override_time((time_t)0);
     CHECK(diffsnap_now(&overridden_time) == 0 && overridden_time == (time_t)0,
       "the test overrides diffsnap's clock without changing the system clock");
