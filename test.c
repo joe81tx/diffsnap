@@ -258,6 +258,99 @@ static void run_ensure_std_fds_test(void) {
     printf("\n");
 }
 
+/*
+ * Coverage gap: every ensure_std_fds() test above (and the one in the
+ * top-level main() gap test) closes exactly ONE of fd 0/1/2 before
+ * calling ensure_std_fds(). That's a real gap, but not quite the one it
+ * looks like -- ensure_std_fds()'s loop processes fd 0, then 1, then 2,
+ * strictly in that order, and fully refills each closed slot before
+ * advancing to the next. So by induction, at the start of the iteration
+ * that examines fd k, fds 0..k-1 are *already* guaranteed valid (either
+ * they were never closed, or a prior iteration just refilled them).
+ * open("/dev/null") always returns the lowest-numbered available fd; with
+ * 0..k-1 all occupied and k itself the only closed one, that lowest
+ * available fd can only be k. So `devnull != fd` -- and therefore the
+ * dup2()/close() rebind inside it, plus its own dup2 failure path -- is
+ * provably unreachable through ensure_std_fds()'s only real call pattern
+ * (fds 0/1/2, examined low to high) no matter which single fd a test
+ * closes. No single-fd-closed test, however arranged, can ever reach it.
+ *
+ * What was never actually tested is the realistic scenario diffsnap.c's
+ * own comment above ensure_std_fds() describes: a launcher (e.g. cron)
+ * starting the process with fd 0, 1, AND 2 all closed at once. This test
+ * drives exactly that, closing all three simultaneously, and confirms
+ * ensure_std_fds() still fills every one of them with /dev/null -- which
+ * is also the concrete proof that the low-to-high fill-before-advancing
+ * invariant above actually holds in the multi-closed case, not just the
+ * single-closed case, i.e. real evidence for *why* the rebind branch is
+ * dead, rather than just an assertion that it is.
+ *
+ * Same discipline as run_ensure_std_fds_one(): no printf/CHECK (both
+ * ultimately write through fd 1/2) between closing the real fds and
+ * ensure_std_fds() refilling them -- everything is captured into locals
+ * and reported via CHECK() only once fd 0/1/2 are all back to a valid
+ * state.
+ */
+static void run_ensure_std_fds_all_closed_test(void) {
+    int saved[3] = {-1, -1, -1};
+    int dup_ok = 1;
+    for (int fd = 0; fd <= 2; fd++) {
+        saved[fd] = dup(fd);
+        if (saved[fd] < 0) dup_ok = 0;
+    }
+
+    int close_ok = 1, rc = -1, restore_ok = 1;
+    int leaves_open[3] = {0, 0, 0};
+    int refilled_with_devnull[3] = {0, 0, 0};
+
+    if (dup_ok) {
+        fflush(stdout);
+        fflush(stderr);
+        for (int fd = 0; fd <= 2; fd++) {
+            if (close(fd) != 0) close_ok = 0;
+        }
+
+        rc = ensure_std_fds();
+
+        for (int fd = 0; fd <= 2; fd++) leaves_open[fd] = (fcntl(fd, F_GETFD) != -1);
+
+        int null_fd = open("/dev/null", O_RDONLY);
+        struct stat null_st;
+        int have_null_st = (null_fd >= 0 && fstat(null_fd, &null_st) == 0);
+        for (int fd = 0; fd <= 2; fd++) {
+            struct stat target_st;
+            refilled_with_devnull[fd] = have_null_st && fstat(fd, &target_st) == 0 &&
+                                         target_st.st_dev == null_st.st_dev &&
+                                         target_st.st_rdev == null_st.st_rdev;
+        }
+        if (null_fd >= 0) close(null_fd);
+
+        for (int fd = 0; fd <= 2; fd++) {
+            if (dup2(saved[fd], fd) == -1) restore_ok = 0;
+            close(saved[fd]);
+        }
+    }
+
+    /* fd 0/1/2 are now fully restored (or were never touched, if dup
+     * itself failed) -- safe to use stdio/CHECK from here on. */
+    printf("== ensure_std_fds: refills fd 0, 1, AND 2 with /dev/null when all three are closed simultaneously ==\n");
+    CHECK(dup_ok, "dup'd the real fd 0/1/2 aside before closing all three for the all-closed ensure_std_fds test");
+    if (!dup_ok) {
+        for (int fd = 0; fd <= 2; fd++) if (saved[fd] >= 0) close(saved[fd]);
+        printf("\n");
+        return;
+    }
+    CHECK(close_ok, "closed fd 0, 1, and 2 simultaneously to simulate a launcher that starts diffsnap with none of them open");
+    CHECK(rc == 0, "ensure_std_fds succeeds when fd 0, 1, and 2 all start closed at once");
+    CHECK(leaves_open[0] && leaves_open[1] && leaves_open[2], "ensure_std_fds leaves all three fds open afterward");
+    CHECK(refilled_with_devnull[0] && refilled_with_devnull[1] && refilled_with_devnull[2],
+          "every one of fd 0/1/2 is refilled specifically with /dev/null when all three start closed together -- "
+          "confirming the low-to-high fill-before-advancing invariant holds in the multi-closed case, which is why "
+          "the dup2()/close() rebind branch inside ensure_std_fds() is unreachable through its only real call pattern");
+    CHECK(restore_ok, "restored the real fd 0/1/2 after the all-closed ensure_std_fds test");
+    printf("\n");
+}
+
 static void run_chunk_test(void) {
     char trace_path[PATH_MAX];
     CHECK(snprintf(trace_path, sizeof(trace_path), "%s/chunks", g_fake_zfs_dir) < (int)sizeof(trace_path),
@@ -988,6 +1081,28 @@ static void run_main_pipeline_tests(void) {
               "main() logs the recursive Created= line with the subtree written total, proving the recursive path -- not the standard one -- ran end to end through the real pipeline");
     }
 
+    /*
+     * Fixture-isolation fix: the recursive=yes block just above installed
+     * rec_script, whose `get` branch unconditionally answers
+     * "pool/tree\t500" no matter which dataset was actually requested.
+     * Every block below this point that uses a "pool/due" config (the
+     * log_io_failed exit-code test and the timestamp strftime-failure
+     * test) must not be left silently running against a script that
+     * doesn't understand "pool/due" -- batch_filter_by_metrics() would
+     * treat pool/due as "not found" and drop it, which happens to not
+     * break either of those two tests' own assertions today (one only
+     * needs *some* log write to fail, which /dev/full guarantees
+     * regardless of content; the other calls strftime_now_fn
+     * unconditionally of batch state) but is exactly the kind of
+     * incidental, order-dependent pass this suite otherwise goes out of
+     * its way to avoid. Reinstall the known-good generic script here so
+     * later "pool/due" blocks are verified against a fixture that
+     * actually answers for the dataset they configure, not one left over
+     * from an unrelated test.
+     */
+    CHECK(write_fake_zfs(script) == 0,
+          "reinstalled the generic pool/due-aware fake zfs after the recursive=yes block replaced it with one that only understands pool/tree");
+
     int held_lock = open(lock_file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     /* Capture the flock() outcome itself rather than re-deriving it from
      * held_lock alone: if open() succeeds but flock() fails, held_lock >= 0
@@ -1705,8 +1820,14 @@ static void run_fault_injection_tests(void) {
         CHECK(buf && strstr(buf, "localtime_r failed") && strstr(buf, "message during localtime failure"),
               "timestamp failure is described on the log message");
         CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
-        fclose(log_fp); log_fp = prior_log_fp; free(buf);
+        fclose(log_fp);
     }
+    /* Restored unconditionally -- including when open_memstream() itself
+     * failed above and this block's body never ran -- so a rare
+     * allocation failure here can never leave log_fp silently stuck at a
+     * dead/NULL stream for every later test in this process. */
+    log_fp = prior_log_fp;
+    free(buf);
 
     buf = NULL;
     buf_len = 0;
@@ -1729,8 +1850,11 @@ static void run_fault_injection_tests(void) {
         CHECK(buf && strstr(buf, "localtime_r failed") == NULL,
               "a strftime-only failure is not misreported as a localtime_r failure");
         CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
-        fclose(log_fp); log_fp = prior_log_fp; free(buf);
+        fclose(log_fp);
     }
+    /* Restored unconditionally -- see the equivalent fix above. */
+    log_fp = prior_log_fp;
+    free(buf);
 
     batch_ctx_t ctx = {0};
     const size_t count = ALLOC_CHUNK_BATCH + 8;
@@ -1957,6 +2081,7 @@ int main(int argc, char **argv) {
     CHECK(setup_fake_zfs() == 0, "created an isolated fake-zfs directory");
     if (zfs_path != g_fake_zfs) return 1;
     run_ensure_std_fds_test();
+    run_ensure_std_fds_all_closed_test();
     run_main_pipeline_tests();
     run_fault_injection_tests();
     run_chunk_test();
@@ -2672,8 +2797,11 @@ int main(int argc, char **argv) {
             CHECK(metrics.count == 0 && strstr(log_buf, "missing tab delimiter") &&
                   strstr(log_buf, "unexpected fields") && strstr(log_buf, "empty dataset or written value"),
                   "missing, extra, and empty metric fields each produce a diagnostic log entry");
-            fclose(log_fp); log_fp = prior_log_fp;
+            fclose(log_fp);
         }
+        /* Restored unconditionally, even if open_memstream() above failed
+         * and this block's body never ran. */
+        log_fp = prior_log_fp;
         free(log_buf); free(metrics.items);
         printf("\n");
     }
@@ -2746,8 +2874,11 @@ int main(int argc, char **argv) {
             fflush(log_fp);
             CHECK(stderr_reader.failed == 0 && strstr(log_buf, "bad\\x00x") != NULL,
                   "a NUL in stderr is safely escaped in its diagnostic log line");
-            fclose(log_fp); log_fp = prior_log_fp;
+            fclose(log_fp);
         }
+        /* Restored unconditionally, even if open_memstream() above failed
+         * and this block's body never ran. */
+        log_fp = prior_log_fp;
         free(log_buf);
 
         printf("\n");
@@ -2853,8 +2984,11 @@ int main(int argc, char **argv) {
             fflush(log_fp);
             CHECK(inventory.count == 1 && strstr(log_buf, "Invalid snapshot inventory line"),
                   "invalid inventory rows are logged and rejected before they enter pruning");
-            fclose(log_fp); log_fp = prior_log_fp;
+            fclose(log_fp);
         }
+        /* Restored unconditionally, even if open_memstream() above failed
+         * and this block's body never ran. */
+        log_fp = prior_log_fp;
         free(log_buf);
         name_list_free(&inventory);
         printf("\n");
