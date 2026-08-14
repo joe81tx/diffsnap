@@ -1843,7 +1843,8 @@ static void run_fault_injection_tests(void) {
     int prior_time_override_active = diffsnap_time_override_is_active();
     time_t prior_time_override_value = diffsnap_time_override_get_value();
     diffsnap_override_time((time_t)0);
-    CHECK(diffsnap_now() == (time_t)0, "the test overrides diffsnap's clock without changing the system clock");
+    CHECK(diffsnap_now(&overridden_time) == 0 && overridden_time == (time_t)0,
+      "the test overrides diffsnap's clock without changing the system clock");
     diffsnap_time_override_restore(prior_time_override_active, prior_time_override_value);
 
     char *buf = NULL;
