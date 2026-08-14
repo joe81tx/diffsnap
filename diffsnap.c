@@ -108,8 +108,22 @@ static pid_t (*fork_now_fn)(void) = fork;
 static int time_override_active = 0;
 static time_t time_override_value;
 
-static time_t diffsnap_now(void) {
-    return time_override_active ? time_override_value : time_now_fn(NULL);
+/*
+ * Writes the current time to *out and returns 0, or leaves *out unset and
+ * returns -1 if the underlying clock read failed. time_now_fn(NULL) signals
+ * failure by returning (time_t)-1 with errno set; that same value is also
+ * the last valid pre-epoch second, so the only reliable way to tell a real
+ * clock failure apart from a legitimate return of -1 is to clear errno
+ * first and check it alongside the return value, rather than testing the
+ * return value alone.
+ */
+static int diffsnap_now(time_t *out) {
+    if (time_override_active) { *out = time_override_value; return 0; }
+    errno = 0;
+    time_t t = time_now_fn(NULL);
+    if (t == (time_t)-1 && errno != 0) return -1;
+    *out = t;
+    return 0;
 }
 
 #ifdef DIFFSNAP_TESTING
@@ -250,18 +264,21 @@ static void log_msg(const char *fmt, ...) {
     if (!log_fp) return;
     va_list args;
     va_start(args, fmt);
-    time_t t = diffsnap_now();
+    time_t t;
     struct tm tm_info;
     char timestamp[STR_BUF_SMALL];
     
-    /* Either failure (can't get the local time, or can't format it) falls
-     * back to a placeholder timestamp. When it's specifically localtime_r
-     * that failed, that's surfaced with an inline marker on THIS SAME
-     * line -- not as a second, separate log_fp write -- so an operator
-     * still sees it was localtime_r that broke without log_msg() ever
-     * doubling its own output for one call. */
-    int localtime_failed = 0, strftime_failed = 0;
-    if (localtime_now_fn(&t, &tm_info) == NULL) {
+    /* Any of the three steps failing (can't read the clock, can't get the
+     * local time, or can't format it) falls back to a placeholder
+     * timestamp. Whichever one specifically failed is surfaced with an
+     * inline marker on THIS SAME line -- not as a second, separate log_fp
+     * write -- so an operator still sees which step broke without
+     * log_msg() ever doubling its own output for one call. */
+    int clock_failed = 0, localtime_failed = 0, strftime_failed = 0;
+    if (diffsnap_now(&t) != 0) {
+        clock_failed = 1;
+        snprintf(timestamp, sizeof(timestamp), "unknown-time");
+    } else if (localtime_now_fn(&t, &tm_info) == NULL) {
         localtime_failed = 1;
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     } else if (strftime_now_fn(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
@@ -269,7 +286,9 @@ static void log_msg(const char *fmt, ...) {
         snprintf(timestamp, sizeof(timestamp), "unknown-time");
     }
     if (fprintf(log_fp, "%s ", timestamp) < 0) log_io_failed = 1;
-    if (localtime_failed) {
+    if (clock_failed) {
+        if (fprintf(log_fp, "[clock read failed, using fallback timestamp] ") < 0) log_io_failed = 1;
+    } else if (localtime_failed) {
         if (fprintf(log_fp, "[localtime_r failed, using fallback timestamp] ") < 0) log_io_failed = 1;
     } else if (strftime_failed) {
         if (fprintf(log_fp, "[strftime failed, using fallback timestamp] ") < 0) log_io_failed = 1;
@@ -1355,7 +1374,8 @@ int main(int argc, char *argv[]) {
         log_msg("Error: failed to open config file %s: %s", conf_path, strerror(saved_errno));
         ret_code = global_status ? global_status : 1; goto cleanup;
     }
-    time_t t = diffsnap_now(); struct tm tm_info;
+    time_t t; struct tm tm_info;
+    if (diffsnap_now(&t) != 0) { log_msg("Error: failed to read current time"); ret_code = 1; goto cleanup; }
     if (localtime_now_fn(&t, &tm_info) == NULL) { log_msg("Error: localtime_r failed"); ret_code = 1; goto cleanup; }
     size_t line_cap = 0;
     long long current_day_mins = (tm_info.tm_hour * 60) + tm_info.tm_min;
