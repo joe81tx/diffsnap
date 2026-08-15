@@ -596,6 +596,21 @@ static int spy_line_handler(const char *line, void *data) {
     return 0;
 }
 
+/* diffsnap_now() tells a genuine clock failure apart from a legitimate
+ * (time_t)-1 return by clearing errno first and requiring errno != 0 too
+ * (see the comment above diffsnap_now() in diffsnap.c) -- so a faithful
+ * failure-injection stand-in must set errno itself, not just return -1. */
+static int g_time_fail;
+static int g_time_calls;
+static time_t test_time(time_t *out) {
+    g_time_calls++;
+    if (g_time_fail) {
+        errno = EIO;
+        return (time_t)-1;
+    }
+    return time(out);
+}
+
 static int g_localtime_fail;
 static int g_localtime_calls;
 static struct tm *test_localtime(const time_t *value, struct tm *result) {
@@ -1171,6 +1186,23 @@ static void run_main_pipeline_tests(void) {
         CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
               "main() fails when getline reports a config read error before EOF");
         getline_now_fn = getline;
+    }
+
+    fp = fopen(conf_file, "w");
+    CHECK(fp != NULL, "opened isolated main() config for the top-level clock-read failure test");
+    if (fp) {
+        fputs("pool/due,1,1,p,no,0\n", fp); fclose(fp);
+        g_time_calls = 0;
+        g_time_fail = 1; time_now_fn = test_time;
+        CHECK(diffsnap_real_main(1, (char *[]){"diffsnap-test", NULL}) == 1,
+              "main() fails when its top-level clock read fails");
+        FILE *log = fopen(log_file, "r");
+        char contents[8192] = {0};
+        if (log) { size_t rd = fread(contents, 1, sizeof(contents) - 1, log); (void)rd; fclose(log); }
+        CHECK(strstr(contents, "Error: failed to read current time") != NULL,
+              "the clock-read failure, rather than an unrelated error, is logged");
+        time_now_fn = time; g_time_fail = 0;
+        CHECK(g_time_calls >= 1, "the time hook was actually reached by main()");
     }
 
     fp = fopen(conf_file, "w");
@@ -1851,6 +1883,33 @@ static void run_fault_injection_tests(void) {
     char *buf = NULL;
     size_t buf_len = 0;
     FILE *prior_log_fp = log_fp;
+    log_fp = open_memstream(&buf, &buf_len);
+    CHECK(log_fp != NULL, "memory-backed log capture opened");
+    if (log_fp) {
+        g_time_calls = 0;
+        g_time_fail = 1;
+        time_now_fn = test_time;
+        log_msg("message during clock-read failure");
+        time_now_fn = time;
+        g_time_fail = 0;
+        fflush(log_fp);
+        size_t newlines = 0;
+        for (size_t i = 0; i < buf_len; i++) if (buf[i] == '\n') newlines++;
+        CHECK(g_time_calls == 1, "time hook intercepted the logging call");
+        CHECK(buf && strstr(buf, "clock read failed") && strstr(buf, "message during clock-read failure"),
+              "clock-read failure is described on the log message");
+        CHECK(buf && strstr(buf, "localtime_r failed") == NULL && strstr(buf, "strftime failed") == NULL,
+              "a clock-read-only failure is not misreported as a localtime_r or strftime failure");
+        CHECK(newlines == 1, "timestamp fallback produces exactly one log line");
+        fclose(log_fp);
+    }
+    /* Restored unconditionally -- see the equivalent fix below. */
+    log_fp = prior_log_fp;
+    free(buf);
+
+    buf = NULL;
+    buf_len = 0;
+    prior_log_fp = log_fp;
     log_fp = open_memstream(&buf, &buf_len);
     CHECK(log_fp != NULL, "memory-backed log capture opened");
     if (log_fp) {
