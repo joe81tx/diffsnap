@@ -1,12 +1,13 @@
 PROG = diffsnap
 TEST_PROG = test-bin
 SRCS = diffsnap.c
+PREFIX ?= /usr/local
 
 OS_NAME != uname -s
-OS_ETCDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc ;; *) echo /etc ;; esac
+OS_ETCDIR != case "$(OS_NAME)" in FreeBSD) echo "$(PREFIX)/etc" ;; *) echo /etc ;; esac
 OS_RUNSTATEDIR != case "$(OS_NAME)" in FreeBSD) echo /var/run ;; *) echo /run ;; esac
 OS_ZFS_PATH != case "$(OS_NAME)" in FreeBSD) echo /sbin/zfs ;; *) if [ -x /usr/sbin/zfs ]; then echo /usr/sbin/zfs; else echo /sbin/zfs; fi ;; esac
-OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo /usr/local/etc/newsyslog.conf.d ;; *) echo /etc/logrotate.d ;; esac
+OS_LOGCONFDIR != case "$(OS_NAME)" in FreeBSD) echo "$(PREFIX)/etc/newsyslog.conf.d" ;; *) echo /etc/logrotate.d ;; esac
 OS_LOGCONF_SRC != case "$(OS_NAME)" in FreeBSD) echo logrotation/diffsnap.conf ;; *) echo logrotation/diffsnap ;; esac
 OS_LOGCONF_NAME != case "$(OS_NAME)" in FreeBSD) echo diffsnap.conf ;; *) echo diffsnap ;; esac
 INITDIR_Linux = /etc/systemd/system
@@ -18,7 +19,6 @@ CFLAGS ?= -O2 -pipe
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS ?=
 
-PREFIX ?= /usr/local
 SBINDIR ?= $(PREFIX)/sbin
 ETCDIR ?= $(OS_ETCDIR)
 LOGDIR ?= /var/log
