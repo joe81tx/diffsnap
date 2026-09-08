@@ -123,7 +123,7 @@ The examples below schedule `diffsnap` to run as root. You can authorize an unpr
 
 FreeBSD Crontab Configuration  
 
-/usr/local/etc/cron.d/diffsnap will be installed automatically. Modify it to adjust the default from every minute or comment the line with a leading # to disable running `diffsnap` automatically.
+/usr/local/etc/cron.d/diffsnap will be installed automatically. You must uncomment the line for it to begin running on a schedule. Once enabled you can modify it to adjust the default from every minute.
 ```cron
 * * * * * root /usr/local/sbin/diffsnap
 ```
