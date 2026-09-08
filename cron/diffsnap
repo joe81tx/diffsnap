@@ -1,1 +1,2 @@
-* * * * * root /usr/local/sbin/diffsnap
+# Uncomment the line below to enable diffsnap:
+#* * * * * root /usr/local/sbin/diffsnap
