@@ -66,7 +66,7 @@ install: $(PROG)
 		$(INSTALL_DATA) diffsnap.conf "$(DESTDIR)$(ETCDIR)/diffsnap.conf"
 	$(INSTALL) -d $(DESTDIR)$(LOGCONFDIR)
 	$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME).sample
-	test -f "$(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)" || \
+	test -f "$(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)" || \
 		$(INSTALL_DATA) $(LOGCONF_SRC) $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
 	@if [ "$(OS_NAME)" = "Linux" ]; then \
 		$(INSTALL) -d $(DESTDIR)$(INITDIR_Linux); \
@@ -83,7 +83,7 @@ install: $(PROG)
 uninstall:
 	rm -f $(DESTDIR)$(SBINDIR)/$(PROG)
 	rm -f $(DESTDIR)$(ETCDIR)/diffsnap.conf.sample
-	rm -f $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME)
+	rm -f $(DESTDIR)$(LOGCONFDIR)/$(LOGCONF_NAME).sample
 	@if [ "$(OS_NAME)" = "Linux" ]; then \
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.service; \
 		rm -f $(DESTDIR)$(INITDIR_Linux)/diffsnap.timer; \
