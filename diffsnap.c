@@ -27,7 +27,7 @@
 #ifndef ZFS_PATH
 #define ZFS_PATH "/sbin/zfs"
 #endif
-#define DIFFSNAP_VERSION "1.0"
+#define DIFFSNAP_VERSION "1.0.1"
 #ifndef BUILD_SHA
 #define BUILD_SHA "unknown"
 #endif
